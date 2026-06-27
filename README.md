@@ -53,6 +53,5 @@ This is a reworked version of **make-debian-look-like-ubuntu** by **DeltaLima**.
 - Original: https://github.com/DeltaLima/make-debian-look-like-ubuntu
 - Upstream source: https://git.la10cy.net/DeltaLima/make-debian-look-like-ubuntu
 
-The original `make-debian-look-like-ubuntu_rev.sh` is kept in this repository for reference.
 For older Debian releases, check out the upstream
 [tags](https://git.la10cy.net/DeltaLima/make-debian-look-like-ubuntu/tags).
