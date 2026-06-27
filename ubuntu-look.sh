@@ -77,12 +77,16 @@ UBUNTU_MIRROR="http://archive.ubuntu.com/ubuntu"
 # update, so this list does NOT need to enumerate every Ubuntu release.
 #
 # IMPORTANT (wallpaper coverage): the per-release packs (ubuntu-wallpapers-groovy
-# "Groovy Gorilla", ubuntu-wallpapers-kinetic "Kinetic Kudu", … back to karmic)
-# are RE-SHIPPED in the newest release's 'universe' — e.g. resolute (26.04 LTS)
-# carries the complete historical set, all at version 26.04.x.  So we MUST include
-# the newest release here; otherwise apt-cache never sees those older wallpaper
-# packs and they go missing.  EOL interim releases are NOT needed (no old-releases
-# mirror): the newest LTS universe already contains every release's wallpapers.
+# "Groovy Gorilla", ubuntu-wallpapers-kinetic "Kinetic Kudu", … back to karmic
+# "Karmic Koala" 9.10) are RE-SHIPPED in the newest release's 'universe' — e.g.
+# resolute (26.04 LTS) carries the complete historical set, all at version
+# 26.04.x.  ubuntu-wallpapers-lts-legacy (also in that set) adds the pre-karmic
+# LTS art: 4.10 Warty, 6.06 Dapper, 8.04 Hardy + every LTS.  Together that covers
+# every Ubuntu release that was EVER packaged with wallpapers (the non-LTS
+# releases 5.04–9.04 were never packaged by Ubuntu, so no source exists for them).
+# So we MUST include the newest release here; otherwise apt-cache never sees those
+# older wallpaper packs and they go missing.  EOL interim releases are NOT needed
+# (no old-releases mirror): the newest LTS universe already contains them all.
 # The auto-detected theme codename is added to this list at runtime if not present.
 WALLPAPER_CODENAMES="focal jammy noble plucky questing resolute"
 
@@ -164,6 +168,52 @@ available_packages() {
     apt-cache show "$pkg" >/dev/null 2>&1 && avail="$avail $pkg"
   done
   echo "$avail" | xargs
+}
+
+# Install OPTIONAL packages without ever aborting the script.  Tries the whole
+# list in one transaction first (fast); if that fails (e.g. one pack has an
+# unsatisfiable dependency under our strict pin), falls back to installing each
+# package individually so one bad apple can't take the rest down.  Prints which
+# packages ended up installed via stdout (space-separated).
+install_optional() {
+  local list="$1" ok=""
+  [ -z "$list" ] && return 0
+  # shellcheck disable=SC2086
+  if sudo apt-get install -y $list >/dev/null 2>&1; then
+    echo "$list" | xargs
+    return 0
+  fi
+  # Bulk failed — retry one-by-one, skipping any that won't install.
+  for pkg in $list; do
+    if sudo apt-get install -y "$pkg" >/dev/null 2>&1; then
+      ok="$ok $pkg"
+    else
+      message warn "skipped optional package (unsatisfiable): ${pkg}"
+    fi
+  done
+  echo "$ok" | xargs
+}
+
+# Pick the best 'light' or 'dark' desktop wallpaper from /usr/share/backgrounds.
+# Release default wallpapers use inconsistent names across Ubuntu versions, e.g.
+#   resolute/plucky : <Name>_Wallpaper_Light_3840x2160.png / ..._Dimmed_...
+#   questing        : <Name>_Full_Light_3840x2160.png      / ..._Full_Dark_...
+#   noble           : Numbat_wallpaper_light_3480x2160.png
+#   jammy           : jj_light_by_Hiking93.jpg
+# We try the official "release default" patterns first (newest wins via sort -V,
+# so the latest LTS's wallpaper is preferred), then any light/dark image, and
+# finally warty-final-ubuntu.png — the one file the base package always ships.
+pick_wallpaper() {
+  local variant="$1" bg=/usr/share/backgrounds f pat
+  local light_pats="*_Wallpaper_Light_*.png *_Full_Light_*.png *[Ll]ight*.png *[Ll]ight*.jpg"
+  local dark_pats="*_Wallpaper_Dimmed_*.png *_Full_Dark_*.png *_Full_Dimmed_*.png *[Dd]immed*.png *[Dd]ark*.png *[Dd]ark*.jpg"
+  local pats; [ "$variant" = dark ] && pats="$dark_pats" || pats="$light_pats"
+  for pat in $pats; do
+    # shellcheck disable=SC2086
+    f="$(ls -1 $bg/$pat 2>/dev/null | sort -V | tail -1)"
+    [ -n "$f" ] && { echo "$f"; return 0; }
+  done
+  echo "$bg/warty-final-ubuntu.png"
 }
 
 step() {
@@ -551,11 +601,29 @@ else
 fi
 
 # Discover ALL available ubuntu-wallpapers-* packages (every Ubuntu release ever
-# packaged — from karmic 9.10 through the latest — plus lts-legacy) and append
-# them to the 1-desktop-base install list.  available_packages() in the install
-# loop silently skips any that aren't in the cache.
-_all_wp="$(apt-cache pkgnames 2>/dev/null | grep '^ubuntu-wallpapers' | sort | tr '\n' ' ')"
-packages[1-desktop-base]="${packages[1-desktop-base]} ${_all_wp}"
+# packaged — from karmic 9.10 through the latest) and install them in a dedicated,
+# fault-tolerant step.  The newest release's 'universe' re-ships the complete
+# historical set (verified: resolute 26.04 carries karmic…questing), and
+# ubuntu-wallpapers-lts-legacy adds the pre-karmic LTS art (4.10 Warty Warthog,
+# 6.06 Dapper Drake, 8.04 Hardy Heron) plus every LTS wallpaper.
+#
+# EXCLUDE *-raspi variants: despite the "ubuntu-wallpapers-" prefix,
+# ubuntu-wallpapers-groovy-raspi is a Raspberry-Pi Ubuntu-Cinnamon DESKTOP pack
+# that Depends on an entire desktop (ubuntucinnamon-*, xserver-xorg,
+# network-manager, slick-greeter, whoopsie, …).  Those deps are pinned out (-1),
+# so it is unsatisfiable and — installed in one bulk transaction — would abort the
+# whole wallpaper install.  install_optional() also guards against any future
+# oddball pack by retrying per-package.
+step "Install Ubuntu wallpaper packs (all releases)"
+_all_wp="$(apt-cache pkgnames 2>/dev/null | grep '^ubuntu-wallpapers' | grep -v -- '-raspi' | sort | tr '\n' ' ')"
+if [ -n "$_all_wp" ]; then
+  message "discovered $(echo "$_all_wp" | wc -w) wallpaper pack(s); installing..."
+  _wp_installed="$(install_optional "$_all_wp")"
+  _wp_count="$(echo "$_wp_installed" | wc -w)"
+  STATUS_CHANGES+=("Ubuntu wallpaper packs installed/present: ${_wp_count} release(s)")
+else
+  message warn "no ubuntu-wallpapers-* packs found in apt cache (check Ubuntu sources)"
+fi
 
 ###############################################################################
 # Step: Install packages per category + post-install tasks
@@ -625,11 +693,12 @@ for category in $package_categories; do
 
     # -------------------------------------------------------------------------
     2-desktop-gnome)
-      # Resolve wallpaper paths (for dconf profile and live gsettings)
-      WP_LIGHT="$(ls -1 /usr/share/backgrounds/*Full*Light*.png 2>/dev/null | sort -V | tail -1)"
-      WP_DARK="$(ls -1 /usr/share/backgrounds/*Full*Dark*.png 2>/dev/null | sort -V | tail -1)"
-      WP_LIGHT="${WP_LIGHT:-/usr/share/backgrounds/warty-final-ubuntu.png}"
-      WP_DARK="${WP_DARK:-$WP_LIGHT}"
+      # Resolve wallpaper paths (for dconf profile and live gsettings).
+      # pick_wallpaper handles the varied release-default naming and always
+      # returns an existing file (worst case warty-final-ubuntu.png).
+      WP_LIGHT="$(pick_wallpaper light)"
+      WP_DARK="$(pick_wallpaper dark)"
+      [ -f "$WP_DARK" ] || WP_DARK="$WP_LIGHT"
 
       # ------------------------------------------------------------------
       # Write dconf system profile (the fix for "needs two runs"):
@@ -638,6 +707,18 @@ for category in $package_categories; do
       # ------------------------------------------------------------------
       message "writing dconf system profile (extensions + GNOME defaults)"
       write_dconf_profile "$WP_LIGHT" "$WP_DARK"
+
+      # If no session bus is exported in this shell (e.g. the script was started
+      # from SSH/TTY/tmux rather than a desktop terminal), fall back to the
+      # well-known systemd user bus.  Without this, the live apply below is
+      # skipped and only a *system default* wallpaper is written — which an
+      # existing user's dconf already shadows, so the desktop would not change.
+      # Pointing at /run/user/$UID/bus lets us set the user's real wallpaper too.
+      if [ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ] && [ -S "/run/user/$(id -u)/bus" ]; then
+        export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+        export DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$(id -u)/bus"
+        message "no session bus in env — using ${DBUS_SESSION_BUS_ADDRESS}"
+      fi
 
       # If we have a live GNOME session, also apply immediately via gsettings
       if [ -n "${DBUS_SESSION_BUS_ADDRESS:-}" ]; then
