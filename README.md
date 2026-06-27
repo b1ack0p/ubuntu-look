@@ -37,7 +37,7 @@ $ bash ubuntu-look.sh 2-desktop-gnome
 ### Force a specific Ubuntu codename for the theme repo
 
 ```bash
-$ UBUNTU_CODENAME=plucky bash ubuntu-look.sh
+$ UBUNTU_CODENAME=resolute bash ubuntu-look.sh
 ```
 
 ## Requirements

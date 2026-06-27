@@ -75,11 +75,19 @@ UBUNTU_MIRROR="http://archive.ubuntu.com/ubuntu"
 # Ubuntu releases for which we add entries in ubuntu-themes.list (sources only).
 # ubuntu-wallpapers-* packages to install are discovered dynamically after apt
 # update, so this list does NOT need to enumerate every Ubuntu release.
+#
+# IMPORTANT (wallpaper coverage): the per-release packs (ubuntu-wallpapers-groovy
+# "Groovy Gorilla", ubuntu-wallpapers-kinetic "Kinetic Kudu", … back to karmic)
+# are RE-SHIPPED in the newest release's 'universe' — e.g. resolute (26.04 LTS)
+# carries the complete historical set, all at version 26.04.x.  So we MUST include
+# the newest release here; otherwise apt-cache never sees those older wallpaper
+# packs and they go missing.  EOL interim releases are NOT needed (no old-releases
+# mirror): the newest LTS universe already contains every release's wallpapers.
 # The auto-detected theme codename is added to this list at runtime if not present.
-WALLPAPER_CODENAMES="focal jammy noble plucky questing"
+WALLPAPER_CODENAMES="focal jammy noble plucky questing resolute"
 
 # Bump this whenever the pin/source content changes so re-runs detect stale config.
-PIN_VERSION="v6-2026-06-22"
+PIN_VERSION="v7-2026-06-27"
 
 # dconf system profile paths (system defaults, no running session required)
 DCONF_PROFILE_DIR="/etc/dconf/db/local.d"
@@ -191,11 +199,19 @@ detect_ubuntu_codename() {
   local v
   command -v gnome-shell >/dev/null 2>&1 || { echo "noble"; return; }
   v="$(gnome-shell --version 2>/dev/null | awk '{print $3}' | cut -d. -f1)"
+  # Forward-compat: any shell at/after 26.04's GNOME 50 (including future
+  # releases we don't know yet) maps to the newest known release, resolute.
+  # Going the other way is unsafe — resolute's yaru-theme-gnome-shell has a
+  # hard "Breaks: gnome-shell (<< 50~)", so it must NOT be offered to older
+  # shells; those fall through to the LTS default below.
+  if [[ "$v" =~ ^[0-9]+$ ]] && [ "$v" -ge 50 ]; then
+    echo "resolute"; return   # Ubuntu 26.04 LTS (GNOME 50+, "Resolute Raccoon")
+  fi
   case "$v" in
-    50|51)    echo "questing" ;;  # Ubuntu 25.10 / 26.04 transition
-    48|49)    echo "plucky"   ;;  # Ubuntu 25.04
-    46|47)    echo "noble"    ;;  # Ubuntu 24.04 LTS
-    *)        echo "noble"    ;;  # unknown — fall back to LTS
+    49)       echo "questing" ;;  # Ubuntu 25.10 (GNOME 49)
+    48)       echo "plucky"   ;;  # Ubuntu 25.04 (GNOME 48)
+    46|47)    echo "noble"    ;;  # Ubuntu 24.04 LTS (GNOME 46)
+    *)        echo "noble"    ;;  # older / unknown — fall back to LTS
   esac
 }
 
@@ -284,7 +300,7 @@ custom-background-color=true
 background-opacity=0.64
 click-action='focus-or-previews'
 custom-theme-shrink=true
-dash-max-icon-size=42
+dash-max-icon-size=48
 dock-fixed=true
 dock-position='LEFT'
 extend-height=true
@@ -501,8 +517,10 @@ Pin: release o=Ubuntu, n=${UBUNTU_CODENAME}
 Pin-Priority: 990
 
 # Wallpapers have no hard dependency on gnome-shell, so they are safe to pull
-# from any Ubuntu release — this lets us install wallpaper packs across all
-# releases (focal … questing) without creating version conflicts.
+# from any Ubuntu release.  The newest release (resolute / 26.04) re-ships the
+# complete historical set of ubuntu-wallpapers-<codename> packs (groovy gorilla,
+# kinetic kudu, … back to karmic), so adding it here makes every release's
+# wallpapers installable without any version conflicts.
 Package: ubuntu-wallpapers*
 Pin: release o=Ubuntu
 Pin-Priority: 990
@@ -668,7 +686,7 @@ for category in $package_categories; do
         gset org.gnome.shell.extensions.dash-to-dock background-opacity 0.64
         gset org.gnome.shell.extensions.dash-to-dock click-action 'focus-or-previews'
         gset org.gnome.shell.extensions.dash-to-dock custom-theme-shrink true
-        gset org.gnome.shell.extensions.dash-to-dock dash-max-icon-size 42
+        gset org.gnome.shell.extensions.dash-to-dock dash-max-icon-size 48
         gset org.gnome.shell.extensions.dash-to-dock dock-fixed true
         gset org.gnome.shell.extensions.dash-to-dock dock-position 'LEFT'
         gset org.gnome.shell.extensions.dash-to-dock extend-height true
