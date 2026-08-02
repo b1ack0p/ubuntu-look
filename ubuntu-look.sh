@@ -2,10 +2,15 @@
 # =============================================================================
 # Title       : ubuntu-look.sh
 # Description : Transform a Debian GNOME desktop into an authentic Ubuntu look.
+#               Wallpaper and icon/GTK/sound theme track the latest official
+#               Ubuntu release; the shell theme + dock/appindicator extensions
+#               pin to the newest release compatible with your GNOME Shell.
 #               Installs genuine Yaru theme, Ubuntu fonts, official wallpapers,
 #               ubuntu-dock, and applies all Ubuntu GNOME defaults — including
 #               extension enabling — via a dconf system profile so everything
 #               takes effect on the FIRST run (no second run after reboot).
+#               Visuals only: no extra apps, no Snap/Flatpak/AppImage, and
+#               your dock favorites are left alone.
 #
 # Original    : DeltaLima
 #               https://github.com/DeltaLima/make-debian-look-like-ubuntu
@@ -32,7 +37,7 @@
 #               Valid stages: 0-base  1-desktop-base  2-desktop-gnome
 #
 # Override    : Force a specific Ubuntu codename for the theme repo:
-#                   UBUNTU_CODENAME=plucky bash ubuntu-look.sh
+#                   UBUNTU_CODENAME=resolute bash ubuntu-look.sh
 #
 # Requires    : Debian 12+ with GNOME desktop, user in 'sudo' group,
 #               working internet connection.
@@ -45,53 +50,50 @@ declare -A packages
 # Core tools: Plymouth splash, apt/key helpers, dconf compiler (for system profile)
 packages[0-base]="plymouth plymouth-themes curl wget gnupg ca-certificates dconf-cli"
 
-# Ubuntu fonts + wallpapers.
-# desktop-base    = official Debian release wallpapers (current Debian default themes)
-# gnome-backgrounds = GNOME's own curated wallpaper collection (ships with GNOME)
-# ubuntu-wallpapers + per-release packs = all Ubuntu wallpapers across releases
-# (per-release packs are resolved + appended after Ubuntu codename auto-detect)
+# Ubuntu fonts + wallpapers. ubuntu-wallpapers tracks the latest official
+# release only, via the floating pin below (LTS or not).
 packages[1-desktop-base]="fonts-ubuntu fonts-ubuntu-console
 desktop-base gnome-backgrounds
 ubuntu-wallpapers"
 
-# Gnome-shell extensions + full Yaru theme stack.
-# gnome-shell-extension-ubuntu-dock = Canonical's official Ubuntu fork of dash-to-dock.
-# humanity-icon-theme                = fallback icon set Ubuntu ships alongside Yaru.
+# GNOME Shell extensions + full Yaru theme stack. tiling-assistant is
+# Ubuntu's built-in tiling extension (default since 24.04); ptyxis is
+# Ubuntu's default terminal since 24.10.
 packages[2-desktop-gnome]="gnome-shell-extensions
 gnome-shell-extension-desktop-icons-ng
 gnome-shell-extension-ubuntu-dock
+gnome-shell-extension-ubuntu-tiling-assistant
 gnome-shell-extension-appindicator
 gnome-shell-extension-manager
 yaru-theme-gnome-shell yaru-theme-gtk yaru-theme-icon yaru-theme-sound
-humanity-icon-theme"
+humanity-icon-theme
+ptyxis"
 
-# Ubuntu release to pull Yaru theme + Ubuntu fonts from.
-# yaru-theme-gnome-shell has a hard "Breaks: gnome-shell (<< N~)" pin, so the
-# wrong codename causes apt to refuse the install.  We auto-pick to match the
-# running gnome-shell major version.  Override with UBUNTU_CODENAME=<name>.
+# Ubuntu release to pull Yaru theme + Ubuntu fonts from. yaru-theme-gnome-shell
+# is pinned to a gnome-shell major version, so the codename must be verified
+# compatible first (see resolve_ubuntu_codename()). Override with
+# UBUNTU_CODENAME=<name>.
 UBUNTU_CODENAME="${UBUNTU_CODENAME:-auto}"
 UBUNTU_MIRROR="http://archive.ubuntu.com/ubuntu"
 
-# Ubuntu releases for which we add entries in ubuntu-themes.list (sources only).
-# ubuntu-wallpapers-* packages to install are discovered dynamically after apt
-# update, so this list does NOT need to enumerate every Ubuntu release.
-#
-# IMPORTANT (wallpaper coverage): the per-release packs (ubuntu-wallpapers-groovy
-# "Groovy Gorilla", ubuntu-wallpapers-kinetic "Kinetic Kudu", … back to karmic
-# "Karmic Koala" 9.10) are RE-SHIPPED in the newest release's 'universe' — e.g.
-# resolute (26.04 LTS) carries the complete historical set, all at version
-# 26.04.x.  ubuntu-wallpapers-lts-legacy (also in that set) adds the pre-karmic
-# LTS art: 4.10 Warty, 6.06 Dapper, 8.04 Hardy + every LTS.  Together that covers
-# every Ubuntu release that was EVER packaged with wallpapers (the non-LTS
-# releases 5.04–9.04 were never packaged by Ubuntu, so no source exists for them).
-# So we MUST include the newest release here; otherwise apt-cache never sees those
-# older wallpaper packs and they go missing.  EOL interim releases are NOT needed
-# (no old-releases mirror): the newest LTS universe already contains them all.
-# The auto-detected theme codename is added to this list at runtime if not present.
-WALLPAPER_CODENAMES="focal jammy noble plucky questing resolute"
+# Static list of released Ubuntu codenames to try when resolving a
+# gnome-shell-compatible codename (theme/extensions) — see
+# discover_ubuntu_codenames(), which extends this dynamically at runtime.
+FALLBACK_CODENAMES="focal jammy noble plucky questing resolute"
 
-# Bump this whenever the pin/source content changes so re-runs detect stale config.
-PIN_VERSION="v7-2026-06-27"
+# Bump whenever pin/source content changes, so re-runs detect stale config.
+PIN_VERSION="v11-2026-08-03"
+
+# Extensions that make up the Ubuntu look. Single source of truth for the
+# dconf profile, the live-session enable loop, and the verification loop.
+SHELL_EXTENSIONS="ubuntu-appindicators@ubuntu.com ubuntu-dock@ubuntu.com ding@rastersoft.com tiling-assistant@ubuntu.com user-theme@gnome-shell-extensions.gcampax.github.com"
+
+# One-time pre-install snapshot + running manifests, so uninstall.sh can undo
+# exactly what THIS script did and restore whatever was there before it ran.
+BACKUP_DIR="$HOME/.ubuntu-look-backup"
+BACKUP_ORIGINAL="${BACKUP_DIR}/original"
+INSTALLED_MANIFEST="${BACKUP_DIR}/installed-by-script.txt"
+REMOVED_MANIFEST="${BACKUP_DIR}/removed-by-script.txt"
 
 # dconf system profile paths (system defaults, no running session required)
 DCONF_PROFILE_DIR="/etc/dconf/db/local.d"
@@ -144,10 +146,14 @@ confirm_continue() {
   fi
 }
 
+is_installed() {
+  dpkg-query -W -f='${Status}' "$1" 2>/dev/null | grep -q "install ok installed"
+}
+
 missing_packages() {
   local missing=""
   for pkg in $1; do
-    dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null | grep -q "install ok installed" || missing="$missing $pkg"
+    is_installed "$pkg" || missing="$missing $pkg"
   done
   echo "$missing" | xargs
 }
@@ -155,13 +161,12 @@ missing_packages() {
 installed_packages() {
   local got=""
   for pkg in $1; do
-    dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null | grep -q "install ok installed" && got="$got $pkg"
+    is_installed "$pkg" && got="$got $pkg"
   done
   echo "$got" | xargs
 }
 
 # Filter a list to only packages actually available in the apt cache.
-# Used for optional packages (e.g. wallpaper packs) that may not exist in all repos.
 available_packages() {
   local avail=""
   for pkg in $1; do
@@ -170,50 +175,15 @@ available_packages() {
   echo "$avail" | xargs
 }
 
-# Install OPTIONAL packages without ever aborting the script.  Tries the whole
-# list in one transaction first (fast); if that fails (e.g. one pack has an
-# unsatisfiable dependency under our strict pin), falls back to installing each
-# package individually so one bad apple can't take the rest down.  Prints which
-# packages ended up installed via stdout (space-separated).
-install_optional() {
-  local list="$1" ok=""
-  [ -z "$list" ] && return 0
-  # shellcheck disable=SC2086
-  if sudo apt-get install -y $list >/dev/null 2>&1; then
-    echo "$list" | xargs
-    return 0
-  fi
-  # Bulk failed — retry one-by-one, skipping any that won't install.
-  for pkg in $list; do
-    if sudo apt-get install -y "$pkg" >/dev/null 2>&1; then
-      ok="$ok $pkg"
-    else
-      message warn "skipped optional package (unsatisfiable): ${pkg}"
-    fi
+# Render SHELL_EXTENSIONS (space-separated) as a dconf/GVariant string array:
+# ['a', 'b', 'c'].
+shell_extensions_dconf_array() {
+  local out="" first=1 e
+  for e in $SHELL_EXTENSIONS; do
+    [ $first -eq 1 ] && first=0 || out="${out}, "
+    out="${out}'${e}'"
   done
-  echo "$ok" | xargs
-}
-
-# Pick the best 'light' or 'dark' desktop wallpaper from /usr/share/backgrounds.
-# Release default wallpapers use inconsistent names across Ubuntu versions, e.g.
-#   resolute/plucky : <Name>_Wallpaper_Light_3840x2160.png / ..._Dimmed_...
-#   questing        : <Name>_Full_Light_3840x2160.png      / ..._Full_Dark_...
-#   noble           : Numbat_wallpaper_light_3480x2160.png
-#   jammy           : jj_light_by_Hiking93.jpg
-# We try the official "release default" patterns first (newest wins via sort -V,
-# so the latest LTS's wallpaper is preferred), then any light/dark image, and
-# finally warty-final-ubuntu.png — the one file the base package always ships.
-pick_wallpaper() {
-  local variant="$1" bg=/usr/share/backgrounds f pat
-  local light_pats="*_Wallpaper_Light_*.png *_Full_Light_*.png *[Ll]ight*.png *[Ll]ight*.jpg"
-  local dark_pats="*_Wallpaper_Dimmed_*.png *_Full_Dark_*.png *_Full_Dimmed_*.png *[Dd]immed*.png *[Dd]ark*.png *[Dd]ark*.jpg"
-  local pats; [ "$variant" = dark ] && pats="$dark_pats" || pats="$light_pats"
-  for pat in $pats; do
-    # shellcheck disable=SC2086
-    f="$(ls -1 $bg/$pat 2>/dev/null | sort -V | tail -1)"
-    [ -n "$f" ] && { echo "$f"; return 0; }
-  done
-  echo "$bg/warty-final-ubuntu.png"
+  echo "[${out}]"
 }
 
 step() {
@@ -242,28 +212,56 @@ gset() {
   fi
 }
 
-# Auto-detect running gnome-shell major version → Ubuntu codename.
-# yaru-theme-gnome-shell is pinned to a specific gnome-shell major, so the
-# codename must match what the user's gnome-shell actually is.
-detect_ubuntu_codename() {
-  local v
-  command -v gnome-shell >/dev/null 2>&1 || { echo "noble"; return; }
-  v="$(gnome-shell --version 2>/dev/null | awk '{print $3}' | cut -d. -f1)"
-  # Forward-compat: any shell at/after 26.04's GNOME 50 (including future
-  # releases we don't know yet) maps to the newest known release, resolute.
-  # Going the other way is unsafe — resolute's yaru-theme-gnome-shell has a
-  # hard "Breaks: gnome-shell (<< 50~)", so it must NOT be offered to older
-  # shells; those fall through to the LTS default below.
-  if [[ "$v" =~ ^[0-9]+$ ]] && [ "$v" -ge 50 ]; then
-    echo "resolute"; return   # Ubuntu 26.04 LTS (GNOME 50+, "Resolute Raccoon")
+# Current Ubuntu releases from distro-info-data, unioned with
+# FALLBACK_CODENAMES (never narrowed — archive.ubuntu.com keeps serving EOL
+# releases that older gnome-shell versions may still need).
+discover_ubuntu_codenames() {
+  local dynamic=""
+  if command -v ubuntu-distro-info >/dev/null 2>&1; then
+    dynamic="$(ubuntu-distro-info --supported 2>/dev/null | tr '\n' ' ')"
   fi
-  case "$v" in
-    49)       echo "questing" ;;  # Ubuntu 25.10 (GNOME 49)
-    48)       echo "plucky"   ;;  # Ubuntu 25.04 (GNOME 48)
-    46|47)    echo "noble"    ;;  # Ubuntu 24.04 LTS (GNOME 46)
-    *)        echo "noble"    ;;  # older / unknown — fall back to LTS
-  esac
+  echo "$FALLBACK_CODENAMES $dynamic" | tr ' ' '\n' | awk 'NF && !seen[$0]++' | tr '\n' ' ' | xargs
 }
+
+# Newest Ubuntu codename whose $1 package installs cleanly here, verified via
+# a real simulated install (avoids a hand-maintained compatibility table).
+#
+# $2 ("1"): also require "Inst $1 " in the simulated output, not just
+# "no Remv" — needed when Debian ships the same package (e.g. ptyxis), where
+# a clean simulate can mean "already installed from Debian, nothing to do".
+#
+# $3: fallback value if no codename simulates cleanly.
+resolve_ubuntu_pkg_codename() {
+  local pkg="$1" require_inst="${2:-0}" fallback="${3:-}"
+  local newest_first cn ver sim
+  newest_first="$(echo "$WALLPAPER_CODENAMES" | tr ' ' '\n' | tac)"
+  for cn in $newest_first; do
+    # Progress goes to stderr so it doesn't pollute the codename on stdout.
+    message "  checking ${pkg} on ${cn}..." >&2
+    ver="$(apt-cache madison "$pkg" 2>/dev/null \
+      | awk -F'|' -v c="$cn" '$3 ~ c { gsub(/^[ \t]+|[ \t]+$/, "", $2); print $2; exit }')"
+    [ -z "$ver" ] && continue
+    sim="$(apt-get install -s "${pkg}=${ver}" 2>&1)"
+    echo "$sim" | grep -q '^Remv ' && continue
+    if [ "$require_inst" = "1" ]; then
+      echo "$sim" | grep -q "^Inst ${pkg} " || continue
+    fi
+    echo "$cn"
+    return 0
+  done
+  echo "$fallback"
+}
+
+# yaru-theme-gnome-shell is pinned to a gnome-shell major version; "noble" is
+# a safe LTS fallback if nothing simulates cleanly (e.g. offline).
+resolve_ubuntu_codename() { resolve_ubuntu_pkg_codename yaru-theme-gnome-shell 0 noble; }
+
+# Debian's own ptyxis build is often version-newer than the Ubuntu one, and
+# Pin-Priority 990 never overrides an already-installed newer version — the
+# "Inst ptyxis" check confirms a real switch is possible before pinning it at
+# 1001. Echoes "" if no Ubuntu ptyxis build installs here; callers then leave
+# ptyxis unpinned.
+resolve_ptyxis_codename() { resolve_ubuntu_pkg_codename ptyxis 1 ""; }
 
 # Auto-detect the running Debian suite from /etc/os-release.
 detect_debian_codename() {
@@ -277,6 +275,25 @@ detect_debian_codename() {
 # take effect on first login even when the script ran without a GNOME session.
 write_dconf_profile() {
   local wp_light="$1" wp_dark="$2"
+
+  # Only emit background/screensaver keys if the wallpaper file exists
+  # (it may not, if 2-desktop-gnome ran before 1-desktop-base ever installed
+  # ubuntu-wallpapers).
+  local bg_block=""
+  if [ -n "$wp_light" ] && [ -f "$wp_light" ]; then
+    bg_block="
+[org/gnome/desktop/background]
+show-desktop-icons=true
+picture-uri='file://${wp_light}'
+picture-uri-dark='file://${wp_dark}'
+picture-options='zoom'
+
+[org/gnome/desktop/screensaver]
+picture-uri='file://${wp_light}'"
+  else
+    message warn "wallpaper file not found (${wp_light:-none}) — skipping background/screensaver keys"
+    message warn "run 'bash ubuntu-look.sh 1-desktop-base' (or a full run) first to install ubuntu-wallpapers"
+  fi
 
   # Ensure the dconf system db directory exists
   sudo mkdir -p "$DCONF_PROFILE_DIR"
@@ -295,12 +312,13 @@ write_dconf_profile() {
 # Provides system-wide defaults; users can override in their own dconf.
 
 [org/gnome/shell]
-enabled-extensions=['ubuntu-appindicators@ubuntu.com', 'ubuntu-dock@ubuntu.com', 'ding@rastersoft.com', 'user-theme@gnome-shell-extensions.gcampax.github.com']
+enabled-extensions=$(shell_extensions_dconf_array)
 disable-user-extensions=false
 always-show-log-out=true
 start-in-overview=false
 
 [org/gnome/desktop/interface]
+color-scheme='default'
 gtk-theme='Yaru'
 icon-theme='Yaru'
 cursor-theme='Yaru'
@@ -311,15 +329,7 @@ font-antialiasing='rgba'
 font-hinting='slight'
 enable-hot-corners=false
 accent-color='orange'
-
-[org/gnome/desktop/background]
-show-desktop-icons=true
-picture-uri='file://${wp_light}'
-picture-uri-dark='file://${wp_dark}'
-picture-options='zoom'
-
-[org/gnome/desktop/screensaver]
-picture-uri='file://${wp_light}'
+${bg_block}
 
 [org/gnome/desktop/wm/preferences]
 button-layout=':minimize,maximize,close'
@@ -342,21 +352,26 @@ focus-change-on-pointer-rest=true
 tap-to-click=true
 click-method='default'
 
+# Mirrors gnome-shell-extension-ubuntu-dock's own gschema override, which
+# only takes effect on a real Ubuntu session. Debian has no equivalent, so
+# these values are reapplied here to match Ubuntu's dock behavior.
 [org/gnome/shell/extensions/dash-to-dock]
-autohide-in-fullscreen=false
-transparency-mode='FIXED'
-background-color='#0c0c0c'
-custom-background-color=true
-background-opacity=0.64
-click-action='focus-or-previews'
-custom-theme-shrink=true
-dash-max-icon-size=48
-dock-fixed=true
 dock-position='LEFT'
-extend-height=true
-show-apps-at-top=true
-running-indicator-style='DOTS'
+dock-fixed=true
+intellihide=true
+intellihide-mode='ALL_WINDOWS'
 icon-size-fixed=true
+custom-theme-shrink=true
+running-indicator-style='DOTS'
+extend-height=true
+scroll-action='switch-workspace'
+click-action='focus-or-appspread'
+shift-click-action='launch'
+middle-click-action='launch'
+shift-middle-click-action='minimize'
+disable-overview-on-startup=true
+show-mounts-only-mounted=false
+show-mounts-network=true
 
 [org/gnome/nautilus/icon-view]
 default-zoom-level='small'
@@ -383,6 +398,13 @@ EOF
     STATUS_NOCHANGE+=("dconf system profile already current")
   fi
   rm -f "$tmp"
+
+  # mktemp's file is 0600 and cp (no -p) carries that mode over, leaving even
+  # the owner unable to read the profile without sudo. Enforced unconditionally
+  # so an existing install self-heals without needing a rewrite.
+  if [ -f "$DCONF_PROFILE_FILE" ]; then
+    sudo chmod 0644 "$DCONF_PROFILE_FILE"
+  fi
 }
 
 # Pretty end-of-run report (fires on clean exit and on early exit 1).
@@ -456,20 +478,64 @@ groups | grep -q sudo || error "User $USER is not in the 'sudo' group.
   Fix: su -c '/usr/sbin/usermod -aG sudo ${USER}' && reboot"
 
 ###############################################################################
-# Resolve Ubuntu codename
+# One-time snapshot of pre-existing state, for uninstall.sh
 ###############################################################################
+# Only ever taken once (first run) — a later re-run must NOT overwrite this
+# with a state that already has ubuntu-look's own changes applied, or
+# uninstall.sh would have nothing real to restore.
 
-if [ "$UBUNTU_CODENAME" = "auto" ]; then
-  UBUNTU_CODENAME="$(detect_ubuntu_codename)"
-  GS_VER="$(gnome-shell --version 2>/dev/null || echo 'gnome-shell not installed')"
-  message "auto-detected Ubuntu codename ${GREEN}${UBUNTU_CODENAME}${ENDCOLOR} (${GS_VER})"
-fi
+backup_snapshot_file() {
+  local src="$1" dest="$2"
+  [ -f "$src" ] || return 0
+  mkdir -p "$(dirname "$dest")"
+  cp "$src" "$dest" 2>/dev/null || true
+}
 
-# Ensure the auto-detected theme codename has a source entry.
-if ! echo "$WALLPAPER_CODENAMES" | grep -qw "$UBUNTU_CODENAME"; then
-  WALLPAPER_CODENAMES="$WALLPAPER_CODENAMES $UBUNTU_CODENAME"
+FIRST_RUN=0
+if [ ! -d "$BACKUP_ORIGINAL" ]; then
+  FIRST_RUN=1
+  message "first run — saving your pre-existing config to ${BACKUP_ORIGINAL} (for uninstall.sh)"
+  mkdir -p "$BACKUP_ORIGINAL"
+
+  cp /etc/apt/sources.list "${BACKUP_ORIGINAL}/sources.list" 2>/dev/null || true
+  sudo cp /etc/default/grub "${BACKUP_ORIGINAL}/grub" 2>/dev/null || true
+  cp /etc/environment "${BACKUP_ORIGINAL}/environment" 2>/dev/null || true
+
+  backup_snapshot_file "$HOME/.config/gtk-3.0/gtk.css" "${BACKUP_ORIGINAL}/gtk-3.0-gtk.css"
+  backup_snapshot_file "$HOME/.config/gtk-4.0/gtk.css" "${BACKUP_ORIGINAL}/gtk-4.0-gtk.css"
+  backup_snapshot_file "$HOME/.config/gtk-3.0/settings.ini" "${BACKUP_ORIGINAL}/gtk-3.0-settings.ini"
+  backup_snapshot_file "$HOME/.config/gtk-4.0/settings.ini" "${BACKUP_ORIGINAL}/gtk-4.0-settings.ini"
+  backup_snapshot_file "$HOME/.gtkrc-2.0" "${BACKUP_ORIGINAL}/gtkrc-2.0"
+  backup_snapshot_file "$HOME/.config/xdg-terminals.list" "${BACKUP_ORIGINAL}/xdg-terminals.list"
+  backup_snapshot_file "$HOME/.config/ubuntu-xdg-terminals.list" "${BACKUP_ORIGINAL}/ubuntu-xdg-terminals.list"
+
+  if command -v plymouth-get-default-theme >/dev/null 2>&1; then
+    plymouth-get-default-theme 2>/dev/null > "${BACKUP_ORIGINAL}/plymouth-theme.txt" || true
+  fi
+
+  # Existing Ptyxis default profile's palette/label, if Ptyxis was already
+  # configured before this script ever touches it.
+  _pre_ptyxis_uuid="$(dconf read /org/gnome/Ptyxis/default-profile-uuid 2>/dev/null | tr -d \')"
+  if [ -n "$_pre_ptyxis_uuid" ]; then
+    {
+      echo "uuid=${_pre_ptyxis_uuid}"
+      echo "palette=$(dconf read "/org/gnome/Ptyxis/Profiles/${_pre_ptyxis_uuid}/palette" 2>/dev/null | tr -d \')"
+      echo "label=$(dconf read "/org/gnome/Ptyxis/Profiles/${_pre_ptyxis_uuid}/label" 2>/dev/null | tr -d \')"
+    } > "${BACKUP_ORIGINAL}/ptyxis-profile.txt"
+  fi
+
+  if [ -n "${DBUS_SESSION_BUS_ADDRESS:-}" ] && command -v dconf >/dev/null 2>&1; then
+    dconf dump / > "${BACKUP_ORIGINAL}/dconf-dump.ini" 2>/dev/null || true
+  fi
+
+  dpkg-query -W -f='${Package}\n' 2>/dev/null | sort > "${BACKUP_ORIGINAL}/packages-before.txt"
+  touch "$INSTALLED_MANIFEST" "$REMOVED_MANIFEST"
+  echo "ubuntu-look.sh pre-install snapshot — $(date -Iseconds)" > "${BACKUP_ORIGINAL}/INFO"
+  STATUS_CHANGES+=("Pre-install snapshot saved → ${BACKUP_ORIGINAL}")
+else
+  message "pre-existing config already backed up (from first run) → ${BACKUP_ORIGINAL}"
+  STATUS_NOCHANGE+=("Pre-install snapshot already exists")
 fi
-# ubuntu-wallpapers-* packages are discovered dynamically after apt update below.
 
 ###############################################################################
 # Step: Debian sources.list
@@ -499,32 +565,42 @@ else
 fi
 
 ###############################################################################
-# Step: Ubuntu apt repo (themes / fonts only, strictly pinned)
+# Step: Ubuntu apt repo — broad candidate sources (themes / fonts / wallpapers)
 ###############################################################################
 
-step "Configure Ubuntu archive (Yaru theme: ${UBUNTU_CODENAME} | wallpapers: all releases)"
+step "Configure Ubuntu archive candidate sources"
 
-for prereq in gnupg curl ca-certificates; do
-  dpkg-query -W -f='${Status}' "$prereq" 2>/dev/null | grep -q "install ok installed" && continue
+_missing_prereqs="$(missing_packages "gnupg curl ca-certificates distro-info")"
+if [ -n "$_missing_prereqs" ]; then
   sudo apt-get update -qq
-  sudo apt-get install -y "$prereq" || error "Failed to install prerequisite: $prereq"
-  STATUS_INSTALLED+=("$prereq (prereq)")
-done
+  for prereq in $_missing_prereqs; do
+    sudo apt-get install -y "$prereq" || error "Failed to install prerequisite: $prereq"
+    STATUS_INSTALLED+=("$prereq (prereq)")
+  done
+fi
+
+# Always re-discover the candidate list — distro-info-data updates
+# independently of this script, so a newly-released Ubuntu version becomes a
+# candidate automatically, with no script edit ever required.
+WALLPAPER_CODENAMES="$(discover_ubuntu_codenames)"
+
+# A manually forced codename (UBUNTU_CODENAME=xyz) still needs its own source
+# entry even if distro-info no longer/doesn't yet consider it "supported".
+if [ "$UBUNTU_CODENAME" != "auto" ] && ! echo "$WALLPAPER_CODENAMES" | grep -qw "$UBUNTU_CODENAME"; then
+  WALLPAPER_CODENAMES="$WALLPAPER_CODENAMES $UBUNTU_CODENAME"
+fi
 
 UBUNTU_KEYRING=/etc/apt/keyrings/ubuntu-archive.gpg
 UBUNTU_LIST=/etc/apt/sources.list.d/ubuntu-themes.list
 UBUNTU_PIN=/etc/apt/preferences.d/ubuntu-themes
 
-NEED_REPO_REWRITE=0
-if [ ! -f "$UBUNTU_LIST" ] || [ ! -f "$UBUNTU_KEYRING" ] || [ ! -f "$UBUNTU_PIN" ]; then
-  NEED_REPO_REWRITE=1
-elif ! grep -q "# pin-version: ${PIN_VERSION}" "$UBUNTU_PIN"; then
-  message warn "Ubuntu repo config is from an older script version — rewriting"
-  NEED_REPO_REWRITE=1
+NEED_SOURCES_REWRITE=0
+if [ ! -f "$UBUNTU_LIST" ] || [ ! -f "$UBUNTU_KEYRING" ] || ! grep -qF "# codenames: ${WALLPAPER_CODENAMES}" "$UBUNTU_LIST"; then
+  NEED_SOURCES_REWRITE=1
 fi
 
-if [ $NEED_REPO_REWRITE -eq 1 ]; then
-  message "configuring Ubuntu archive (theme: ${UBUNTU_CODENAME} | wallpapers: ${WALLPAPER_CODENAMES})"
+if [ $NEED_SOURCES_REWRITE -eq 1 ]; then
+  message "configuring Ubuntu archive candidates: ${WALLPAPER_CODENAMES}"
   sudo install -d -m 0755 /etc/apt/keyrings
 
   if ! sudo test -s "$UBUNTU_KEYRING"; then
@@ -533,60 +609,115 @@ if [ $NEED_REPO_REWRITE -eq 1 ]; then
     sudo chmod 0644 "$UBUNTU_KEYRING"
   fi
 
-  # Build source list: one entry per wallpaper codename + the theme codename
-  # (deduped).  All codenames share the same signing key.
   {
-    echo "# Ubuntu — Yaru theme (${UBUNTU_CODENAME}) + wallpapers (all releases)"
-    echo "# Strictly apt-pinned — only theme/font/wallpaper packages are allowed."
-    echo "# See: ${UBUNTU_PIN}"
+    echo "# Ubuntu — Yaru theme + wallpaper (released codenames tried for compatibility)"
+    echo "# Strictly apt-pinned — see ${UBUNTU_PIN}. This marker line lets re-runs"
+    echo "# detect when a new Ubuntu release should be added automatically:"
+    echo "# codenames: ${WALLPAPER_CODENAMES}"
     echo ""
-    # Collect unique codenames: wallpaper set + theme codename
-    printed=""
-    for _c in $WALLPAPER_CODENAMES $UBUNTU_CODENAME; do
-      echo "$printed" | grep -qw "$_c" && continue
-      printed="$printed $_c"
+    for _c in $WALLPAPER_CODENAMES; do
       echo "deb [signed-by=${UBUNTU_KEYRING}] ${UBUNTU_MIRROR} ${_c} main universe"
       echo "deb [signed-by=${UBUNTU_KEYRING}] ${UBUNTU_MIRROR} ${_c}-updates main universe"
     done
   } | sudo tee "$UBUNTU_LIST" > /dev/null
+  STATUS_CHANGES+=("Ubuntu apt sources written (candidates: ${WALLPAPER_CODENAMES})")
+else
+  message "Ubuntu candidate sources already current"
+  STATUS_NOCHANGE+=("Ubuntu apt sources already current")
+fi
 
-  # Priority -1 blocks everything from Ubuntu by default.
-  # The whitelist explicitly allows only theme/icon/font/wallpaper packages and
-  # their Ubuntu-only deps (e.g. session-migration pulled by yaru-theme-gtk).
+###############################################################################
+# Step: apt update (needed before we can query real package versions/compat)
+###############################################################################
+
+step "Refresh package lists"
+sudo apt-get update || error "apt update failed"
+
+###############################################################################
+# Step: resolve the gnome-shell-compatible Ubuntu theme codename + apply pin
+###############################################################################
+
+step "Resolve Ubuntu theme codename"
+
+if [ "$UBUNTU_CODENAME" = "auto" ]; then
+  UBUNTU_CODENAME="$(resolve_ubuntu_codename)"
+  GS_VER="$(gnome-shell --version 2>/dev/null || echo 'gnome-shell not installed')"
+  message "auto-detected Ubuntu codename ${GREEN}${UBUNTU_CODENAME}${ENDCOLOR} (${GS_VER}) — verified via simulated install"
+fi
+
+PTYXIS_CODENAME="$(resolve_ptyxis_codename)"
+if [ -n "$PTYXIS_CODENAME" ]; then
+  message "Ubuntu's own ptyxis build (${GREEN}${PTYXIS_CODENAME}${ENDCOLOR}) installs cleanly here — will be preferred over Debian's"
+else
+  message warn "no Ubuntu ptyxis build is installable on this system (dependency too new) — keeping Debian's ptyxis"
+fi
+
+NEED_PIN_REWRITE=0
+if [ ! -f "$UBUNTU_PIN" ]; then
+  NEED_PIN_REWRITE=1
+elif ! grep -q "# pin-version: ${PIN_VERSION}" "$UBUNTU_PIN"; then
+  message warn "Ubuntu theme pin is from an older script version — rewriting"
+  NEED_PIN_REWRITE=1
+elif ! grep -q "n=${UBUNTU_CODENAME}\$" "$UBUNTU_PIN"; then
+  message warn "a newer compatible Ubuntu release is now available (${UBUNTU_CODENAME}) — rewriting theme pin"
+  NEED_PIN_REWRITE=1
+elif [ -n "$PTYXIS_CODENAME" ] && ! grep -qE "^Package: ptyxis\$" "$UBUNTU_PIN"; then
+  message warn "Ubuntu ptyxis is now installable (${PTYXIS_CODENAME}) — rewriting pin"
+  NEED_PIN_REWRITE=1
+elif [ -n "$PTYXIS_CODENAME" ] && ! awk '/^Package: ptyxis$/{getline; print; exit}' "$UBUNTU_PIN" | grep -q "n=${PTYXIS_CODENAME}\$"; then
+  message warn "a newer installable ptyxis codename is available (${PTYXIS_CODENAME}) — rewriting pin"
+  NEED_PIN_REWRITE=1
+elif [ -z "$PTYXIS_CODENAME" ] && grep -qE "^Package: ptyxis\$" "$UBUNTU_PIN"; then
+  message warn "Ubuntu ptyxis is no longer installable here — rewriting pin to drop it"
+  NEED_PIN_REWRITE=1
+fi
+
+if [ $NEED_PIN_REWRITE -eq 1 ]; then
+  # Priority -1 blocks all Ubuntu packages by default; the whitelist below
+  # allows only theme/icon/font/wallpaper packages and their Ubuntu-only deps.
+  PTYXIS_PIN_BLOCK=""
+  if [ -n "$PTYXIS_CODENAME" ]; then
+    PTYXIS_PIN_BLOCK="
+# Priority 1001 (not 990) is required: Debian's ptyxis is often version-newer
+# than the Ubuntu build, and 990 never overrides an already-installed newer
+# version. Verified installable in resolve_ptyxis_codename() before pinning.
+Package: ptyxis
+Pin: release o=Ubuntu, n=${PTYXIS_CODENAME}
+Pin-Priority: 1001
+"
+  fi
   cat << EOF | sudo tee "$UBUNTU_PIN" > /dev/null
 # pin-version: ${PIN_VERSION}
 Package: *
 Pin: release o=Ubuntu
 Pin-Priority: -1
 
-# Theme and GNOME-shell-extension packages must come only from the matching
-# Ubuntu codename, otherwise a newer release's yaru-theme-gnome-shell may
-# require a gnome-shell version Debian does not provide, causing a hold.
-Package: yaru-theme-* fonts-ubuntu* humanity-icon-theme suru-icon-theme gnome-shell-extension-ubuntu-* session-migration
+# Coupled to the running gnome-shell major version — must match the
+# verified-compatible codename, or a hold can result.
+Package: yaru-theme-gnome-shell gnome-shell-extension-ubuntu-*
 Pin: release o=Ubuntu, n=${UBUNTU_CODENAME}
 Pin-Priority: 990
 
-# Wallpapers have no hard dependency on gnome-shell, so they are safe to pull
-# from any Ubuntu release.  The newest release (resolute / 26.04) re-ships the
-# complete historical set of ubuntu-wallpapers-<codename> packs (groovy gorilla,
-# kinetic kudu, … back to karmic), so adding it here makes every release's
-# wallpapers installable without any version conflicts.
-Package: ubuntu-wallpapers*
+# No gnome-shell coupling — float to the newest release across all
+# configured Ubuntu sources instead of the conservative theme codename.
+Package: yaru-theme-gtk yaru-theme-icon yaru-theme-sound fonts-ubuntu* humanity-icon-theme suru-icon-theme session-migration user-session-migration
+Pin: release o=Ubuntu
+Pin-Priority: 990
+${PTYXIS_PIN_BLOCK}
+# Latest release's default wallpaper only — no per-release packs.
+Package: ubuntu-wallpapers
 Pin: release o=Ubuntu
 Pin-Priority: 990
 EOF
-  STATUS_CHANGES+=("Ubuntu apt source written (theme: ${UBUNTU_CODENAME}, wallpapers: all releases)")
+  STATUS_CHANGES+=("Ubuntu theme pin applied (${UBUNTU_CODENAME}${PTYXIS_CODENAME:+, ptyxis: $PTYXIS_CODENAME})")
 else
-  message "Ubuntu themes repo already configured"
-  STATUS_NOCHANGE+=("Ubuntu apt source already current")
+  message "Ubuntu theme pin already current (${UBUNTU_CODENAME})"
+  STATUS_NOCHANGE+=("Ubuntu theme pin already current")
 fi
 
 ###############################################################################
-# Step: apt update + upgrade
+# Step: apt upgrade
 ###############################################################################
-
-step "Refresh package lists"
-sudo apt-get update || error "apt update failed"
 
 step "Upgrade installed packages"
 upgradable_before="$(apt list --upgradable 2>/dev/null | grep -c '/')"
@@ -600,31 +731,6 @@ else
   STATUS_NOCHANGE+=("apt upgrade: nothing to upgrade")
 fi
 
-# Discover ALL available ubuntu-wallpapers-* packages (every Ubuntu release ever
-# packaged — from karmic 9.10 through the latest) and install them in a dedicated,
-# fault-tolerant step.  The newest release's 'universe' re-ships the complete
-# historical set (verified: resolute 26.04 carries karmic…questing), and
-# ubuntu-wallpapers-lts-legacy adds the pre-karmic LTS art (4.10 Warty Warthog,
-# 6.06 Dapper Drake, 8.04 Hardy Heron) plus every LTS wallpaper.
-#
-# EXCLUDE *-raspi variants: despite the "ubuntu-wallpapers-" prefix,
-# ubuntu-wallpapers-groovy-raspi is a Raspberry-Pi Ubuntu-Cinnamon DESKTOP pack
-# that Depends on an entire desktop (ubuntucinnamon-*, xserver-xorg,
-# network-manager, slick-greeter, whoopsie, …).  Those deps are pinned out (-1),
-# so it is unsatisfiable and — installed in one bulk transaction — would abort the
-# whole wallpaper install.  install_optional() also guards against any future
-# oddball pack by retrying per-package.
-step "Install Ubuntu wallpaper packs (all releases)"
-_all_wp="$(apt-cache pkgnames 2>/dev/null | grep '^ubuntu-wallpapers' | grep -v -- '-raspi' | sort | tr '\n' ' ')"
-if [ -n "$_all_wp" ]; then
-  message "discovered $(echo "$_all_wp" | wc -w) wallpaper pack(s); installing..."
-  _wp_installed="$(install_optional "$_all_wp")"
-  _wp_count="$(echo "$_wp_installed" | wc -w)"
-  STATUS_CHANGES+=("Ubuntu wallpaper packs installed/present: ${_wp_count} release(s)")
-else
-  message warn "no ubuntu-wallpapers-* packs found in apt cache (check Ubuntu sources)"
-fi
-
 ###############################################################################
 # Step: Install packages per category + post-install tasks
 ###############################################################################
@@ -632,9 +738,8 @@ fi
 for category in $package_categories; do
   step "Install + configure: ${category}"
 
-  # Filter the full list to only packages that exist in the apt cache.
-  # This lets us list optional packages (e.g. ubuntu-wallpapers-focal) without
-  # failing when a particular Ubuntu repo doesn't carry them.
+  # Filter to only packages that exist in the apt cache, so an optional
+  # package missing from a particular repo doesn't fail the whole category.
   available="$(available_packages "${packages[$category]}")"
   to_install="$(missing_packages "$available")"
   already="$(installed_packages "$available")"
@@ -653,16 +758,37 @@ for category in $package_categories; do
   case $category in
     # -------------------------------------------------------------------------
     0-base)
-      # GRUB: enable splash for Plymouth
-      if ! grep -q 'GRUB_CMDLINE_LINUX_DEFAULT="quiet splash"' /etc/default/grub; then
-        message "setting GRUB_CMDLINE_LINUX_DEFAULT='quiet splash'"
-        sudo sed -i 's/GRUB_CMDLINE_LINUX_DEFAULT=.*$/GRUB_CMDLINE_LINUX_DEFAULT="quiet splash"/' \
-          /etc/default/grub || error "Failed to update /etc/default/grub"
-        sudo update-grub
-        STATUS_CHANGES+=("/etc/default/grub → GRUB_CMDLINE_LINUX_DEFAULT=\"quiet splash\"")
-        REBOOT_NEEDED=1
+      # GRUB: enable splash for Plymouth. Only done on the very first run —
+      # once set, the user owns this file. A later run must not re-enforce
+      # "quiet splash" over a value the user deliberately changed afterward.
+      if [ "$FIRST_RUN" -eq 1 ]; then
+        # Anchored to line-start so a commented-out line is never mistaken for
+        # an active setting.
+        if ! grep -q '^GRUB_CMDLINE_LINUX_DEFAULT="quiet splash"' /etc/default/grub; then
+          message "setting GRUB_CMDLINE_LINUX_DEFAULT='quiet splash'"
+          if grep -q '^GRUB_CMDLINE_LINUX_DEFAULT=' /etc/default/grub; then
+            # An active assignment already exists — update it in place.
+            sudo sed -i 's/^GRUB_CMDLINE_LINUX_DEFAULT=.*$/GRUB_CMDLINE_LINUX_DEFAULT="quiet splash"/' \
+              /etc/default/grub || error "Failed to update /etc/default/grub"
+          elif grep -q '^#GRUB_CMDLINE_LINUX_DEFAULT=' /etc/default/grub; then
+            # Stock Debian ships this line commented out. Uncomment it in place
+            # rather than appending a second, active line further down the file —
+            # /etc/default/grub is sourced top-to-bottom, so a duplicate active
+            # line would silently shadow this one and make it un-editable.
+            sudo sed -i 's/^#GRUB_CMDLINE_LINUX_DEFAULT=.*$/GRUB_CMDLINE_LINUX_DEFAULT="quiet splash"/' \
+              /etc/default/grub || error "Failed to update /etc/default/grub"
+          else
+            echo 'GRUB_CMDLINE_LINUX_DEFAULT="quiet splash"' | sudo tee -a /etc/default/grub > /dev/null \
+              || error "Failed to update /etc/default/grub"
+          fi
+          sudo update-grub
+          STATUS_CHANGES+=("/etc/default/grub → GRUB_CMDLINE_LINUX_DEFAULT=\"quiet splash\"")
+          REBOOT_NEEDED=1
+        else
+          STATUS_NOCHANGE+=("/etc/default/grub already 'quiet splash'")
+        fi
       else
-        STATUS_NOCHANGE+=("/etc/default/grub already 'quiet splash'")
+        STATUS_NOCHANGE+=("/etc/default/grub left as-is (only set on first run — edit it yourself afterward)")
       fi
 
       # Plymouth theme: use 'spinner' (ships with plymouth-themes on Debian)
@@ -693,27 +819,19 @@ for category in $package_categories; do
 
     # -------------------------------------------------------------------------
     2-desktop-gnome)
-      # Resolve wallpaper paths (for dconf profile and live gsettings).
-      # pick_wallpaper handles the varied release-default naming and always
-      # returns an existing file (worst case warty-final-ubuntu.png).
-      WP_LIGHT="$(pick_wallpaper light)"
-      WP_DARK="$(pick_wallpaper dark)"
+      # ubuntu-wallpapers overwrites these canonical filenames each release
+      # cycle, so they always track the latest release via the floating pin.
+      WP_LIGHT=/usr/share/backgrounds/warty-final-ubuntu.png
+      WP_DARK=/usr/share/backgrounds/ubuntu-wallpaper-d.png
       [ -f "$WP_DARK" ] || WP_DARK="$WP_LIGHT"
 
-      # ------------------------------------------------------------------
-      # Write dconf system profile (the fix for "needs two runs"):
-      # Settings here take effect on first login without any GNOME session,
-      # including extension enabling via enabled-extensions list.
-      # ------------------------------------------------------------------
+      # dconf system profile: settings + extension enabling take effect on
+      # first login, even without a GNOME session.
       message "writing dconf system profile (extensions + GNOME defaults)"
       write_dconf_profile "$WP_LIGHT" "$WP_DARK"
 
-      # If no session bus is exported in this shell (e.g. the script was started
-      # from SSH/TTY/tmux rather than a desktop terminal), fall back to the
-      # well-known systemd user bus.  Without this, the live apply below is
-      # skipped and only a *system default* wallpaper is written — which an
-      # existing user's dconf already shadows, so the desktop would not change.
-      # Pointing at /run/user/$UID/bus lets us set the user's real wallpaper too.
+      # No session bus (e.g. run from SSH/tmux) — fall back to the systemd
+      # user bus so the live gsettings apply below still reaches this user.
       if [ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ] && [ -S "/run/user/$(id -u)/bus" ]; then
         export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
         export DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$(id -u)/bus"
@@ -729,15 +847,25 @@ for category in $package_categories; do
         gset org.gnome.shell start-in-overview false
 
         # Enable extensions in the running shell
-        for ext in \
-          ubuntu-appindicators@ubuntu.com \
-          ubuntu-dock@ubuntu.com \
-          ding@rastersoft.com \
-          user-theme@gnome-shell-extensions.gcampax.github.com
-        do
+        for ext in $SHELL_EXTENSIONS; do
           gnome-extensions enable "$ext" 2>/dev/null || true
         done
 
+        # Verify each one actually landed in the enabled list. "enable" can
+        # silently no-op — e.g. a stale disable left over from uninstall.sh,
+        # or gnome-shell not having rescanned a just-installed extension yet —
+        # leaving the dock/indicators missing with no error printed anywhere.
+        ENABLED_NOW="$(gnome-extensions list --enabled 2>/dev/null)"
+        for ext in $SHELL_EXTENSIONS; do
+          if ! echo "$ENABLED_NOW" | grep -qx "$ext"; then
+            message warn "extension ${ext} did not activate — log out and back in, then re-run this script"
+            STATUS_CHANGES+=("WARNING: ${ext} not active — log out/in and re-run")
+            RELOGIN_NEEDED=1
+          fi
+        done
+
+        # 'default' (light) matches upstream Ubuntu's out-of-the-box setting.
+        gset org.gnome.desktop.interface color-scheme 'default'
         gset org.gnome.desktop.interface accent-color 'orange'
         gset org.gnome.desktop.interface icon-theme 'Yaru'
         gset org.gnome.desktop.interface cursor-theme 'Yaru'
@@ -760,20 +888,22 @@ for category in $package_categories; do
         gset org.gnome.mutter focus-change-on-pointer-rest true
         gset org.gnome.desktop.peripherals.touchpad tap-to-click true
         gset org.gnome.desktop.peripherals.touchpad click-method 'default'
-        gset org.gnome.shell.extensions.dash-to-dock autohide-in-fullscreen false
-        gset org.gnome.shell.extensions.dash-to-dock transparency-mode 'FIXED'
-        gset org.gnome.shell.extensions.dash-to-dock background-color '#0c0c0c'
-        gset org.gnome.shell.extensions.dash-to-dock custom-background-color true
-        gset org.gnome.shell.extensions.dash-to-dock background-opacity 0.64
-        gset org.gnome.shell.extensions.dash-to-dock click-action 'focus-or-previews'
-        gset org.gnome.shell.extensions.dash-to-dock custom-theme-shrink true
-        gset org.gnome.shell.extensions.dash-to-dock dash-max-icon-size 48
-        gset org.gnome.shell.extensions.dash-to-dock dock-fixed true
         gset org.gnome.shell.extensions.dash-to-dock dock-position 'LEFT'
-        gset org.gnome.shell.extensions.dash-to-dock extend-height true
-        gset org.gnome.shell.extensions.dash-to-dock show-apps-at-top true
-        gset org.gnome.shell.extensions.dash-to-dock running-indicator-style 'DOTS'
+        gset org.gnome.shell.extensions.dash-to-dock dock-fixed true
+        gset org.gnome.shell.extensions.dash-to-dock intellihide true
+        gset org.gnome.shell.extensions.dash-to-dock intellihide-mode 'ALL_WINDOWS'
         gset org.gnome.shell.extensions.dash-to-dock icon-size-fixed true
+        gset org.gnome.shell.extensions.dash-to-dock custom-theme-shrink true
+        gset org.gnome.shell.extensions.dash-to-dock running-indicator-style 'DOTS'
+        gset org.gnome.shell.extensions.dash-to-dock extend-height true
+        gset org.gnome.shell.extensions.dash-to-dock scroll-action 'switch-workspace'
+        gset org.gnome.shell.extensions.dash-to-dock click-action 'focus-or-appspread'
+        gset org.gnome.shell.extensions.dash-to-dock shift-click-action 'launch'
+        gset org.gnome.shell.extensions.dash-to-dock middle-click-action 'launch'
+        gset org.gnome.shell.extensions.dash-to-dock shift-middle-click-action 'minimize'
+        gset org.gnome.shell.extensions.dash-to-dock disable-overview-on-startup true
+        gset org.gnome.shell.extensions.dash-to-dock show-mounts-only-mounted false
+        gset org.gnome.shell.extensions.dash-to-dock show-mounts-network true
         gset org.gnome.nautilus.icon-view default-zoom-level 'small'
         gset org.gnome.nautilus.preferences open-folder-on-dnd-hover false
         gset org.gtk.Settings.FileChooser sort-directories-first true
@@ -789,9 +919,6 @@ for category in $package_categories; do
         message warn "No D-Bus session detected — settings written to dconf profile only."
         message warn "Log out and back in to apply theme, extensions, and wallpaper."
       fi
-
-      # Apply wallpaper path to summary regardless
-      [ -f "$WP_LIGHT" ] && STATUS_CHANGES+=("Wallpaper: $(basename "$WP_LIGHT")")
 
       # ------------------------------------------------------------------
       # Yaru light/dark auto-switch service
@@ -917,23 +1044,193 @@ EOF
         STATUS_NOCHANGE+=("~/.gtkrc-2.0 already has gtk-color-scheme")
       fi
 
-      # gnome-terminal Ubuntu purple profile (only if schema exists)
-      if command -v gnome-terminal >/dev/null 2>&1 \
-         && gsettings list-schemas 2>/dev/null | grep -q "^org.gnome.Terminal.ProfilesList$" \
-         && [ -n "${DBUS_SESSION_BUS_ADDRESS:-}" ]; then
-        message "applying Ubuntu purple gnome-terminal colors to default profile"
-        gset org.gnome.Terminal.Legacy.Settings theme-variant 'dark'
-        TERM_PROFILE_UUID="$(gsettings get org.gnome.Terminal.ProfilesList default 2>/dev/null | tr -d \')"
-        if [ -n "$TERM_PROFILE_UUID" ]; then
-          TERM_PATH="org.gnome.Terminal.Legacy.Profile:/org/gnome/terminal/legacy/profiles:/:${TERM_PROFILE_UUID}/"
-          gset "$TERM_PATH" use-theme-colors false
-          gset "$TERM_PATH" background-color '#300A24'
-          gset "$TERM_PATH" foreground-color '#FFFFFF'
-          gset "$TERM_PATH" use-theme-transparency false
+      # ------------------------------------------------------------------
+      # Ptyxis: Ubuntu's default terminal since 24.10. Selects the built-in
+      # Ubuntu palette and makes Ptyxis the system default terminal.
+      # ------------------------------------------------------------------
+      if command -v ptyxis >/dev/null 2>&1; then
+        # missing_packages() only checks "is it installed", so a Debian-origin
+        # ptyxis is never re-queued by the pin alone. Compare versions
+        # explicitly and switch if they differ.
+        _ptyxis_installed_ver="$(dpkg-query -W -f='${Version}' ptyxis 2>/dev/null)"
+        _ptyxis_candidate_ver="$(apt-cache policy ptyxis 2>/dev/null | awk '/Candidate:/{print $2; exit}')"
+        if [ -n "$_ptyxis_candidate_ver" ] && [ "$_ptyxis_installed_ver" != "$_ptyxis_candidate_ver" ]; then
+          message "switching ptyxis ${_ptyxis_installed_ver} → ${_ptyxis_candidate_ver} (Ubuntu ${PTYXIS_CODENAME})"
+          if sudo apt-get install -y --allow-downgrades "ptyxis=${_ptyxis_candidate_ver}" >/dev/null 2>&1; then
+            STATUS_CHANGES+=("ptyxis switched to Ubuntu build ${_ptyxis_candidate_ver} (${PTYXIS_CODENAME})")
+            RELOGIN_NEEDED=1
+          else
+            message warn "failed to switch ptyxis to the Ubuntu build — keeping ${_ptyxis_installed_ver}"
+          fi
         fi
+
+        # Ptyxis ships a built-in "Ubuntu" palette (48.x+); a custom file with
+        # the same id would create a visible duplicate entry. Remove any such
+        # leftover from older script versions.
+        PTYXIS_STALE_PALETTE_FILE="$HOME/.local/share/org.gnome.Ptyxis/palettes/Ubuntu.palette"
+        if [ -f "$PTYXIS_STALE_PALETTE_FILE" ]; then
+          rm -f "$PTYXIS_STALE_PALETTE_FILE"
+          STATUS_CHANGES+=("Removed duplicate custom Ubuntu Ptyxis palette (built-in one is used instead)")
+        fi
+
+        message "selecting Ptyxis's built-in Ubuntu palette"
+
+        # Ptyxis profiles live at /org/gnome/Ptyxis/Profiles/<uuid>/ (relocatable
+        # schema). Reuse the existing default profile if there is one; otherwise
+        # create one so the palette is set before Ptyxis is ever launched.
+        PTYXIS_UUID="$(dconf read /org/gnome/Ptyxis/default-profile-uuid 2>/dev/null | tr -d \')"
+        [ -z "$PTYXIS_UUID" ] && PTYXIS_UUID="$(gsettings get org.gnome.Ptyxis default-profile-uuid 2>/dev/null | tr -d \')"
+        if [ -n "$PTYXIS_UUID" ]; then
+          PTYXIS_CUR_PALETTE="$(dconf read "/org/gnome/Ptyxis/Profiles/${PTYXIS_UUID}/palette" 2>/dev/null | tr -d \')"
+          if [ "$PTYXIS_CUR_PALETTE" != "Ubuntu" ]; then
+            for _key in palette label; do
+              dconf write "/org/gnome/Ptyxis/Profiles/${PTYXIS_UUID}/${_key}" "'Ubuntu'" 2>/dev/null || true
+            done
+            STATUS_CHANGES+=("Ptyxis: Ubuntu palette applied to profile ${PTYXIS_UUID}")
+            RELOGIN_NEEDED=1
+          else
+            STATUS_NOCHANGE+=("Ptyxis: profile ${PTYXIS_UUID} already uses Ubuntu palette")
+          fi
+        else
+          PTYXIS_NEW_UUID="$(python3 -c 'import uuid; print(uuid.uuid4().hex)' 2>/dev/null || uuidgen 2>/dev/null | tr -d '-' || echo "ptyxis-$(date +%s)")"
+          dconf write /org/gnome/Ptyxis/default-profile-uuid "'${PTYXIS_NEW_UUID}'"
+          dconf write /org/gnome/Ptyxis/profile-uuids "['${PTYXIS_NEW_UUID}']"
+          dconf write "/org/gnome/Ptyxis/Profiles/${PTYXIS_NEW_UUID}/palette" "'Ubuntu'"
+          dconf write "/org/gnome/Ptyxis/Profiles/${PTYXIS_NEW_UUID}/label" "'Ubuntu'"
+          STATUS_CHANGES+=("Ptyxis: created profile ${PTYXIS_NEW_UUID} with Ubuntu palette")
+          RELOGIN_NEEDED=1
+        fi
+
+        # Clean up the non-functional Nautilus Script a previous run of this
+        # script may have left behind (Scripts menu doesn't exist in nautilus
+        # 43+, so this file could never have done anything).
+        NAUTILUS_STALE_SCRIPT="$HOME/.local/share/nautilus/scripts/Open Terminal Here"
+        if [ -f "$NAUTILUS_STALE_SCRIPT" ]; then
+          rm -f "$NAUTILUS_STALE_SCRIPT"
+          STATUS_CHANGES+=("Removed non-functional Nautilus Script: 'Open Terminal Here'")
+        fi
+
+        # nautilus-extension-gnome-terminal is hardcoded to gnome-terminal
+        # over D-Bus and cannot be pointed at Ptyxis. Remove it; replaced
+        # below with a Nautilus extension that launches Ptyxis instead.
+        if is_installed nautilus-extension-gnome-terminal; then
+          if sudo apt-get remove -y nautilus-extension-gnome-terminal 2>/dev/null; then
+            STATUS_CHANGES+=("Removed nautilus-extension-gnome-terminal (hardcoded to gnome-terminal, conflicts with Ptyxis)")
+            mkdir -p "$BACKUP_DIR"
+            echo "nautilus-extension-gnome-terminal" >> "$REMOVED_MANIFEST"
+            sort -u -o "$REMOVED_MANIFEST" "$REMOVED_MANIFEST"
+            RELOGIN_NEEDED=1
+          else
+            message warn "failed to remove nautilus-extension-gnome-terminal"
+          fi
+        fi
+
+        # python3-nautilus (Nautilus.MenuProvider) is the supported way to add
+        # right-click menu items in GTK4 Nautilus.
+        if ! is_installed python3-nautilus; then
+          if sudo apt-get install -y python3-nautilus 2>/dev/null; then
+            STATUS_CHANGES+=("Installed python3-nautilus (for the Ptyxis right-click extension)")
+            STATUS_INSTALLED+=("python3-nautilus")
+          else
+            message warn "failed to install python3-nautilus — Nautilus right-click won't get a terminal entry"
+          fi
+        else
+          STATUS_NOCHANGE+=("python3-nautilus already installed")
+        fi
+
+        if is_installed python3-nautilus; then
+          NAUTILUS_EXT_DIR="$HOME/.local/share/nautilus-python/extensions"
+          NAUTILUS_EXT_FILE="${NAUTILUS_EXT_DIR}/ubuntu_look_ptyxis.py"
+          mkdir -p "$NAUTILUS_EXT_DIR"
+          NAUTILUS_EXT_NEW="$(mktemp)"
+          cat << 'EOF' > "$NAUTILUS_EXT_NEW"
+# Installed by ubuntu-look.sh — adds "Open Terminal Here" to Nautilus's
+# right-click menu, launching Ptyxis in the folder being viewed.
+from gi.repository import GLib, GObject, Nautilus
+
+
+class UbuntuLookOpenPtyxisHere(GObject.GObject, Nautilus.MenuProvider):
+    def _menu_item(self, item_id, path):
+        item = Nautilus.MenuItem(
+            name=item_id,
+            label="Open Terminal Here",
+            icon="org.gnome.Ptyxis",
+        )
+        item.connect("activate", self._launch, path)
+        return item
+
+    def _launch(self, _menu_item, path):
+        GLib.spawn_async(
+            ["ptyxis", "--new-window", "--working-directory=" + path],
+            flags=GLib.SpawnFlags.SEARCH_PATH,
+        )
+
+    def get_background_items(self, folder):
+        path = folder.get_location().get_path()
+        if not path:
+            return []
+        return [self._menu_item("UbuntuLookOpenPtyxisHere::background", path)]
+
+    def get_file_items(self, files):
+        if len(files) != 1 or not files[0].is_directory():
+            return []
+        path = files[0].get_location().get_path()
+        if not path:
+            return []
+        return [self._menu_item("UbuntuLookOpenPtyxisHere::selection", path)]
+EOF
+          if [ ! -f "$NAUTILUS_EXT_FILE" ] || ! cmp -s "$NAUTILUS_EXT_NEW" "$NAUTILUS_EXT_FILE"; then
+            cp "$NAUTILUS_EXT_NEW" "$NAUTILUS_EXT_FILE"
+            STATUS_CHANGES+=("Nautilus extension installed: 'Open Terminal Here' → Ptyxis (right-click ▸ Open Terminal Here)")
+            RELOGIN_NEEDED=1
+          else
+            STATUS_NOCHANGE+=("Nautilus Ptyxis extension already current")
+          fi
+          rm -f "$NAUTILUS_EXT_NEW"
+        fi
+
+        if command -v update-alternatives >/dev/null 2>&1; then
+          _ptyxis_bin="$(command -v ptyxis)"
+          _alt_current="$(readlink -f /etc/alternatives/x-terminal-emulator 2>/dev/null || true)"
+          sudo update-alternatives --install /usr/bin/x-terminal-emulator x-terminal-emulator "$_ptyxis_bin" 30 2>/dev/null || true
+          if [ "$_alt_current" != "$_ptyxis_bin" ]; then
+            sudo update-alternatives --set x-terminal-emulator "$_ptyxis_bin" 2>/dev/null || true
+            STATUS_CHANGES+=("x-terminal-emulator alternative set to ptyxis")
+            RELOGIN_NEEDED=1
+          else
+            STATUS_NOCHANGE+=("x-terminal-emulator alternative already ptyxis")
+          fi
+        fi
+
+        # xdg-terminal-exec (used by newer terminal-launching apps) checks
+        # <desktop>-xdg-terminals.list before the generic xdg-terminals.list, in
+        # $XDG_CONFIG_HOME then $XDG_DATA_HOME/DIRS — write both so it resolves
+        # to Ptyxis regardless of $XDG_CURRENT_DESKTOP.
+        mkdir -p "$HOME/.config"
+        for _xlist in xdg-terminals.list ubuntu-xdg-terminals.list; do
+          _xf="$HOME/.config/${_xlist}"
+          if [ ! -f "$_xf" ] || ! grep -qs '^org.gnome.Ptyxis' "$_xf"; then
+            printf '%s\n' 'org.gnome.Ptyxis.desktop:new-window' 'org.gnome.Ptyxis.desktop' > "$_xf"
+            STATUS_CHANGES+=("Ptyxis: wrote ~/.config/${_xlist}")
+            RELOGIN_NEEDED=1
+          else
+            STATUS_NOCHANGE+=("Ptyxis: ~/.config/${_xlist} already has Ptyxis")
+          fi
+        done
+      else
+        message warn "Ptyxis not installed — skipping terminal configuration"
       fi
       ;;
   esac
 done
+
+# Record every package this run actually installed (not just "present"), so
+# uninstall.sh can remove exactly what ubuntu-look.sh added — never a package
+# that happened to already be on the system for unrelated reasons.
+if [ ${#STATUS_INSTALLED[@]} -gt 0 ]; then
+  mkdir -p "$BACKUP_DIR"
+  printf '%s\n' "${STATUS_INSTALLED[@]}" | sed -E 's/ \(prereq\)$//' >> "$INSTALLED_MANIFEST"
+  sort -u -o "$INSTALLED_MANIFEST" "$INSTALLED_MANIFEST"
+fi
 
 message "${GREEN}All steps finished. See SUMMARY below.${ENDCOLOR}"
