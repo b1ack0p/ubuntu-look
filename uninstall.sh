@@ -240,8 +240,20 @@ step_ptyxis() {
   fi
 
   if command -v update-alternatives >/dev/null 2>&1; then
-    sudo update-alternatives --auto x-terminal-emulator 2>/dev/null || true
-    DONE+=("x-terminal-emulator alternative reset to auto")
+    if [ $HAVE_SNAPSHOT -eq 1 ] && [ -f "${BACKUP_ORIGINAL}/x-terminal-emulator-alternative.txt" ]; then
+      ( # shellcheck disable=SC1090
+        . "${BACKUP_ORIGINAL}/x-terminal-emulator-alternative.txt" 2>/dev/null
+        if [ "${status:-}" = "manual" ] && [ -n "${target:-}" ] && [ -x "${target:-}" ]; then
+          sudo update-alternatives --set x-terminal-emulator "${target}" 2>/dev/null
+        else
+          sudo update-alternatives --auto x-terminal-emulator 2>/dev/null
+        fi
+      )
+      DONE+=("x-terminal-emulator alternative restored to your pre-install state")
+    else
+      sudo update-alternatives --auto x-terminal-emulator 2>/dev/null || true
+      GUESSED+=("x-terminal-emulator alternative reset to auto (no snapshot of your prior selection)")
+    fi
   fi
 
   local xlist target
@@ -256,9 +268,22 @@ step_ptyxis() {
     fi
   done
 
-  if [ -n "${DBUS_SESSION_BUS_ADDRESS:-}" ]; then
+  if [ $HAVE_SNAPSHOT -eq 1 ] && [ -f "${BACKUP_ORIGINAL}/default-terminal-override.txt" ]; then
+    ( # shellcheck disable=SC1090
+      . "${BACKUP_ORIGINAL}/default-terminal-override.txt" 2>/dev/null
+      if [ "${had_override:-0}" = "1" ]; then
+        dconf write /org/gnome/desktop/default-applications/terminal/exec "'${exec:-}'" 2>/dev/null
+        dconf write /org/gnome/desktop/default-applications/terminal/exec-arg "'${exec_arg:-}'" 2>/dev/null
+      else
+        gsettings reset org.gnome.desktop.default-applications.terminal exec 2>/dev/null || true
+        gsettings reset org.gnome.desktop.default-applications.terminal exec-arg 2>/dev/null || true
+      fi
+    )
+    DONE+=("Default-terminal exec/exec-arg restored to your pre-install state")
+  elif [ -n "${DBUS_SESSION_BUS_ADDRESS:-}" ]; then
     gsettings reset org.gnome.desktop.default-applications.terminal exec 2>/dev/null || true
     gsettings reset org.gnome.desktop.default-applications.terminal exec-arg 2>/dev/null || true
+    GUESSED+=("Default-terminal exec/exec-arg reset to schema default (no snapshot of your prior value)")
   fi
 }
 

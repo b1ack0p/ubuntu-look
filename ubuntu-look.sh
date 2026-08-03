@@ -82,7 +82,7 @@ UBUNTU_MIRROR="http://archive.ubuntu.com/ubuntu"
 FALLBACK_CODENAMES="focal jammy noble plucky questing resolute"
 
 # Bump whenever pin/source content changes, so re-runs detect stale config.
-PIN_VERSION="v11-2026-08-03"
+PIN_VERSION="v12-2026-08-03"
 
 # Extensions that make up the Ubuntu look. Single source of truth for the
 # dconf profile, the live-session enable loop, and the verification loop.
@@ -491,6 +491,31 @@ backup_snapshot_file() {
   cp "$src" "$dest" 2>/dev/null || true
 }
 
+###############################################################################
+# Guard: don't silently treat an already-modified system as "pristine" just
+# because ~/.ubuntu-look-backup is missing — e.g. it was deleted per
+# uninstall.sh's own cleanup instructions while some changes were still in
+# place. If that happens, the "first run" snapshot below would permanently
+# bake those leftover changes in as the thing uninstall.sh restores back to.
+###############################################################################
+if [ ! -d "$BACKUP_ORIGINAL" ]; then
+  _taint_signs=""
+  for _p in yaru-theme-gnome-shell yaru-theme-gtk yaru-theme-icon yaru-theme-sound \
+            humanity-icon-theme gnome-shell-extension-ubuntu-dock \
+            gnome-shell-extension-ubuntu-tiling-assistant ptyxis; do
+    is_installed "$_p" && _taint_signs="$_taint_signs $_p"
+  done
+  if [ -n "$_taint_signs" ]; then
+    message warn "No pre-install snapshot found, but this system already shows signs of a"
+    message warn "previous ubuntu-look.sh run (installed:${_taint_signs})."
+    message warn "This usually means ~/.ubuntu-look-backup was deleted while changes were"
+    message warn "still in place. The snapshot this run is about to take will NOT be a true"
+    message warn "pre-ubuntu-look baseline — uninstall.sh will only ever be able to restore"
+    message warn "back to THIS (already-modified) state, not your original setup."
+    confirm_continue
+  fi
+fi
+
 FIRST_RUN=0
 if [ ! -d "$BACKUP_ORIGINAL" ]; then
   FIRST_RUN=1
@@ -508,6 +533,32 @@ if [ ! -d "$BACKUP_ORIGINAL" ]; then
   backup_snapshot_file "$HOME/.gtkrc-2.0" "${BACKUP_ORIGINAL}/gtkrc-2.0"
   backup_snapshot_file "$HOME/.config/xdg-terminals.list" "${BACKUP_ORIGINAL}/xdg-terminals.list"
   backup_snapshot_file "$HOME/.config/ubuntu-xdg-terminals.list" "${BACKUP_ORIGINAL}/ubuntu-xdg-terminals.list"
+
+  # Exact pre-install default-terminal state, so uninstall.sh can restore your
+  # actual prior terminal preference (e.g. gnome-terminal) instead of
+  # resetting to a generic schema default after switching to Ptyxis.
+  {
+    _dt_exec="$(dconf read /org/gnome/desktop/default-applications/terminal/exec 2>/dev/null | tr -d \')"
+    _dt_exec_arg="$(dconf read /org/gnome/desktop/default-applications/terminal/exec-arg 2>/dev/null | tr -d \')"
+    if [ -n "$_dt_exec" ] || [ -n "$_dt_exec_arg" ]; then
+      echo "had_override=1"
+      echo "exec=${_dt_exec}"
+      echo "exec_arg=${_dt_exec_arg}"
+    else
+      echo "had_override=0"
+    fi
+  } > "${BACKUP_ORIGINAL}/default-terminal-override.txt"
+
+  if command -v update-alternatives >/dev/null 2>&1 && update-alternatives --query x-terminal-emulator >/dev/null 2>&1; then
+    {
+      if update-alternatives --query x-terminal-emulator 2>/dev/null | grep -q '^Status: manual$'; then
+        echo "status=manual"
+        echo "target=$(readlink -f /etc/alternatives/x-terminal-emulator 2>/dev/null)"
+      else
+        echo "status=auto"
+      fi
+    } > "${BACKUP_ORIGINAL}/x-terminal-emulator-alternative.txt"
+  fi
 
   if command -v plymouth-get-default-theme >/dev/null 2>&1; then
     plymouth-get-default-theme 2>/dev/null > "${BACKUP_ORIGINAL}/plymouth-theme.txt" || true
@@ -704,8 +755,11 @@ Package: yaru-theme-gtk yaru-theme-icon yaru-theme-sound fonts-ubuntu* humanity-
 Pin: release o=Ubuntu
 Pin-Priority: 990
 ${PTYXIS_PIN_BLOCK}
-# Latest release's default wallpaper only — no per-release packs.
-Package: ubuntu-wallpapers
+# Latest release's default wallpaper only — no per-release packs. The
+# ubuntu-wallpapers metapackage Depends on a per-codename pack (e.g.
+# ubuntu-wallpapers-resolute) that must be pinned too, or apt can't satisfy
+# the dependency and the whole install aborts.
+Package: ubuntu-wallpapers ubuntu-wallpapers-*
 Pin: release o=Ubuntu
 Pin-Priority: 990
 EOF
