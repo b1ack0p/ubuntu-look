@@ -1,0 +1,5 @@
+# The .deb bundle is built locally, on demand:
+#     bash ubuntu-look-offline.sh --download
+# Nothing in here is tracked, so this folder ships empty.
+*
+!.gitignore
