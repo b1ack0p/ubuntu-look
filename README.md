@@ -302,6 +302,85 @@ $ gsettings set org.gnome.desktop.background picture-uri-dark 'file:///usr/share
 > you are happy. `uninstall.sh` restores every one of them to the value it had
 > before the first install, not to Ubuntu's.
 
+### GNOME animations and hot corners
+
+Motion is a master switch plus a few per-component keys, all of them ordinary
+GSettings like everything else here.
+
+```bash
+# The master switch. false stops every animation GNOME draws: the overview
+# sliding open and closed, menus and popovers popping up and down, windows
+# minimising and restoring, the workspace slide, dialogs fading in, and the
+# dock's own slide. GTK follows the same key, so applications stop animating
+# too. This is what Settings -> Accessibility -> Seeing -> Reduce Animation
+# writes. Ubuntu and Debian both ship it on, so the script leaves it alone.
+$ gsettings set org.gnome.desktop.interface enable-animations false
+$ gsettings reset org.gnome.desktop.interface enable-animations
+```
+
+The hot corner is not an animation but is asked about in the same breath, and
+it is one of the few behaviours here that genuinely differs between the two
+distributions: Debian leaves the top-left corner live, Ubuntu does not, so the
+installer turns it off. Either way the Super key still opens the overview.
+
+```bash
+# Top-left corner opens the overview: Debian's default, off under Ubuntu
+$ gsettings set org.gnome.desktop.interface enable-hot-corners true
+
+# What the Super key does instead. '' unbinds it entirely; `gsettings get`
+# first if you want to put the current binding back by hand.
+$ gsettings set org.gnome.mutter overlay-key ''
+$ gsettings reset org.gnome.mutter overlay-key
+```
+
+The dock has its own timings, in seconds, independent of the master switch:
+
+```bash
+# Slide in / slide out, and the pauses before each
+$ gsettings set org.gnome.shell.extensions.dash-to-dock animation-time 0.0
+$ gsettings set org.gnome.shell.extensions.dash-to-dock show-delay 0.0
+$ gsettings set org.gnome.shell.extensions.dash-to-dock hide-delay 0.0
+
+# Whether the screen edge has to be pushed against before the dock comes out
+$ gsettings set org.gnome.shell.extensions.dash-to-dock require-pressure-to-show false
+$ gsettings set org.gnome.shell.extensions.dash-to-dock pressure-threshold 100.0
+```
+
+Those five do nothing until the dock actually hides. The script sets
+`dock-fixed true`, as Ubuntu has it, so the dock is always on screen and never
+slides; set `dock-fixed false` or `intellihide true` (above) first and the
+timings start to matter.
+
+The tiling assistant animates a window into and out of a tile, and offers a
+popup for the other half of the screen. All three are separate keys:
+
+```bash
+$ gsettings set org.gnome.shell.extensions.tiling-assistant enable-tile-animations false
+$ gsettings set org.gnome.shell.extensions.tiling-assistant enable-untile-animations false
+$ gsettings set org.gnome.shell.extensions.tiling-assistant enable-tiling-popup false
+```
+
+And the one animation you see before anything else — the overview sliding open
+as you log in. GNOME does that; Ubuntu does not, and the installer follows
+Ubuntu:
+
+```bash
+# true = log straight to the desktop (Ubuntu, and what the script sets)
+$ gsettings set org.gnome.shell.extensions.dash-to-dock disable-overview-on-startup false
+```
+
+Of everything in this section the installer writes only two keys —
+`enable-hot-corners` and `disable-overview-on-startup` — so a later run puts
+those two back to Ubuntu's values and leaves the rest exactly as you set them.
+`uninstall.sh` restores both to what they were before the first install.
+
+These are per-user keys, and the login screen is a different user reading the
+gdm dconf profile, so turning animations off for yourself does not quiet the
+greeter. A file of your own under `/etc/dconf/db/gdm.d/` with
+`enable-animations=false` under `[org/gnome/desktop/interface]`, followed by
+`sudo dconf update`, does that — and stays there, since `uninstall.sh` removes
+only the database file this script wrote.
+
 ## Offline install
 
 `ubuntu-look-offline.sh` does the same job from a local `.deb` bundle in `packages/`.
