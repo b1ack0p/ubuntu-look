@@ -257,6 +257,33 @@ $ gsettings set org.gnome.shell.extensions.dash-to-dock dash-max-icon-size 32
 $ gsettings set org.gnome.shell.extensions.dash-to-dock show-trash false
 $ gsettings set org.gnome.shell.extensions.dash-to-dock show-mounts false
 
+# How transparent the dock is. Every opacity key here is a fraction, which is
+# the percentage divided by 100: 0.0 is invisible, 0.25 is 25% opaque and very
+# see-through, 0.8 is 80% and nearly solid, 1.0 is an opaque bar. Higher is
+# less transparent. Ubuntu ships transparency-mode DEFAULT, which ignores the
+# opacity keys and does its own thing: translucent while the desktop below is
+# clear, solid once a window touches the dock. Switch to FIXED for one opacity
+# that never changes, and set it in the same breath.
+$ gsettings set org.gnome.shell.extensions.dash-to-dock transparency-mode FIXED
+
+# 25% opaque, i.e. mostly transparent
+$ gsettings set org.gnome.shell.extensions.dash-to-dock background-opacity 0.25
+
+# 80% opaque, i.e. only slightly transparent
+$ gsettings set org.gnome.shell.extensions.dash-to-dock background-opacity 0.8
+
+# DYNAMIC keeps Ubuntu's two-state behaviour but lets you pick both ends:
+# min-alpha with the desktop clear, max-alpha once a window is against the
+# dock. Both are read only when customize-alphas is true. Below: 10% normally,
+# 90% when a window reaches it.
+$ gsettings set org.gnome.shell.extensions.dash-to-dock transparency-mode DYNAMIC
+$ gsettings set org.gnome.shell.extensions.dash-to-dock customize-alphas true
+$ gsettings set org.gnome.shell.extensions.dash-to-dock min-alpha 0.1
+$ gsettings set org.gnome.shell.extensions.dash-to-dock max-alpha 0.9
+
+# Back to Ubuntu's own behaviour
+$ gsettings reset org.gnome.shell.extensions.dash-to-dock transparency-mode
+
 # Desktop icons: which corner they start from, and what appears there
 $ gsettings set org.gnome.shell.extensions.ding start-corner top-left
 $ gsettings set org.gnome.shell.extensions.ding show-trash true
@@ -296,11 +323,11 @@ $ gsettings set org.gnome.desktop.background picture-uri-dark 'file:///usr/share
 ```
 
 > **Re-running the installer puts these back.** Every key above except
-> `dash-max-icon-size`, `show-trash` and `show-mounts` is one of the Ubuntu
-> defaults the script applies, so a later `ubuntu-look.sh` run overwrites your
-> choice with Ubuntu's. Re-apply yours afterwards, or simply do not re-run once
-> you are happy. `uninstall.sh` restores every one of them to the value it had
-> before the first install, not to Ubuntu's.
+> `dash-max-icon-size`, `show-trash`, `show-mounts` and the transparency keys
+> is one of the Ubuntu defaults the script applies, so a later `ubuntu-look.sh`
+> run overwrites your choice with Ubuntu's. Re-apply yours afterwards, or
+> simply do not re-run once you are happy. `uninstall.sh` restores every one of
+> them to the value it had before the first install, not to Ubuntu's.
 
 ### GNOME animations and hot corners
 
