@@ -257,6 +257,12 @@ $ gsettings set org.gnome.shell.extensions.dash-to-dock dash-max-icon-size 32
 $ gsettings set org.gnome.shell.extensions.dash-to-dock show-trash false
 $ gsettings set org.gnome.shell.extensions.dash-to-dock show-mounts false
 
+# Which drives the dock lists. The script sets both: only-mounted false lists
+# every known drive, mounted or not, and network true includes network shares.
+# Set only-mounted true for just what is mounted right now.
+$ gsettings set org.gnome.shell.extensions.dash-to-dock show-mounts-only-mounted true
+$ gsettings set org.gnome.shell.extensions.dash-to-dock show-mounts-network false
+
 # How transparent the dock is. Every opacity key here is a fraction, which is
 # the percentage divided by 100: 0.0 is invisible, 0.25 is 25% opaque and very
 # see-through, 0.8 is 80% and nearly solid, 1.0 is an opaque bar. Higher is
@@ -284,10 +290,16 @@ $ gsettings set org.gnome.shell.extensions.dash-to-dock max-alpha 0.9
 # Back to Ubuntu's own behaviour
 $ gsettings reset org.gnome.shell.extensions.dash-to-dock transparency-mode
 
-# Desktop icons: which corner they start from, and what appears there
+# Desktop icons: which corner they start from, and what appears there.
+# show-volumes puts mounted drives on the desktop; Ubuntu, and so the script,
+# keeps both Trash and drives off it.
 $ gsettings set org.gnome.shell.extensions.ding start-corner top-left
 $ gsettings set org.gnome.shell.extensions.ding show-trash true
 $ gsettings set org.gnome.shell.extensions.ding show-volumes true
+
+# The order icons are laid out in: DESCENDINGNAME (Ubuntu's, and the script's)
+# or ASCENDINGNAME
+$ gsettings set org.gnome.shell.extensions.ding arrangeorder ASCENDINGNAME
 
 # Middle-click paste: the script turns this off, as Ubuntu has it. The clock is
 # 24-hour on both already, so the script leaves that one alone.
