@@ -234,191 +234,181 @@ alone.
 
 ## Tweaking the result
 
-Everything the script applies is an ordinary GSettings key, so anything you
-dislike can be changed afterwards with one command. The dock is `ubuntu-dock`,
-a fork of dash-to-dock, and answers to the dash-to-dock schema:
+Everything the script applies is an ordinary GSettings key. Each command below
+is complete — copy the line, change the value at the end. `(script: X)` is what
+the installer writes, so a later run overwrites your choice on that key; keys
+without it are left alone. `uninstall.sh` restores them all.
 
 ```bash
-# Where the dock sits: LEFT (Ubuntu default) / RIGHT / BOTTOM / TOP
+$ gsettings get   org.gnome.desktop.interface accent-color   # read a key
+$ gsettings reset org.gnome.desktop.interface accent-color   # undo one key
+```
+
+### Dock
+
+Ubuntu Dock is a dash-to-dock fork and answers to its schema.
+
+```bash
+# Position: LEFT RIGHT BOTTOM TOP  (script: LEFT)
 $ gsettings set org.gnome.shell.extensions.dash-to-dock dock-position BOTTOM
 
-# Centred panel instead of one spanning the whole edge
+# Span the whole edge, or a centred panel  (script: true)
 $ gsettings set org.gnome.shell.extensions.dash-to-dock extend-height false
 
-# Always visible (Ubuntu default) vs. hiding under maximised windows
+# Always visible  (script: true)
 $ gsettings set org.gnome.shell.extensions.dash-to-dock dock-fixed false
+
+# Hide under windows
 $ gsettings set org.gnome.shell.extensions.dash-to-dock intellihide true
 
-# What clicking a running app does
+# What hides it: ALL_WINDOWS FOCUS_APPLICATION_WINDOWS MAXIMIZED_WINDOWS ALWAYS_ON_TOP  (script: ALL_WINDOWS)
+$ gsettings set org.gnome.shell.extensions.dash-to-dock intellihide-mode MAXIMIZED_WINDOWS
+
+# Icon size in pixels
+$ gsettings set org.gnome.shell.extensions.dash-to-dock dash-max-icon-size 32
+
+# Click a running app: minimize cycle-windows previews launch quit focus-or-appspread  (script: focus-or-appspread)
 $ gsettings set org.gnome.shell.extensions.dash-to-dock click-action minimize
 
-# Icon size in pixels, and the Trash / drives entries
-$ gsettings set org.gnome.shell.extensions.dash-to-dock dash-max-icon-size 32
+# Scroll over the dock: do-nothing switch-workspace cycle-windows  (script: switch-workspace)
+$ gsettings set org.gnome.shell.extensions.dash-to-dock scroll-action cycle-windows
+
+# Running-app marker: DOTS DASHES SQUARES SEGMENTED SOLID METRO CILIORA BINARY  (script: DOTS)
+$ gsettings set org.gnome.shell.extensions.dash-to-dock running-indicator-style DASHES
+
+# Log in to the desktop instead of the overview  (script: true)
+$ gsettings set org.gnome.shell.extensions.dash-to-dock disable-overview-on-startup false
+```
+
+**Trash and drives on the dock:**
+
+```bash
+# Trash entry
 $ gsettings set org.gnome.shell.extensions.dash-to-dock show-trash false
+
+# Drive entries
 $ gsettings set org.gnome.shell.extensions.dash-to-dock show-mounts false
 
-# Which drives the dock lists. The script sets both: only-mounted false lists
-# every known drive, mounted or not, and network true includes network shares.
-# Set only-mounted true for just what is mounted right now.
+# List only drives that are mounted right now  (script: false, i.e. list them all)
 $ gsettings set org.gnome.shell.extensions.dash-to-dock show-mounts-only-mounted true
+
+# Include network shares  (script: true)
 $ gsettings set org.gnome.shell.extensions.dash-to-dock show-mounts-network false
+```
 
-# How transparent the dock is. Every opacity key here is a fraction, which is
-# the percentage divided by 100: 0.0 is invisible, 0.25 is 25% opaque and very
-# see-through, 0.8 is 80% and nearly solid, 1.0 is an opaque bar. Higher is
-# less transparent. Ubuntu ships transparency-mode DEFAULT, which ignores the
-# opacity keys and does its own thing: translucent while the desktop below is
-# clear, solid once a window touches the dock. Switch to FIXED for one opacity
-# that never changes, and set it in the same breath.
+**Transparency.** Ubuntu ships `DEFAULT`: translucent over the desktop, solid
+once a window touches the dock. Opacities are fractions — `0.25` is 25% opaque
+(very see-through), `0.8` is nearly solid.
+
+```bash
+# One opacity that never changes
 $ gsettings set org.gnome.shell.extensions.dash-to-dock transparency-mode FIXED
-
-# 25% opaque, i.e. mostly transparent
 $ gsettings set org.gnome.shell.extensions.dash-to-dock background-opacity 0.25
 
-# 80% opaque, i.e. only slightly transparent
-$ gsettings set org.gnome.shell.extensions.dash-to-dock background-opacity 0.8
-
-# DYNAMIC keeps Ubuntu's two-state behaviour but lets you pick both ends:
-# min-alpha with the desktop clear, max-alpha once a window is against the
-# dock. Both are read only when customize-alphas is true. Below: 10% normally,
-# 90% when a window reaches it.
+# Two-state, your own ends: desktop clear, then a window against the dock
 $ gsettings set org.gnome.shell.extensions.dash-to-dock transparency-mode DYNAMIC
 $ gsettings set org.gnome.shell.extensions.dash-to-dock customize-alphas true
 $ gsettings set org.gnome.shell.extensions.dash-to-dock min-alpha 0.1
 $ gsettings set org.gnome.shell.extensions.dash-to-dock max-alpha 0.9
 
-# Back to Ubuntu's own behaviour
+# Back to Ubuntu's behaviour
 $ gsettings reset org.gnome.shell.extensions.dash-to-dock transparency-mode
-
-# Desktop icons: which corner they start from, and what appears there.
-# show-volumes puts mounted drives on the desktop; Ubuntu, and so the script,
-# keeps both Trash and drives off it.
-$ gsettings set org.gnome.shell.extensions.ding start-corner top-left
-$ gsettings set org.gnome.shell.extensions.ding show-trash true
-$ gsettings set org.gnome.shell.extensions.ding show-volumes true
-
-# The order icons are laid out in: DESCENDINGNAME (Ubuntu's, and the script's)
-# or ASCENDINGNAME
-$ gsettings set org.gnome.shell.extensions.ding arrangeorder ASCENDINGNAME
-
-# Middle-click paste: the script turns this off, as Ubuntu has it. The clock is
-# 24-hour on both already, so the script leaves that one alone.
-$ gsettings set org.gnome.desktop.interface gtk-enable-primary-paste true
-$ gsettings set org.gnome.desktop.interface clock-format 12h
 ```
 
-`gsettings get <schema> <key>` shows the current value and `gsettings reset`
-puts a single key back. For a graphical equivalent, **Extension Manager**
-(`gnome-shell-extension-manager`) gives Ubuntu Dock a settings button — install
-it yourself if you want it; Ubuntu does not ship it, so neither does this.
-GNOME's own Settings app has no dock panel on Debian: that panel comes from
-Ubuntu's patched `gnome-control-center`.
-
-The same applies to the rest of the look:
+**Timings**, in seconds. These do nothing until the dock hides — set
+`dock-fixed false` or `intellihide true` above first.
 
 ```bash
-# Light / dark. The shell theme follows on its own; nothing else is needed.
-$ gsettings set org.gnome.desktop.interface color-scheme prefer-dark
-
-# Edge tiling: on by default on both, and the tiling assistant builds on it
-$ gsettings set org.gnome.mutter edge-tiling false
-
-# Accent colour: blue teal green yellow orange red pink purple slate
-$ gsettings set org.gnome.desktop.interface accent-color purple
-
-# Window buttons on the left
-$ gsettings set org.gnome.desktop.wm.preferences button-layout 'close,minimize,maximize:'
-
-# Wallpaper (both keys, or the dark theme keeps the old one)
-$ gsettings set org.gnome.desktop.background picture-uri      'file:///usr/share/backgrounds/warty-final-ubuntu.png'
-$ gsettings set org.gnome.desktop.background picture-uri-dark 'file:///usr/share/backgrounds/warty-final-ubuntu.png'
-```
-
-> **Re-running the installer puts these back.** Every key above except
-> `dash-max-icon-size`, `show-trash`, `show-mounts` and the transparency keys
-> is one of the Ubuntu defaults the script applies, so a later `ubuntu-look.sh`
-> run overwrites your choice with Ubuntu's. Re-apply yours afterwards, or
-> simply do not re-run once you are happy. `uninstall.sh` restores every one of
-> them to the value it had before the first install, not to Ubuntu's.
-
-### GNOME animations and hot corners
-
-Motion is a master switch plus a few per-component keys, all of them ordinary
-GSettings like everything else here.
-
-```bash
-# The master switch. false stops every animation GNOME draws: the overview
-# sliding open and closed, menus and popovers popping up and down, windows
-# minimising and restoring, the workspace slide, dialogs fading in, and the
-# dock's own slide. GTK follows the same key, so applications stop animating
-# too. This is what Settings -> Accessibility -> Seeing -> Reduce Animation
-# writes. Ubuntu and Debian both ship it on, so the script leaves it alone.
-$ gsettings set org.gnome.desktop.interface enable-animations false
-$ gsettings reset org.gnome.desktop.interface enable-animations
-```
-
-The hot corner is not an animation but is asked about in the same breath, and
-it is one of the few behaviours here that genuinely differs between the two
-distributions: Debian leaves the top-left corner live, Ubuntu does not, so the
-installer turns it off. Either way the Super key still opens the overview.
-
-```bash
-# Top-left corner opens the overview: Debian's default, off under Ubuntu
-$ gsettings set org.gnome.desktop.interface enable-hot-corners true
-
-# What the Super key does instead. '' unbinds it entirely; `gsettings get`
-# first if you want to put the current binding back by hand.
-$ gsettings set org.gnome.mutter overlay-key ''
-$ gsettings reset org.gnome.mutter overlay-key
-```
-
-The dock has its own timings, in seconds, independent of the master switch:
-
-```bash
-# Slide in / slide out, and the pauses before each
+# Slide in / out, and the pauses before each
 $ gsettings set org.gnome.shell.extensions.dash-to-dock animation-time 0.0
 $ gsettings set org.gnome.shell.extensions.dash-to-dock show-delay 0.0
 $ gsettings set org.gnome.shell.extensions.dash-to-dock hide-delay 0.0
 
-# Whether the screen edge has to be pushed against before the dock comes out
+# Push the screen edge to reveal it, and how hard
 $ gsettings set org.gnome.shell.extensions.dash-to-dock require-pressure-to-show false
 $ gsettings set org.gnome.shell.extensions.dash-to-dock pressure-threshold 100.0
 ```
 
-Those five do nothing until the dock actually hides. The script sets
-`dock-fixed true`, as Ubuntu has it, so the dock is always on screen and never
-slides; set `dock-fixed false` or `intellihide true` (above) first and the
-timings start to matter.
+### Desktop icons
 
-The tiling assistant animates a window into and out of a tile, and offers a
-popup for the other half of the screen. All three are separate keys:
+Icons come from `~/Desktop`; there is no key for showing a folder elsewhere —
+symlink it in.
 
 ```bash
+# Corner they start from: top-left top-right bottom-left bottom-right  (script: bottom-right)
+$ gsettings set org.gnome.shell.extensions.ding start-corner top-left
+
+# Trash on the desktop  (script: false)
+$ gsettings set org.gnome.shell.extensions.ding show-trash true
+
+# Mounted drives on the desktop  (script: false)
+$ gsettings set org.gnome.shell.extensions.ding show-volumes true
+
+# Sort order: NAME DESCENDINGNAME MODIFIEDTIME KIND SIZE  (script: DESCENDINGNAME)
+$ gsettings set org.gnome.shell.extensions.ding arrangeorder NAME
+```
+
+### Appearance
+
+```bash
+# Light / dark. The shell theme follows on its own.
+$ gsettings set org.gnome.desktop.interface color-scheme prefer-dark
+
+# Accent: blue teal green yellow orange red pink purple slate  (script: orange)
+$ gsettings set org.gnome.desktop.interface accent-color purple
+
+# Wallpaper — set both keys, or the dark theme keeps the old one
+$ gsettings set org.gnome.desktop.background picture-uri      'file:///usr/share/backgrounds/warty-final-ubuntu.png'
+$ gsettings set org.gnome.desktop.background picture-uri-dark 'file:///usr/share/backgrounds/warty-final-ubuntu.png'
+
+# Window buttons on the left  (script: ':minimize,maximize,close')
+$ gsettings set org.gnome.desktop.wm.preferences button-layout 'close,minimize,maximize:'
+```
+
+### Behaviour
+
+```bash
+# Clock: 24h is the default on both, so the script leaves it alone
+$ gsettings set org.gnome.desktop.interface clock-format 12h
+
+# Middle-click paste  (script: false)
+$ gsettings set org.gnome.desktop.interface gtk-enable-primary-paste true
+
+# Top-left corner opens the overview: Debian's default, off under Ubuntu  (script: false)
+$ gsettings set org.gnome.desktop.interface enable-hot-corners true
+
+# What the Super key does. '' unbinds it; `gsettings get` first to note the current one.
+$ gsettings set org.gnome.mutter overlay-key ''
+
+# Edge tiling: on by default on both, and the tiling assistant builds on it
+$ gsettings set org.gnome.mutter edge-tiling false
+```
+
+### Animations
+
+```bash
+# Master switch: every GNOME and GTK animation, applications included
+$ gsettings set org.gnome.desktop.interface enable-animations false
+
+# Tiling assistant: into a tile, out of one, and the half-screen popup
 $ gsettings set org.gnome.shell.extensions.tiling-assistant enable-tile-animations false
 $ gsettings set org.gnome.shell.extensions.tiling-assistant enable-untile-animations false
 $ gsettings set org.gnome.shell.extensions.tiling-assistant enable-tiling-popup false
 ```
 
-And the one animation you see before anything else — the overview sliding open
-as you log in. GNOME does that; Ubuntu does not, and the installer follows
-Ubuntu:
+The dock's own slide follows the master switch, or its timings above.
 
-```bash
-# true = log straight to the desktop (Ubuntu, and what the script sets)
-$ gsettings set org.gnome.shell.extensions.dash-to-dock disable-overview-on-startup false
-```
+The login screen is a different user, so this does not quiet the greeter. Put
+`enable-animations=false` under `[org/gnome/desktop/interface]` in a file of
+your own in `/etc/dconf/db/gdm.d/`, then `sudo dconf update`. It stays there:
+`uninstall.sh` removes only the database file this script wrote.
 
-Of everything in this section the installer writes only two keys —
-`enable-hot-corners` and `disable-overview-on-startup` — so a later run puts
-those two back to Ubuntu's values and leaves the rest exactly as you set them.
-`uninstall.sh` restores both to what they were before the first install.
+### A settings window instead
 
-These are per-user keys, and the login screen is a different user reading the
-gdm dconf profile, so turning animations off for yourself does not quiet the
-greeter. A file of your own under `/etc/dconf/db/gdm.d/` with
-`enable-animations=false` under `[org/gnome/desktop/interface]`, followed by
-`sudo dconf update`, does that — and stays there, since `uninstall.sh` removes
-only the database file this script wrote.
+**Extension Manager** (`gnome-shell-extension-manager`) gives Ubuntu Dock a
+settings button. Ubuntu does not ship it, so neither does this — install it
+yourself. GNOME Settings has no dock panel on Debian; that panel comes from
+Ubuntu's patched `gnome-control-center`.
 
 ## Offline install
 
