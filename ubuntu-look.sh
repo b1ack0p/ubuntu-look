@@ -164,10 +164,15 @@ UBUNTU_INCLUDE_DEVEL="${UBUNTU_INCLUDE_DEVEL:-0}"
 # directory listing). Normal runs never consult this list.
 FALLBACK_CODENAMES="noble plucky questing resolute"
 
-# Number of recent Ubuntu releases configured as candidate sources. Each suite
-# adds a full Packages index to every apt update. Four covers current Debian
-# stable with one release of margin either side.
+# Number of recent Ubuntu releases configured as apt sources. Each one adds a
+# Packages index to every apt update, so the window is kept small.
 MAX_UBUNTU_CANDIDATES=4
+
+# How much further back to look when no release in the window has a theme this
+# gnome-shell can load. Ubuntu ships twice a year while Debian stable does not
+# move, so the last compatible release eventually falls outside the window.
+# Used only on that path, and only one extra release is kept.
+MAX_UBUNTU_LOOKBACK=6
 
 # Ubuntu Archive Automatic Signing Key. If Ubuntu ever rotates it, the
 # NO_PUBKEY recovery in apt_update() fetches whatever the archive moved to.
@@ -200,7 +205,11 @@ UBUNTU_PIN=/etc/apt/preferences.d/ubuntu-themes
 # Status tracking
 # -----------------------------------------------------------------------------
 declare -a STATUS_INSTALLED=()
+declare -a STATUS_UPGRADED=()
 declare -a STATUS_ALREADY=()
+# Packages with a newer Ubuntu build that this Debian cannot take. Not a
+# failure: the newest build that fits stays installed.
+declare -a STATUS_HELD=()
 # Every package the stages name, flattened, for log_final_state().
 ALL_STAGE_PACKAGES="$(printf '%s ' "${packages[@]}" | xargs -n1 | sort -u | xargs)"
 
@@ -267,12 +276,12 @@ missing_packages() {
   echo "$missing" | xargs
 }
 
-installed_packages() {
-  local got="" pkg
-  for pkg in $1; do
-    is_installed "$pkg" && got="$got $pkg"
-  done
-  echo "$got" | xargs
+# True when $1 was installed before this script first ran. Same test as
+# uninstall.sh's predates_us(): packages this script did not install are left
+# to the system's own apt. No snapshot reads as "not pre-existing".
+predates_install() {
+  [ -f "${BACKUP_ORIGINAL}/packages-before.txt" ] || return 1
+  grep -qx "$1" "${BACKUP_ORIGINAL}/packages-before.txt" 2>/dev/null
 }
 
 # Filter a list to only packages actually available in the apt cache.
@@ -282,6 +291,131 @@ available_packages() {
     apt-cache show "$pkg" >/dev/null 2>&1 && avail="$avail $pkg"
   done
   echo "$avail" | xargs
+}
+
+# Installed version of $1, empty when not installed. Uses the same definition
+# as is_installed(), so a removed-but-not-purged package reads as absent.
+pkg_installed_version() {
+  is_installed "$1" && dpkg-query -W -f='${Version}' "$1" 2>/dev/null
+}
+
+# apt's chosen version for $1. Empty when the pin leaves no candidate, which
+# is how a package outside the pin's whitelist appears.
+pkg_candidate_version() {
+  LC_ALL=C apt-cache policy "$1" 2>/dev/null \
+    | awk '/^  Candidate:/ { if ($2 != "(none)") print $2; exit }'
+}
+
+# Every version of $1 apt can see, newest first. Read from apt-cache policy
+# rather than madison so Debian's own build is listed too -- when no Ubuntu
+# build fits, that is where ensure_package is allowed to land.
+pkg_versions_desc() {
+  LC_ALL=C apt-cache policy "$1" 2>/dev/null | awk '
+    $1 == "***"                  { print $2; next }
+    NF == 2 && $2 ~ /^-?[0-9]+$/ { print $1 }'
+}
+
+# True when installing the given "pkg" or "pkg=version" needs nothing removed.
+# A non-zero exit means unmet dependencies. A "Remv" line means apt would take
+# something away to make room, which this script never accepts -- the Yaru
+# built for the next gnome-shell installs cleanly by removing gnome-shell.
+installs_cleanly() {
+  local sim
+  sim="$(LC_ALL=C apt-get install -s "$@" 2>&1)" || return 1
+  ! echo "$sim" | grep -q '^Remv '
+}
+
+# One-line reason why $1 cannot be installed at $2 (default: its candidate),
+# for the SUMMARY. A dependency blocked by this script's own pin is named as
+# such, because apt's wording gives no hint of the cause.
+explain_blocked() {
+  local pkg="$1" ver="${2:-}" have sim rem dep out=""
+  [ -z "$ver" ] && ver="$(pkg_candidate_version "$pkg")"
+  if [ -z "$ver" ]; then
+    echo "apt has no candidate for it — every build it can see is blocked by ${UBUNTU_PIN}"
+    return
+  fi
+  # Nothing to explain when the newest build on offer is already installed.
+  have="$(pkg_installed_version "$pkg" || true)"
+  [ "$have" = "$ver" ] && { echo "${ver} is already the newest build apt offers"; return; }
+
+  sim="$(LC_ALL=C apt-get install -s "${pkg}=${ver}" 2>&1)"
+  rem="$(echo "$sim" | awk '/^Remv /{print $2}' | xargs)"
+  if [ -n "$rem" ]; then
+    # A theme built for the next GNOME proposes removing a dozen packages.
+    # The first few make the point; apt printed the full list during the run.
+    # shellcheck disable=SC2086
+    set -- $rem
+    if [ $# -gt 4 ]; then
+      echo "${ver} would have removed $# packages, among them: $1 $2 $3 $4"
+    else
+      echo "${ver} would have removed: ${rem}"
+    fi
+    return
+  fi
+  # apt words this two ways: "not installable" when nothing can supply the
+  # dependency (what a pin at -1 looks like), and "not going to be installed"
+  # when a candidate exists but was not selected.
+  for dep in $(echo "$sim" \
+      | grep -oE '(Pre)?Depends: [^ ]+ but it is not (installable|going to be installed)' \
+      | awk '{print $2}' | sort -u); do
+    if [ -z "$(pkg_candidate_version "$dep")" ] && [ -n "$(pkg_versions_desc "$dep")" ]; then
+      out="${out} ${dep} (Ubuntu-only, blocked by ${UBUNTU_PIN})"
+    else
+      out="${out} ${dep}"
+    fi
+  done
+  [ -n "$out" ] && { echo "${ver} needs:${out}"; return; }
+  out="$(echo "$sim" | grep -m1 '^E: ' | sed 's/^E: //')"
+  [ -n "$out" ] && { echo "${ver}: ${out}"; return; }
+  echo "${ver} will not install on this system"
+}
+
+# Install $1 at the newest version this system can take.
+#
+# Starts at apt's candidate and steps down: never above it, because that is
+# what the pin selected, and never below what is already installed. This is
+# what keeps the last compatible build in place when Ubuntu moves ahead of
+# this Debian.
+#
+# Prints the version it settled on. Returns:
+#   0  installed or upgraded
+#   1  nothing on offer can be installed here (prints nothing)
+#   2  already at the newest version that fits
+ensure_package() {
+  local pkg="$1" have cand ver
+  have="$(pkg_installed_version "$pkg" || true)"
+  cand="$(pkg_candidate_version "$pkg")"
+
+  # No candidate means the pin blocks every build. An explicit version would
+  # still install, but that would override the script's own pin.
+  if [ -z "$cand" ]; then
+    [ -n "$have" ] && { echo "$have"; return 2; }
+    return 1
+  fi
+
+  for ver in $(pkg_versions_desc "$pkg"); do
+    # Never above the candidate: stepping over it would undo the gnome-shell
+    # coupling the pin exists to express.
+    dpkg --compare-versions "$ver" gt "$cand" && continue
+    # Below this point is a downgrade, and what is installed already works.
+    if [ -n "$have" ] && dpkg --compare-versions "$ver" le "$have"; then
+      echo "$have"
+      return 2
+    fi
+    installs_cleanly "${pkg}=${ver}" || continue
+    # apt writes to stderr here: stdout carries the version back to the
+    # caller. The output still reaches the terminal.
+    if sudo apt-get install -y "${pkg}=${ver}" >&2; then
+      echo "$ver"
+      return 0
+    fi
+    # Simulated clean but failed anyway: try the next version down.
+    message warn "${pkg}=${ver} would not install after all — trying an older build" >&2
+  done
+
+  [ -n "$have" ] && { echo "$have"; return 2; }
+  return 1
 }
 
 # Copy $1 over $2 only when the content differs. Returns 0 when the file was
@@ -858,11 +992,10 @@ ubuntu_release_info() {
         END { if (v != "") print v, (unreleased ? "devel" : "stable") }'
 }
 
-# The newest MAX_UBUNTU_CANDIDATES Ubuntu releases currently served, oldest to
-# newest. Read from the archive dists/ index and ordered by each release's
-# Version field, so a new release becomes a candidate the day it is published.
-# distro-info-data is not used: on a stable Debian it is frozen at Debian's own
-# release date.
+# Every released Ubuntu the archive serves, oldest to newest, ordered by each
+# release's Version field. A new release is picked up the day it is published.
+# distro-info-data is not used: on stable Debian it is frozen at release date.
+# The caller takes the newest MAX_UBUNTU_CANDIDATES as its window.
 discover_ubuntu_codenames() {
   local names cn info ver state versioned=""
 
@@ -891,8 +1024,34 @@ discover_ubuntu_codenames() {
 "
   done
 
-  printf '%s' "$versioned" | sort -V | tail -n "$MAX_UBUNTU_CANDIDATES" \
-    | awk '{print $2}' | tr '\n' ' ' | xargs
+  printf '%s' "$versioned" | sort -V | awk '{print $2}' | tr '\n' ' ' | xargs
+}
+
+# Write the Ubuntu source list for $UBUNTU_CANDIDATE_CODENAMES. Returns 0 when
+# the file changed, 1 when it was already correct.
+write_ubuntu_sources() {
+  local tmp _c
+  tmp="$(mktemp)"
+  {
+    echo "# Ubuntu — Yaru theme + wallpaper (released codenames tried for compatibility)"
+    echo "# Strictly apt-pinned — see ${UBUNTU_PIN}. This marker line lets re-runs"
+    echo "# detect when a new Ubuntu release should be added automatically:"
+    echo "# codenames: ${UBUNTU_CANDIDATE_CODENAMES}"
+    echo ""
+    for _c in $UBUNTU_CANDIDATE_CODENAMES; do
+      echo "deb [signed-by=${UBUNTU_KEYRING}] ${UBUNTU_MIRROR} ${_c} main universe"
+      echo "deb [signed-by=${UBUNTU_KEYRING}] ${UBUNTU_MIRROR} ${_c}-updates main universe"
+    done
+  } > "$tmp"
+
+  if [ -f "$UBUNTU_LIST" ] && cmp -s "$tmp" "$UBUNTU_LIST"; then
+    rm -f "$tmp"
+    return 1
+  fi
+  # 0644, not mktemp's 0600 — apt reads its sources as whoever runs it.
+  sudo install -m 0644 "$tmp" "$UBUNTU_LIST"
+  rm -f "$tmp"
+  return 0
 }
 
 # Append a key to the Ubuntu keyring (dearmored keyrings concatenate cleanly).
@@ -947,7 +1106,7 @@ resolve_ubuntu_pkg_codename() {
   local newest_first cn ver sim
   newest_first="$(echo "$UBUNTU_CANDIDATE_CODENAMES" | tr ' ' '\n' | tac)"
   for cn in $newest_first; do
-    ver="$(apt-cache madison "$pkg" 2>/dev/null \
+    ver="$(LC_ALL=C apt-cache madison "$pkg" 2>/dev/null \
       | awk -F'|' -v c="$cn" '$3 ~ c { gsub(/^[ \t]+|[ \t]+$/, "", $2); print $2; exit }')"
     [ -z "$ver" ] && continue
     if [ "$require_delta" = "1" ]; then
@@ -957,7 +1116,7 @@ resolve_ubuntu_pkg_codename() {
     message "  checking ${pkg} on ${cn} (${ver})..." >&2
     # A non-zero exit means unmet dependencies (e.g. a gnome-shell too new) —
     # checking only for "Remv" would accept that as compatible.
-    sim="$(apt-get install -s "${pkg}=${ver}" 2>&1)" || continue
+    sim="$(LC_ALL=C apt-get install -s "${pkg}=${ver}" 2>&1)" || continue
     echo "$sim" | grep -q '^Remv ' && continue
     if [ "$require_inst" = "1" ]; then
       echo "$sim" | grep -q "^Inst ${pkg} " || continue
@@ -968,13 +1127,10 @@ resolve_ubuntu_pkg_codename() {
   echo "$fallback"
 }
 
-# yaru-theme-gnome-shell is pinned to a gnome-shell major version. If nothing
-# simulates cleanly, fall back to the oldest configured candidate — the most
-# conservative choice available, and never a release name frozen into this
-# script. The package itself is then likely to be skipped at install time.
+# yaru-theme-gnome-shell is tied to a gnome-shell major version. Returns empty
+# when nothing fits, so the caller can widen the search before giving up.
 resolve_ubuntu_codename() {
-  resolve_ubuntu_pkg_codename yaru-theme-gnome-shell 0 \
-    "$(echo "$UBUNTU_CANDIDATE_CODENAMES" | awk '{print $1}')"
+  resolve_ubuntu_pkg_codename yaru-theme-gnome-shell 0 ""
 }
 
 
@@ -1536,9 +1692,18 @@ print_summary() {
     echo -e "${GREEN}Installed this run (${#STATUS_INSTALLED[@]}):${ENDCOLOR}"
     printf '   + %s\n' "${STATUS_INSTALLED[@]}"
   }
+  [ ${#STATUS_UPGRADED[@]} -gt 0 ] && {
+    echo -e "${GREEN}Upgraded this run (${#STATUS_UPGRADED[@]}):${ENDCOLOR}"
+    printf '   ^ %s\n' "${STATUS_UPGRADED[@]}"
+  }
   [ ${#STATUS_ALREADY[@]} -gt 0 ] && {
-    echo -e "${YELLOW}Already installed (${#STATUS_ALREADY[@]}):${ENDCOLOR}"
+    echo -e "${YELLOW}Already installed and current (${#STATUS_ALREADY[@]}):${ENDCOLOR}"
     printf '   = %s\n' "${STATUS_ALREADY[@]}"
+  }
+  [ ${#STATUS_HELD[@]} -gt 0 ] && {
+    echo -e "${YELLOW}Kept at the last compatible build (${#STATUS_HELD[@]}):${ENDCOLOR}"
+    printf '   = %s\n' "${STATUS_HELD[@]}"
+    echo -e "   ${YELLOW}A newer Ubuntu build exists but will not install on this Debian — what you have is the newest that fits.${ENDCOLOR}"
   }
   [ ${#STATUS_FAILED[@]} -gt 0 ] && {
     echo -e "${RED}Could not be installed on this system (${#STATUS_FAILED[@]}):${ENDCOLOR}"
@@ -1684,9 +1849,14 @@ fi
 # Re-read the archive on every run, so a newly published Ubuntu becomes a
 # candidate the day it appears — no script edit, no distro-info-data update.
 message "reading published Ubuntu releases from ${UBUNTU_MIRROR}..."
-UBUNTU_CANDIDATE_CODENAMES="$(discover_ubuntu_codenames)"
-[ -z "$UBUNTU_CANDIDATE_CODENAMES" ] \
+UBUNTU_ALL_CODENAMES="$(discover_ubuntu_codenames)"
+[ -z "$UBUNTU_ALL_CODENAMES" ] \
   && error "No Ubuntu release reachable at ${UBUNTU_MIRROR} — check your internet connection."
+
+# The window a normal run works in. Everything older stays in
+# $UBUNTU_ALL_CODENAMES, unconfigured, until the lookback below needs it.
+UBUNTU_CANDIDATE_CODENAMES="$(echo "$UBUNTU_ALL_CODENAMES" | tr ' ' '\n' \
+  | tail -n "$MAX_UBUNTU_CANDIDATES" | xargs)"
 
 # A manually forced codename (UBUNTU_CODENAME=xyz) still needs its own source
 # entry even when it falls outside the newest-N window.
@@ -1697,26 +1867,13 @@ if [ "$UBUNTU_CODENAME" != "auto" ] && ! echo "$UBUNTU_CANDIDATE_CODENAMES" | gr
 fi
 message "Ubuntu releases in play (oldest to newest): ${GREEN}${UBUNTU_CANDIDATE_CODENAMES}${ENDCOLOR}"
 
-if [ ! -f "$UBUNTU_LIST" ] || ! sudo test -s "$UBUNTU_KEYRING" \
-   || ! grep -qF "# codenames: ${UBUNTU_CANDIDATE_CODENAMES}" "$UBUNTU_LIST"; then
+sudo install -d -m 0755 /etc/apt/keyrings
+sudo test -s "$UBUNTU_KEYRING" \
+  || add_ubuntu_key "$UBUNTU_ARCHIVE_KEY" \
+  || error "Failed to fetch the Ubuntu archive signing key"
+
+if write_ubuntu_sources; then
   message "configuring Ubuntu archive candidates: ${UBUNTU_CANDIDATE_CODENAMES}"
-  sudo install -d -m 0755 /etc/apt/keyrings
-
-  sudo test -s "$UBUNTU_KEYRING" \
-    || add_ubuntu_key "$UBUNTU_ARCHIVE_KEY" \
-    || error "Failed to fetch the Ubuntu archive signing key"
-
-  {
-    echo "# Ubuntu — Yaru theme + wallpaper (released codenames tried for compatibility)"
-    echo "# Strictly apt-pinned — see ${UBUNTU_PIN}. This marker line lets re-runs"
-    echo "# detect when a new Ubuntu release should be added automatically:"
-    echo "# codenames: ${UBUNTU_CANDIDATE_CODENAMES}"
-    echo ""
-    for _c in $UBUNTU_CANDIDATE_CODENAMES; do
-      echo "deb [signed-by=${UBUNTU_KEYRING}] ${UBUNTU_MIRROR} ${_c} main universe"
-      echo "deb [signed-by=${UBUNTU_KEYRING}] ${UBUNTU_MIRROR} ${_c}-updates main universe"
-    done
-  } | sudo tee "$UBUNTU_LIST" > /dev/null
   STATUS_CHANGES+=("Ubuntu apt sources written (candidates: ${UBUNTU_CANDIDATE_CODENAMES})")
 else
   message "Ubuntu candidate sources already current"
@@ -1738,7 +1895,45 @@ step "Resolve Ubuntu theme codename"
 
 if [ "$UBUNTU_CODENAME" = "auto" ]; then
   UBUNTU_CODENAME="$(resolve_ubuntu_codename)"
-  message "auto-detected Ubuntu codename ${GREEN}${UBUNTU_CODENAME}${ENDCOLOR} ($(gnome-shell --version 2>/dev/null || echo 'gnome-shell not installed')) — verified via simulated install"
+
+  # Nothing in the window fits. This happens once Ubuntu has published several
+  # releases since this Debian froze. Look further back before giving up.
+  if [ -z "$UBUNTU_CODENAME" ]; then
+    message warn "no Ubuntu release in the current window has a theme this gnome-shell can load"
+    _older="$(echo "$UBUNTU_ALL_CODENAMES" | tr ' ' '\n' \
+      | head -n -"$MAX_UBUNTU_CANDIDATES" | tail -n "$MAX_UBUNTU_LOOKBACK" | xargs)"
+
+    if [ -n "$_older" ]; then
+      message "looking further back: ${_older}"
+      _window="$UBUNTU_CANDIDATE_CODENAMES"
+      # Oldest to newest: $_older is entirely older than the window.
+      UBUNTU_CANDIDATE_CODENAMES="$_older $_window"
+      write_ubuntu_sources && apt_update
+      UBUNTU_CODENAME="$(resolve_ubuntu_codename)"
+
+      if [ -n "$UBUNTU_CODENAME" ]; then
+        # Keep one extra release, not the whole lookback: each configured
+        # suite costs a Packages index on every apt update.
+        UBUNTU_CANDIDATE_CODENAMES="$UBUNTU_CODENAME $_window"
+        message "found it in ${GREEN}${UBUNTU_CODENAME}${ENDCOLOR} — keeping that release configured alongside the window"
+        STATUS_CHANGES+=("Reached back to ${UBUNTU_CODENAME} for a gnome-shell-compatible theme")
+      else
+        message warn "nothing in the lookback either — dropping those sources again"
+        UBUNTU_CANDIDATE_CODENAMES="$_window"
+      fi
+      write_ubuntu_sources && apt_update
+    fi
+  fi
+
+  # Still nothing: pin the oldest configured release. The shell theme is then
+  # reported as skipped; everything else installs as usual.
+  if [ -z "$UBUNTU_CODENAME" ]; then
+    UBUNTU_CODENAME="$(echo "$UBUNTU_CANDIDATE_CODENAMES" | awk '{print $1}')"
+    message warn "no Ubuntu release ships a shell theme for this gnome-shell — pinning ${UBUNTU_CODENAME}"
+    message warn "everything that does not depend on gnome-shell is installed as usual"
+  else
+    message "auto-detected Ubuntu codename ${GREEN}${UBUNTU_CODENAME}${ENDCOLOR} ($(gnome-shell --version 2>/dev/null || echo 'gnome-shell not installed')) — verified via simulated install"
+  fi
 fi
 
 
@@ -1787,12 +1982,15 @@ fi
 ###############################################################################
 
 step "Upgrade installed packages"
-upgradable_before="$(apt-get -s upgrade 2>/dev/null | grep -c '^Inst ')"
+# --with-new-pkgs lets an update pull in a package that is not installed yet.
+# Without it apt-get silently keeps such updates back. It never removes
+# anything.
+upgradable_before="$(apt-get -s upgrade --with-new-pkgs 2>/dev/null | grep -c '^Inst ')"
 if [ "$upgradable_before" -gt 0 ]; then
   message "upgrading ${upgradable_before} package(s)..."
   # Not fatal: a held package or an unrelated third-party repo must not stop
   # the Ubuntu look, and every install below is checked anyway.
-  if sudo apt-get upgrade -y; then
+  if sudo apt-get upgrade -y --with-new-pkgs; then
     STATUS_CHANGES+=("Upgraded ${upgradable_before} package(s)")
     RELOGIN_NEEDED=1
   else
@@ -1832,20 +2030,40 @@ for category in $package_categories; do
     esac
   done
 
-  to_install="$(missing_packages "$available")"
-  already="$(installed_packages "$available")"
-  for p in $already; do STATUS_ALREADY+=("$p"); done
+  # What this stage still has to do. Being installed is not the same as being
+  # current: when a new Ubuntu moves the pin, the installed build is a release
+  # behind. Newer candidates are handled here, alongside the installs.
+  declare -A PKG_BEFORE=()
+  to_install=""
+  to_upgrade=""
+  for p in $available; do
+    _have="$(pkg_installed_version "$p" || true)"
+    _cand="$(pkg_candidate_version "$p")"
+    PKG_BEFORE[$p]="$_have"
+    if [ -z "$_have" ]; then
+      to_install="$to_install $p"
+    elif [ -n "$_cand" ] && dpkg --compare-versions "$_cand" gt "$_have" \
+         && ! predates_install "$p"; then
+      to_upgrade="$to_upgrade $p"
+    else
+      STATUS_ALREADY+=("$p (${_have})")
+    fi
+  done
+  to_install="$(echo "$to_install" | xargs)"
+  to_upgrade="$(echo "$to_upgrade" | xargs)"
+  to_change="$(echo "$to_install $to_upgrade" | xargs)"
 
-  if [ -z "$to_install" ]; then
-    message "all packages in ${category} already installed"
+  if [ -z "$to_change" ]; then
+    message "everything in ${category} is installed and current"
   else
-    message "installing: ${GREEN}${to_install}${ENDCOLOR}"
+    [ -n "$to_install" ] && message "installing: ${GREEN}${to_install}${ENDCOLOR}"
+    [ -n "$to_upgrade" ] && message "newer build available for: ${GREEN}${to_upgrade}${ENDCOLOR}"
 
     # Ask apt what it would actually do before letting it do it. A theming
     # script has no business removing packages, so a batch that would remove
     # something is never run as a batch.
     # shellcheck disable=SC2086
-    _batch_removes="$(apt-get -s install $to_install 2>/dev/null | awk '/^Remv /{print $2}' | xargs)"
+    _batch_removes="$(apt-get -s install $to_change 2>/dev/null | awk '/^Remv /{print $2}' | xargs)"
     if [ -n "$_batch_removes" ]; then
       message warn "installing this stage as one batch would REMOVE: ${_batch_removes}"
       message warn "not doing that — falling back to one package at a time"
@@ -1853,30 +2071,48 @@ for category in $package_categories; do
       # One package with unsatisfiable dependencies must not stop the rest, so a
       # failed batch is retried package by package below.
       # shellcheck disable=SC2086
-      sudo apt-get install -y $to_install \
+      sudo apt-get install -y $to_change \
         || message warn "batch install failed — retrying one package at a time"
     fi
 
     _installed_any=0
-    for p in $to_install; do
-      if is_installed "$p"; then
-        STATUS_INSTALLED+=("$p")
+    for p in $to_change; do
+      _before="${PKG_BEFORE[$p]:-}"
+      _now="$(pkg_installed_version "$p" || true)"
+
+      # The batch handled it.
+      if [ -n "$_now" ] && [ "$_now" != "$_before" ]; then
+        if [ -z "$_before" ]; then
+          STATUS_INSTALLED+=("$p (${_now})")
+        else
+          STATUS_UPGRADED+=("$p (${_before} → ${_now})")
+        fi
         _installed_any=1
         continue
       fi
-      # Same question, per package: anything that still wants to take another
-      # package away is left uninstalled rather than allowed through.
-      _p_removes="$(apt-get -s install "$p" 2>/dev/null | awk '/^Remv /{print $2}' | xargs)"
-      if [ -n "$_p_removes" ]; then
-        STATUS_FAILED+=("$p (would have removed: ${_p_removes})")
-        message warn "${p} would remove ${_p_removes} — skipped, nothing was touched"
-      elif sudo apt-get install -y "$p"; then
-        STATUS_INSTALLED+=("$p")
-        _installed_any=1
-      else
-        STATUS_FAILED+=("$p")
-        message warn "${p} cannot be installed on this system — skipped"
-      fi
+
+      # It did not. Step down this package's versions and take the newest one
+      # that installs here. Anything needing a removal is refused, as before.
+      _got="$(ensure_package "$p")"
+      _rc=$?
+      case $_rc in
+        0)
+          if [ -z "$_before" ]; then
+            STATUS_INSTALLED+=("$p (${_got})")
+          else
+            STATUS_UPGRADED+=("$p (${_before} → ${_got})")
+          fi
+          _installed_any=1
+          ;;
+        2)
+          STATUS_HELD+=("$p at ${_got} — $(explain_blocked "$p")")
+          message warn "${p} stays at ${_got}: no newer build fits this system"
+          ;;
+        *)
+          STATUS_FAILED+=("$p — $(explain_blocked "$p")")
+          message warn "${p} cannot be installed on this system — skipped, nothing was touched"
+          ;;
+      esac
     done
     # Only ask for a re-login if something actually landed.
     [ $_installed_any -eq 1 ] && RELOGIN_NEEDED=1

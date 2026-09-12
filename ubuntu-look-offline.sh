@@ -230,8 +230,12 @@ UBUNTU_PIN=/etc/apt/preferences.d/ubuntu-themes
 # Status tracking
 # -----------------------------------------------------------------------------
 declare -a STATUS_INSTALLED=()
+declare -a STATUS_UPGRADED=()
 declare -a STATUS_ALREADY=()
 declare -a STATUS_UNAVAIL=()   # requested but absent from the local bundle
+# A newer build is in the bundle but this system cannot take it. Not a
+# failure: the newest build that fits stays installed.
+declare -a STATUS_HELD=()
 BUNDLE_REFRESHED=0
 # Every package the stages name, flattened, for log_final_state().
 ALL_STAGE_PACKAGES="$(printf '%s ' "${packages[@]}" | xargs -n1 | sort -u | xargs)"
@@ -300,12 +304,12 @@ missing_packages() {
   echo "$missing" | xargs
 }
 
-installed_packages() {
-  local got="" pkg
-  for pkg in $1; do
-    is_installed "$pkg" && got="$got $pkg"
-  done
-  echo "$got" | xargs
+# True when $1 was installed before this script first ran. Same test as
+# uninstall.sh's predates_us(): packages this script did not install are left
+# to the system's own apt. No snapshot reads as "not pre-existing".
+predates_install() {
+  [ -f "${BACKUP_ORIGINAL}/packages-before.txt" ] || return 1
+  grep -qx "$1" "${BACKUP_ORIGINAL}/packages-before.txt" 2>/dev/null
 }
 
 # Only ever queries the local bundle's apt cache (see LOCAL_APT_OPTS).
@@ -315,6 +319,118 @@ available_packages() {
     apt-cache "${LOCAL_APT_OPTS[@]}" show "$pkg" >/dev/null 2>&1 && avail="$avail $pkg"
   done
   echo "$avail" | xargs
+}
+
+# Installed version of $1, empty when not installed. Uses the same definition
+# as is_installed(), so a removed-but-not-purged package reads as absent.
+pkg_installed_version() {
+  is_installed "$1" && dpkg-query -W -f='${Version}' "$1" 2>/dev/null
+}
+
+# What the bundle offers for $1, and every version it carries, newest first.
+# Both read through LOCAL_APT_OPTS, so a machine that also has the online
+# sources configured is still measured against the bundle.
+pkg_candidate_version() {
+  LC_ALL=C apt-cache "${LOCAL_APT_OPTS[@]}" policy "$1" 2>/dev/null \
+    | awk '/^  Candidate:/ { if ($2 != "(none)") print $2; exit }'
+}
+
+pkg_versions_desc() {
+  LC_ALL=C apt-cache "${LOCAL_APT_OPTS[@]}" policy "$1" 2>/dev/null | awk '
+    $1 == "***"                  { print $2; next }
+    NF == 2 && $2 ~ /^-?[0-9]+$/ { print $1 }'
+}
+
+# True when installing the given "pkg" or "pkg=version" needs nothing removed.
+# A non-zero exit means unmet dependencies, usually a bundled build made for a
+# different gnome-shell. A "Remv" line means apt would take something away to
+# make room, which this script never accepts.
+installs_cleanly() {
+  local sim
+  sim="$(LC_ALL=C apt-get install -s "${LOCAL_APT_OPTS[@]}" "$@" 2>&1)" || return 1
+  ! echo "$sim" | grep -q '^Remv '
+}
+
+# One-line reason why $1 cannot be installed at $2 (default: what the bundle
+# offers), for the SUMMARY.
+explain_blocked() {
+  local pkg="$1" ver="${2:-}" have sim rem dep out=""
+  [ -z "$ver" ] && ver="$(pkg_candidate_version "$pkg")"
+  if [ -z "$ver" ]; then
+    echo "the bundle carries no build of it"
+    return
+  fi
+  have="$(pkg_installed_version "$pkg" || true)"
+  [ "$have" = "$ver" ] && { echo "${ver} is already the newest build the bundle has"; return; }
+
+  sim="$(LC_ALL=C apt-get install -s "${LOCAL_APT_OPTS[@]}" "${pkg}=${ver}" 2>&1)"
+  rem="$(echo "$sim" | awk '/^Remv /{print $2}' | xargs)"
+  if [ -n "$rem" ]; then
+    # A theme built for the next GNOME proposes removing a dozen packages.
+    # The first few make the point; apt printed the full list during the run.
+    # shellcheck disable=SC2086
+    set -- $rem
+    if [ $# -gt 4 ]; then
+      echo "${ver} would have removed $# packages, among them: $1 $2 $3 $4"
+    else
+      echo "${ver} would have removed: ${rem}"
+    fi
+    return
+  fi
+  # apt words this two ways: "not installable" when nothing can supply the
+  # dependency, and "not going to be installed" when a candidate exists but
+  # was not selected.
+  for dep in $(echo "$sim" \
+      | grep -oE '(Pre)?Depends: [^ ]+ but it is not (installable|going to be installed)' \
+      | awk '{print $2}' | sort -u); do
+    out="${out} ${dep}"
+  done
+  [ -n "$out" ] && { echo "${ver} needs, and the bundle does not carry:${out}"; return; }
+  out="$(echo "$sim" | grep -m1 '^E: ' | sed 's/^E: //')"
+  [ -n "$out" ] && { echo "${ver}: ${out}"; return; }
+  echo "${ver} will not install on this system"
+}
+
+# Install $1 at the newest version the bundle has and this system can take.
+#
+# Starts at what the bundle offers and steps down, never below what is already
+# installed. A refreshed bundle keeps the older debs, so this is what leaves
+# the machine on the last compatible build.
+#
+# Prints the version it settled on. Returns:
+#   0  installed or upgraded
+#   1  nothing in the bundle can be installed here (prints nothing)
+#   2  already at the newest version that fits
+ensure_package() {
+  local pkg="$1" have cand ver
+  have="$(pkg_installed_version "$pkg" || true)"
+  cand="$(pkg_candidate_version "$pkg")"
+
+  if [ -z "$cand" ]; then
+    [ -n "$have" ] && { echo "$have"; return 2; }
+    return 1
+  fi
+
+  for ver in $(pkg_versions_desc "$pkg"); do
+    # Never above the version the bundle offers.
+    dpkg --compare-versions "$ver" gt "$cand" && continue
+    # Below this point is a downgrade, and what is installed already works.
+    if [ -n "$have" ] && dpkg --compare-versions "$ver" le "$have"; then
+      echo "$have"
+      return 2
+    fi
+    installs_cleanly "${pkg}=${ver}" || continue
+    # apt writes to stderr here: stdout carries the version back to the
+    # caller. The output still reaches the terminal.
+    if sudo apt-get install -y "${LOCAL_APT_OPTS[@]}" "${pkg}=${ver}" >&2; then
+      echo "$ver"
+      return 0
+    fi
+    message warn "${pkg}=${ver} would not install after all — trying an older build" >&2
+  done
+
+  [ -n "$have" ] && { echo "$have"; return 2; }
+  return 1
 }
 
 # Copy $1 over $2 only when the content differs. Returns 0 when the file was
@@ -1466,9 +1582,18 @@ print_summary() {
     echo -e "${GREEN}Installed this run (${#STATUS_INSTALLED[@]}):${ENDCOLOR}"
     printf '   + %s\n' "${STATUS_INSTALLED[@]}"
   }
+  [ ${#STATUS_UPGRADED[@]} -gt 0 ] && {
+    echo -e "${GREEN}Upgraded this run (${#STATUS_UPGRADED[@]}):${ENDCOLOR}"
+    printf '   ^ %s\n' "${STATUS_UPGRADED[@]}"
+  }
   [ ${#STATUS_ALREADY[@]} -gt 0 ] && {
-    echo -e "${YELLOW}Already installed (${#STATUS_ALREADY[@]}):${ENDCOLOR}"
+    echo -e "${YELLOW}Already installed and current (${#STATUS_ALREADY[@]}):${ENDCOLOR}"
     printf '   = %s\n' "${STATUS_ALREADY[@]}"
+  }
+  [ ${#STATUS_HELD[@]} -gt 0 ] && {
+    echo -e "${YELLOW}Kept at the last compatible build (${#STATUS_HELD[@]}):${ENDCOLOR}"
+    printf '   = %s\n' "${STATUS_HELD[@]}"
+    echo -e "   ${YELLOW}The bundle carries a newer build that will not install on this Debian — what you have is the newest that fits.${ENDCOLOR}"
   }
   [ ${#STATUS_UNAVAIL[@]} -gt 0 ] && {
     echo -e "${RED}Not in local bundle — skipped (${#STATUS_UNAVAIL[@]}):${ENDCOLOR}"
@@ -1680,7 +1805,7 @@ download_mode() {
       message "  checking ${pkg} on ${cn} (${ver})..." >&2
       # A non-zero exit means unmet dependencies (e.g. a gnome-shell too new);
       # checking only for "Remv" would accept that as compatible.
-      sim="$(apt-get install -s "${pkg}=${ver}" 2>&1)" || continue
+      sim="$(LC_ALL=C apt-get install -s "${pkg}=${ver}" 2>&1)" || continue
       echo "$sim" | grep -q '^Remv ' && continue
       if [ "$require_inst" = "1" ]; then
         echo "$sim" | grep -q "^Inst ${pkg} " || continue
@@ -1740,7 +1865,7 @@ download_mode() {
   # Refetch anything missing from the bundle entirely, or where the archive's
   # candidate version differs from what's already bundled.
   for pkg in $resolvable; do
-    cand="$(apt-cache policy "$pkg" 2>/dev/null | awk '/Candidate:/{print $2; exit}')"
+    cand="$(LC_ALL=C apt-cache policy "$pkg" 2>/dev/null | awk '/Candidate:/{print $2; exit}')"
     if [ -z "$cand" ] || [ "$cand" = "(none)" ]; then
       continue
     fi
@@ -1768,7 +1893,7 @@ download_mode() {
   for dep_pkg in $closure; do
     [ -n "${CANDIDATE_VER[$dep_pkg]:-}" ] && continue
     ubuntu_only_package "$dep_pkg" || continue
-    dep_ver="$(apt-cache policy "$dep_pkg" 2>/dev/null | awk '/Candidate:/{print $2; exit}')"
+    dep_ver="$(LC_ALL=C apt-cache policy "$dep_pkg" 2>/dev/null | awk '/Candidate:/{print $2; exit}')"
     [ -z "$dep_ver" ] && continue
     CANDIDATE_VER[$dep_pkg]="$dep_ver"
     bver="$(bundled_version "$dep_pkg")"
@@ -1784,7 +1909,7 @@ download_mode() {
   sim_out="$(apt-get install -s -y $resolvable 2>&1)"
   for dep_pkg in $(echo "$sim_out" | awk '/^Inst /{print $2}' | sort -u); do
     [ -n "${CANDIDATE_VER[$dep_pkg]:-}" ] && continue   # already handled above
-    dep_ver="$(apt-cache policy "$dep_pkg" 2>/dev/null | awk '/Candidate:/{print $2; exit}')"
+    dep_ver="$(LC_ALL=C apt-cache policy "$dep_pkg" 2>/dev/null | awk '/Candidate:/{print $2; exit}')"
     [ -z "$dep_ver" ] && continue
     CANDIDATE_VER[$dep_pkg]="$dep_ver"
     bver="$(bundled_version "$dep_pkg")"
@@ -2158,20 +2283,40 @@ for category in $package_categories; do
     esac
   done
 
-  to_install="$(missing_packages "$available")"
-  already="$(installed_packages "$available")"
-  for p in $already; do STATUS_ALREADY+=("$p"); done
+  # What this stage still has to do. Being installed is not the same as being
+  # current: a refreshed bundle carries newer builds than the machine has, and
+  # offline mode has no system upgrade to pick them up.
+  declare -A PKG_BEFORE=()
+  to_install=""
+  to_upgrade=""
+  for p in $available; do
+    _have="$(pkg_installed_version "$p" || true)"
+    _cand="$(pkg_candidate_version "$p")"
+    PKG_BEFORE[$p]="$_have"
+    if [ -z "$_have" ]; then
+      to_install="$to_install $p"
+    elif [ -n "$_cand" ] && dpkg --compare-versions "$_cand" gt "$_have" \
+         && ! predates_install "$p"; then
+      to_upgrade="$to_upgrade $p"
+    else
+      STATUS_ALREADY+=("$p (${_have})")
+    fi
+  done
+  to_install="$(echo "$to_install" | xargs)"
+  to_upgrade="$(echo "$to_upgrade" | xargs)"
+  to_change="$(echo "$to_install $to_upgrade" | xargs)"
 
-  if [ -z "$to_install" ]; then
-    message "all packages in ${category} already installed"
+  if [ -z "$to_change" ]; then
+    message "everything in ${category} is installed and current"
   else
-    message "installing: ${GREEN}${to_install}${ENDCOLOR}"
+    [ -n "$to_install" ] && message "installing: ${GREEN}${to_install}${ENDCOLOR}"
+    [ -n "$to_upgrade" ] && message "newer build in the bundle for: ${GREEN}${to_upgrade}${ENDCOLOR}"
 
     # Ask apt what it would actually do before letting it do it. A theming
     # script has no business removing packages, so a batch that would remove
     # something is never run as a batch.
     # shellcheck disable=SC2086
-    _batch_removes="$(apt-get -s install "${LOCAL_APT_OPTS[@]}" $to_install 2>/dev/null | awk '/^Remv /{print $2}' | xargs)"
+    _batch_removes="$(apt-get -s install "${LOCAL_APT_OPTS[@]}" $to_change 2>/dev/null | awk '/^Remv /{print $2}' | xargs)"
     if [ -n "$_batch_removes" ]; then
       message warn "installing this stage as one batch would REMOVE: ${_batch_removes}"
       message warn "not doing that — falling back to one package at a time"
@@ -2180,30 +2325,48 @@ for category in $package_categories; do
       # install here; the batch is retried package by package below so the rest
       # still lands, and only what genuinely failed is reported.
       # shellcheck disable=SC2086
-      sudo apt-get install -y "${LOCAL_APT_OPTS[@]}" $to_install \
+      sudo apt-get install -y "${LOCAL_APT_OPTS[@]}" $to_change \
         || message warn "batch install failed — retrying one package at a time"
     fi
 
     _installed_any=0
-    for p in $to_install; do
-      if is_installed "$p"; then
-        STATUS_INSTALLED+=("$p")
+    for p in $to_change; do
+      _before="${PKG_BEFORE[$p]:-}"
+      _now="$(pkg_installed_version "$p" || true)"
+
+      # The batch handled it.
+      if [ -n "$_now" ] && [ "$_now" != "$_before" ]; then
+        if [ -z "$_before" ]; then
+          STATUS_INSTALLED+=("$p (${_now})")
+        else
+          STATUS_UPGRADED+=("$p (${_before} → ${_now})")
+        fi
         _installed_any=1
         continue
       fi
-      # Same question, per package: anything that still wants to take another
-      # package away is left uninstalled rather than allowed through.
-      _p_removes="$(apt-get -s install "${LOCAL_APT_OPTS[@]}" "$p" 2>/dev/null | awk '/^Remv /{print $2}' | xargs)"
-      if [ -n "$_p_removes" ]; then
-        STATUS_FAILED+=("$p (would have removed: ${_p_removes})")
-        message warn "${p} would remove ${_p_removes} — skipped, nothing was touched"
-      elif sudo apt-get install -y "${LOCAL_APT_OPTS[@]}" "$p"; then
-        STATUS_INSTALLED+=("$p")
-        _installed_any=1
-      else
-        STATUS_FAILED+=("$p")
-        message warn "${p} cannot be installed from the bundle on this system — skipped"
-      fi
+
+      # It did not. Step down the versions the bundle carries and take the
+      # newest one that installs here. A removal is refused, as before.
+      _got="$(ensure_package "$p")"
+      _rc=$?
+      case $_rc in
+        0)
+          if [ -z "$_before" ]; then
+            STATUS_INSTALLED+=("$p (${_got})")
+          else
+            STATUS_UPGRADED+=("$p (${_before} → ${_got})")
+          fi
+          _installed_any=1
+          ;;
+        2)
+          STATUS_HELD+=("$p at ${_got} — $(explain_blocked "$p")")
+          message warn "${p} stays at ${_got}: no newer bundled build fits this system"
+          ;;
+        *)
+          STATUS_FAILED+=("$p — $(explain_blocked "$p")")
+          message warn "${p} cannot be installed from the bundle on this system — skipped"
+          ;;
+      esac
     done
     # Only ask for a re-login if something actually landed.
     [ $_installed_any -eq 1 ] && RELOGIN_NEEDED=1

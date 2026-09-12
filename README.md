@@ -49,16 +49,24 @@ No release name is baked into the script — neither Debian's nor Ubuntu's:
 
 ### Keeping it current
 
-Between runs, an ordinary `sudo apt upgrade` already carries the wallpapers, the Yaru
-GTK / icon / sound themes and the Ubuntu fonts forward on their own: they are pinned
-without a codename, so they float to the newest version across the Ubuntu releases
-already configured and their `-updates` suites. Debian's `unattended-upgrades` allows
-only Debian origins by default, so it will not do this in the background for you.
+Between runs, an ordinary `sudo apt upgrade` carries the wallpapers, the Yaru GTK /
+icon / sound themes and the Ubuntu fonts forward on their own: they are pinned without
+a codename, so they float to the newest version across the Ubuntu releases already
+configured and their `-updates` suites. Debian's `unattended-upgrades` allows only
+Debian origins by default, so it will not do this in the background for you.
 
 Re-run the script when a new Ubuntu is published. The archive is read fresh on every
-run, so the release becomes a candidate the day it appears, and the sources and pin are
-rewritten to match. Re-runs are cheap: a file whose content has not changed is not
-written, and the SUMMARY says what was already current.
+run, so the release becomes a candidate the day it appears; the sources and pin are
+rewritten to match, and **anything already installed is carried up to the new release
+too** — being present is not treated as being current. Re-runs are otherwise cheap: a
+file whose content has not changed is not written, and the SUMMARY says what was
+already current.
+
+> A cross-release upgrade usually has to pull in a package that is not installed yet —
+> `ubuntu-wallpapers` depends on a per-release pack, for instance — and `apt-get upgrade`
+> will not do that on its own. It keeps such a package back, silently. That is why the
+> script upgrades its own packages by name rather than leaving them to the system
+> upgrade.
 
 Two parts move at different speeds, by necessity:
 
@@ -69,13 +77,40 @@ Two parts move at different speeds, by necessity:
 
 The second row is a hard constraint, not a choice: those packages declare a dependency on
 one specific `gnome-shell` major version. On Debian 13 (GNOME 48) that means Ubuntu 25.04's
-build, and a newer Ubuntu's build would refuse to install. If nothing compatible exists at
-all, the run continues and the SUMMARY names what it skipped.
+build, and a newer Ubuntu's build would refuse to install.
+
+**Nothing is ever forced, and nothing is given up on either.** When the newest build will
+not go on, the script walks that package's versions down — never below what is already
+installed, never above what the pin selected — and takes the newest one that does fit. A
+build that could only be installed by removing something (a Yaru tied to the next
+gnome-shell installs perfectly well, *by removing gnome-shell*) is refused outright. The
+SUMMARY reports the outcome in its own section:
+
+| section | meaning |
+|---|---|
+| `Upgraded this run` | carried forward to a newer build, old → new |
+| `Already installed and current` | nothing newer on offer |
+| `Kept at the last compatible build` | something newer exists, does not fit this Debian, and the reason apt gave |
+| `Could not be installed on this system` | no build anywhere will install here |
 
 **After a Debian release upgrade, re-run the script.** The new Debian brings a new GNOME
 Shell, and the second row stays resolved against the old one until a run detects the change
 — the extensions declare which shell versions they support, and will not load until they
-are resolved against the one now running.
+are resolved against the one now running. That run re-resolves the pin and then upgrades
+the shell-coupled packages onto it.
+
+### When Ubuntu outruns your Debian
+
+Only the newest four Ubuntu releases are configured as sources, because each one adds a
+full `Packages` index to every `apt update`. Ubuntu ships twice a year and Debian stable
+stands still for about two, so the release carrying the last compatible shell theme
+eventually drops out of that window while the Debian under it has not changed.
+
+When that happens a run says so and reaches further back on its own — up to six more
+published releases — adds the one that does have a compatible theme, and keeps just that
+suite alongside the window. The cost is paid only on that path; an ordinary run never
+looks past the four. If nothing anywhere fits, the run continues, installs everything that
+does not depend on `gnome-shell`, and names the rest in the SUMMARY.
 
 ## Usage
 
