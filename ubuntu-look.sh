@@ -1336,9 +1336,10 @@ picture-uri-dark='file://${wp_dark}'
 show-desktop-icons=false"
   fi
 
-  # The greeter runs GNOME's own shell theme, not Yaru, so its orange comes
-  # from accent-color; without it the entry's focus ring is the schema
-  # default, blue.
+  # The greeter loads extensions from its own dconf like any session, so Yaru
+  # goes on through user-theme rather than by replacing Debian's gresource; a
+  # missing theme falls back to GNOME's own stylesheet. accent-color is set
+  # for the same reason Ubuntu sets it -- the focus ring is blue without it.
   local tmp
   tmp="$(mktemp)"
   cat << EOF > "$tmp"
@@ -1351,6 +1352,12 @@ cursor-theme='Yaru'
 font-name='Ubuntu Sans 11'
 monospace-font-name='Ubuntu Sans Mono 11'
 font-antialiasing='rgba'
+
+[org/gnome/shell]
+enabled-extensions=['user-theme@gnome-shell-extensions.gcampax.github.com']
+
+[org/gnome/shell/extensions/user-theme]
+name='Yaru-dark'
 ${bg_block}
 EOF
 

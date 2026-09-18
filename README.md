@@ -280,11 +280,18 @@ over Debian's own `file-db` line so its greeter defaults keep being read.
 `uninstall.sh` removes the database file always and the profile only where this script
 created it.
 
-The greeter's blue is included. GNOME Shell draws the login dialog from the stylesheet
-compiled into `gnome-shell-theme.gresource` — Debian's file, never overwritten here —
-but since GNOME 47 that stylesheet takes its highlight from `accent-color`, so setting
-that key for the greeter turns the password entry's focus ring orange without touching
-the gresource.
+The greeter is Yaru-themed too, and no Debian file is replaced to do it. Ubuntu swaps
+GDM's whole stylesheet by pointing a `gdm-theme.gresource` alternative at Yaru, but that
+path is an Ubuntu patch to GNOME Shell and Debian's Shell ignores it. What Debian's Shell
+does do is load extensions in the greeter from the greeter's own dconf, exactly as in a
+session — so the database enables `user-theme` and names `Yaru-dark`, and the login
+dialog is drawn from `/usr/share/themes/Yaru-dark/gnome-shell/gnome-shell.css`. If that
+theme is not installed, the Shell falls back to its own stylesheet.
+
+`accent-color` is set alongside it for the same reason Ubuntu sets it: since GNOME 47 the
+stylesheet takes its highlight from that key, and the password entry's focus ring is blue
+without it. Ubuntu applies it as a schema default for the whole system; here it is one
+key in the greeter's database, so nothing outside the login screen is affected.
 
 The one key left out is `logo`, which Ubuntu points at its own artwork: no branding is
 put on the screen. Choose one yourself in a file of your own under
