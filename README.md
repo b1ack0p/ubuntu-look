@@ -288,10 +288,11 @@ session — so the database enables `user-theme` and names `Yaru-dark`, and the 
 dialog is drawn from `/usr/share/themes/Yaru-dark/gnome-shell/gnome-shell.css`. If that
 theme is not installed, the Shell falls back to its own stylesheet.
 
-`accent-color` is set alongside it for the same reason Ubuntu sets it: since GNOME 47 the
-stylesheet takes its highlight from that key, and the password entry's focus ring is blue
-without it. Ubuntu applies it as a schema default for the whole system; here it is one
-key in the greeter's database, so nothing outside the login screen is affected.
+`accent-color` is set alongside it, because Yaru carries no colour of its own: its
+stylesheets reference the accent rather than hard-coding orange. Ubuntu supplies it from a
+second package, `ubuntu-settings`, as a schema default for the whole system; without it
+Yaru renders in GNOME's default blue there too. Here it is one key in the greeter's
+database instead, so nothing outside the login screen is affected.
 
 The one key left out is `logo`, which Ubuntu points at its own artwork: no branding is
 put on the screen. Choose one yourself in a file of your own under
