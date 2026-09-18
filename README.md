@@ -274,15 +274,21 @@ the default to whichever profile gnome-terminal picks for itself.
 The login screen is themed too. The greeter runs as its own user and reads the gdm
 dconf profile, so a database file under `/etc/dconf/db/gdm.d/` gives it the Yaru
 theme, the Yaru cursor, Ubuntu's fonts and the same wallpaper the desktop uses — the
-greeter block Ubuntu ships, key for key. Ubuntu's gdm ships that profile and Debian's
-does not, so it is created when missing and recorded; `uninstall.sh` removes the
-database file always and the profile only where this script created it.
+greeter block Ubuntu ships, key for key. Debian's gdm3 profile lives in `/usr/share`
+and names no system database, so one is written to `/etc/dconf/profile/gdm`, carrying
+over Debian's own `file-db` line so its greeter defaults keep being read.
+`uninstall.sh` removes the database file always and the profile only where this script
+created it.
+
+The greeter's blue is included. GNOME Shell draws the login dialog from the stylesheet
+compiled into `gnome-shell-theme.gresource` — Debian's file, never overwritten here —
+but since GNOME 47 that stylesheet takes its highlight from `accent-color`, so setting
+that key for the greeter turns the password entry's focus ring orange without touching
+the gresource.
 
 The one key left out is `logo`, which Ubuntu points at its own artwork: no branding is
 put on the screen. Choose one yourself in a file of your own under
-`/etc/dconf/db/gdm.d/` and it stays there. What cannot be changed is the greeter's own
-blue: GNOME Shell draws the login dialog from the stylesheet compiled into
-`gnome-shell-theme.gresource`, which is Debian's file and is not overwritten here.
+`/etc/dconf/db/gdm.d/` and it stays there.
 
 The Show Applications button carries the distribution's logo. The dock asks for
 that icon as `view-app-grid-<session mode>-symbolic`; Ubuntu's session mode is

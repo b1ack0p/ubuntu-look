@@ -1336,12 +1336,16 @@ picture-uri-dark='file://${wp_dark}'
 show-desktop-icons=false"
   fi
 
+  # The greeter runs GNOME's own shell theme, not Yaru, so its orange comes
+  # from accent-color; without it the entry's focus ring is the schema
+  # default, blue.
   local tmp
   tmp="$(mktemp)"
   cat << EOF > "$tmp"
 # ubuntu-look.sh - login screen theme. Safe to delete.
 [org/gnome/desktop/interface]
 gtk-theme='Yaru'
+accent-color='orange'
 icon-theme='Yaru'
 cursor-theme='Yaru'
 font-name='Ubuntu Sans 11'
