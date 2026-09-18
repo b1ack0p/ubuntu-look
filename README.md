@@ -575,24 +575,6 @@ first install, and the terminal profile this script added is removed while every
 profile you made keeps its place. The backup directory is deleted at the end,
 unless a step could not finish and the snapshot is the only way to retry it.
 
-## Tests
-
-The package-resolution logic — which Ubuntu release gets pinned, what is
-installed, what is carried forward when a new Ubuntu appears, and what is left
-alone when it will not fit — has an integration suite under `tests/`:
-
-```bash
-$ bash tests/run-all.sh
-```
-
-It builds real `.deb` packages and a real GPG-signed archive in `$TMPDIR`, then
-runs the scripts' own functions against a real apt resolver and a real dpkg
-database. Nothing is mocked and nothing outside `$TMPDIR` is touched — it needs
-no root and does not look at the machine it runs on.
-
-`bash tests/mutate.sh` breaks each behaviour on purpose and requires the suite
-to notice. See `tests/README.md`.
-
 ## Requirements
 
 - Debian with the GNOME desktop — the current stable is what this targets
