@@ -271,13 +271,16 @@ colours, and makes it the default. Profiles you already have are untouched:
 this one is appended to the list, and `uninstall.sh` removes only it, leaving
 the default to whichever profile gnome-terminal picks for itself.
 
-The login screen is themed too. The greeter runs as its own user and reads the gdm
+The login screen is themed too. The greeter runs as its own user and reads its own
 dconf profile, so a database file under `/etc/dconf/db/gdm.d/` gives it the Yaru
 theme, the Yaru cursor, Ubuntu's fonts and the same wallpaper the desktop uses — the
-greeter block Ubuntu ships, key for key. Debian's gdm3 profile lives in `/usr/share`
-and names no system database, so one is written to `/etc/dconf/profile/gdm`, carrying
-over Debian's own `file-db` line so its greeter defaults keep being read.
-`uninstall.sh` removes the database file always and the profile only where this script
+greeter block Ubuntu ships, key for key. GDM names that profile after the greeter's
+user, and on Debian that user is `Debian-gdm`, not `gdm`. Debian's profiles for both
+names live in `/usr/share` (one is a symlink to the other) and name no system database,
+so the script writes `/etc/dconf/profile/Debian-gdm`, and `/etc/dconf/profile/gdm` to
+match, each carrying over Debian's own `file-db` line so its greeter defaults keep being
+read. dconf looks in `/etc` before `/usr/share`, so no Debian file is changed.
+`uninstall.sh` removes the database file always and each profile only where this script
 created it.
 
 The greeter is Yaru-themed too, and no Debian file is replaced to do it. Ubuntu swaps

@@ -1365,38 +1365,53 @@ EOF
 
 # Theme the login screen.
 #
-# The greeter runs as its own user and reads the gdm dconf profile, so the
+# The greeter runs as its own user and reads its own dconf profile, so the
 # settings above do not reach it. Ubuntu themes it through a GNOME-Greeter
 # override; the equivalent here is a gdm database file. Only the theme, cursor
 # and fonts are set: no logo and no distribution branding, which stays Debian's.
 GDM_PROFILE_DIR="/etc/dconf/db/gdm.d"
 GDM_PROFILE_FILE="${GDM_PROFILE_DIR}/10-ubuntu-look"
 
-write_gdm_profile() {
-  local wp_light="${1:-}" wp_dark="${2:-}"
-
-  # Debian's gdm3 profile lives in /usr/share and names no system db, so the
-  # database written below is never read. A profile in /etc overrides it
-  # entirely, so Debian's file-db line is carried over or its greeter defaults
-  # stop being read; system-db:gdm goes first, so keys set here win and the
-  # rest fall through to Debian's. Creation is recorded, so the uninstall
-  # removes only a file this script put there.
-  local created="${BACKUP_ORIGINAL}/gdm-profile-created"
+# Point one greeter dconf profile at the gdm database.
+#
+# Debian's gdm3 profiles live in /usr/share and name no system db, so the
+# database written below is never read. A profile in /etc overrides one there
+# entirely, so Debian's file-db line is carried over or its greeter defaults
+# stop being read; system-db:gdm goes first, so keys set here win and the
+# rest fall through to Debian's. Creation is recorded, so the uninstall
+# removes only a file this script put there.
+write_greeter_dconf_profile() {
+  local name="$1" created="$2"
+  local target="/etc/dconf/profile/${name}"
   local want
   want="$(
     printf 'user-db:user\nsystem-db:gdm\n'
-    sed -n '/^file-db:/p' /usr/share/dconf/profile/gdm 2>/dev/null
+    sed -n '/^file-db:/p' "/usr/share/dconf/profile/${name}" 2>/dev/null
   )"
-  if [ ! -f /etc/dconf/profile/gdm ]; then
+  if [ ! -f "$target" ]; then
     sudo install -d -m 0755 /etc/dconf/profile
-    printf '%s\n' "$want" | sudo tee /etc/dconf/profile/gdm > /dev/null
+    printf '%s\n' "$want" | sudo tee "$target" > /dev/null
     mkdir -p "$BACKUP_ORIGINAL"
     : > "$created"
-    STATUS_CHANGES+=("Created /etc/dconf/profile/gdm so the login screen reads its database")
-  elif [ -f "$created" ] && ! printf '%s\n' "$want" | cmp -s - /etc/dconf/profile/gdm; then
+    STATUS_CHANGES+=("Created ${target} so the login screen reads its database")
+  elif [ -f "$created" ] && ! printf '%s\n' "$want" | cmp -s - "$target"; then
     # Only a profile this script created is repaired; an admin's is left alone.
-    printf '%s\n' "$want" | sudo tee /etc/dconf/profile/gdm > /dev/null
-    STATUS_CHANGES+=("Repaired /etc/dconf/profile/gdm (restored Debian's greeter defaults)")
+    printf '%s\n' "$want" | sudo tee "$target" > /dev/null
+    STATUS_CHANGES+=("Repaired ${target} (restored Debian's greeter defaults)")
+  fi
+}
+
+write_gdm_profile() {
+  local wp_light="${1:-}" wp_dark="${2:-}"
+
+  # GDM names the greeter's profile after the greeter's user, and Debian's
+  # greeter user is Debian-gdm, so that is the profile the login screen reads.
+  # Debian ships it as a symlink to its gdm profile, which is why one written
+  # only as /etc/dconf/profile/gdm never reached the greeter. The gdm profile
+  # is still written so the two names keep agreeing, as they do in /usr/share.
+  write_greeter_dconf_profile gdm "${BACKUP_ORIGINAL}/gdm-profile-created"
+  if getent passwd Debian-gdm > /dev/null; then
+    write_greeter_dconf_profile Debian-gdm "${BACKUP_ORIGINAL}/gdm-profile-Debian-gdm-created"
   fi
 
   # Ubuntu sets these on the greeter as well as the session. A shell that does

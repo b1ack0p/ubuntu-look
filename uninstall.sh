@@ -546,6 +546,15 @@ step_remove_gdm_profile() {
     removed=1
     DONE+=("Removed /etc/dconf/profile/gdm, which this script created")
   fi
+  # Debian's greeter reads the profile named after its user; Debian's own copy
+  # in /usr/share takes over again once this one is gone.
+  local created_debian="${BACKUP_ORIGINAL}/gdm-profile-Debian-gdm-created"
+  if [ -f "$created_debian" ]; then
+    sudo rm -f /etc/dconf/profile/Debian-gdm
+    rm -f "$created_debian"
+    removed=1
+    DONE+=("Removed /etc/dconf/profile/Debian-gdm, which this script created")
+  fi
   if [ $removed -eq 1 ]; then
     sudo dconf update 2>/dev/null || true
   else
