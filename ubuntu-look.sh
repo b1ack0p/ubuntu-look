@@ -1289,6 +1289,80 @@ log_final_state() {
   echo "--- end of state ---"
 }
 
+# Yaru on the login screen.
+#
+# Ubuntu swaps the greeter's whole stylesheet through a gdm-theme.gresource
+# alternative, a path only Ubuntu's patched GNOME Shell reads; Debian's never
+# looks at it. Debian's Shell does load extensions in the greeter, but only
+# ones whose metadata lists the "gdm" session mode. user-theme lists none, so
+# it is never enabled there. This extension does list it, and it loads
+# Yaru-dark's shell stylesheet, which is byte for byte the gdm.css in Yaru's
+# gresource: Ubuntu's own login screen.
+#
+# It lives under /usr/local, which dpkg never touches, and only the greeter's
+# database enables it, so user sessions never load it. It declares only the
+# running gnome-shell major. After a Shell upgrade the extension is refused and
+# the greeter falls back to Debian's stylesheet until the next run rewrites it.
+GREETER_EXT_UUID="ubuntu-look-greeter@ubuntu-look"
+GREETER_EXT_DIR="/usr/local/share/gnome-shell/extensions/${GREETER_EXT_UUID}"
+
+install_greeter_extension() {
+  local shell_major
+  shell_major="$(gnome-shell --version 2>/dev/null | grep -oE '[0-9]+' | head -1)"
+  [ -n "$shell_major" ] || return 0
+
+  local tmp changed=0
+  tmp="$(mktemp -d)"
+  cat << EOF > "${tmp}/metadata.json"
+{
+  "uuid": "${GREETER_EXT_UUID}",
+  "name": "Ubuntu look for the login screen",
+  "description": "Draws the login screen with Yaru, as Ubuntu does. Installed by ubuntu-look.sh; safe to delete.",
+  "shell-version": ["${shell_major}"],
+  "session-modes": ["gdm"]
+}
+EOF
+  cat << 'EOF' > "${tmp}/extension.js"
+import Gio from 'gi://Gio';
+
+import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
+import * as Main from 'resource:///org/gnome/shell/ui/main.js';
+
+const STYLESHEET = '/usr/share/themes/Yaru-dark/gnome-shell/gnome-shell.css';
+
+export default class UbuntuLookGreeter extends Extension {
+    enable() {
+        // Without the Yaru shell theme the greeter keeps Debian's stylesheet.
+        if (!Gio.File.new_for_path(STYLESHEET).query_exists(null))
+            return;
+        log(`ubuntu-look: loading ${STYLESHEET}`);
+        Main.setThemeStylesheet(STYLESHEET);
+        Main.loadTheme();
+    }
+
+    disable() {
+        Main.setThemeStylesheet(null);
+        Main.loadTheme();
+    }
+}
+EOF
+
+  local f
+  for f in metadata.json extension.js; do
+    if ! cmp -s "${tmp}/${f}" "${GREETER_EXT_DIR}/${f}" 2>/dev/null; then
+      sudo install -Dm 0644 "${tmp}/${f}" "${GREETER_EXT_DIR}/${f}"
+      changed=1
+    fi
+  done
+  rm -rf "$tmp"
+
+  if [ $changed -eq 1 ]; then
+    STATUS_CHANGES+=("Login screen extension → ${GREETER_EXT_DIR}")
+  else
+    STATUS_NOCHANGE+=("Login screen extension already current")
+  fi
+}
+
 # Theme the login screen.
 #
 # The greeter runs as its own user and reads the gdm dconf profile, so the
@@ -1336,10 +1410,11 @@ picture-uri-dark='file://${wp_dark}'
 show-desktop-icons=false"
   fi
 
-  # The greeter loads extensions from its own dconf like any session, so Yaru
-  # goes on through user-theme rather than by replacing Debian's gresource; a
-  # missing theme falls back to GNOME's own stylesheet. accent-color is set
-  # for the same reason Ubuntu sets it -- the focus ring is blue without it.
+  # Yaru goes on through the extension above rather than by replacing Debian's
+  # gresource. accent-color is set for the same reason Ubuntu sets it: the
+  # focus ring is blue without it.
+  install_greeter_extension
+
   local tmp
   tmp="$(mktemp)"
   cat << EOF > "$tmp"
@@ -1354,10 +1429,7 @@ monospace-font-name='Ubuntu Sans Mono 11'
 font-antialiasing='rgba'
 
 [org/gnome/shell]
-enabled-extensions=['user-theme@gnome-shell-extensions.gcampax.github.com']
-
-[org/gnome/shell/extensions/user-theme]
-name='Yaru-dark'
+enabled-extensions=['${GREETER_EXT_UUID}']
 ${bg_block}
 EOF
 

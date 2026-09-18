@@ -531,6 +531,13 @@ step_remove_gdm_profile() {
     removed=1
     DONE+=("Removed ${f}")
   fi
+  local ext="/usr/local/share/gnome-shell/extensions/ubuntu-look-greeter@ubuntu-look"
+  if [ -d "$ext" ]; then
+    sudo rm -rf "$ext"
+    sudo rmdir /usr/local/share/gnome-shell/extensions /usr/local/share/gnome-shell 2>/dev/null || true
+    removed=1
+    DONE+=("Removed ${ext}")
+  fi
   # Only a profile this script created: one the distribution ships is not ours
   # to take away, and removing it would leave the greeter unconfigurable.
   if [ -f "$created" ]; then

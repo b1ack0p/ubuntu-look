@@ -283,10 +283,15 @@ created it.
 The greeter is Yaru-themed too, and no Debian file is replaced to do it. Ubuntu swaps
 GDM's whole stylesheet by pointing a `gdm-theme.gresource` alternative at Yaru, but that
 path is an Ubuntu patch to GNOME Shell and Debian's Shell ignores it. What Debian's Shell
-does do is load extensions in the greeter from the greeter's own dconf, exactly as in a
-session — so the database enables `user-theme` and names `Yaru-dark`, and the login
-dialog is drawn from `/usr/share/themes/Yaru-dark/gnome-shell/gnome-shell.css`. If that
-theme is not installed, the Shell falls back to its own stylesheet.
+does do is load extensions in the greeter, but only extensions whose metadata lists the
+`gdm` session mode. `user-theme` lists none, so it cannot be used there. The script writes
+a small extension of its own that does list it, and it loads
+`/usr/share/themes/Yaru-dark/gnome-shell/gnome-shell.css`. That file is byte for byte the
+`gdm.css` inside Yaru's gresource, so the result is Ubuntu's own login screen. The
+extension lives in `/usr/local/share/gnome-shell/extensions/`, which dpkg never manages,
+and only the greeter's database enables it, so user sessions never load it. If the Yaru
+shell theme is missing, or a GNOME Shell upgrade makes the Shell refuse the extension
+until the next run, the greeter simply keeps Debian's stylesheet.
 
 `accent-color` is set alongside it, because Yaru carries no colour of its own: its
 stylesheets reference the accent rather than hard-coding orange. Ubuntu supplies it from a
