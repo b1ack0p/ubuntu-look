@@ -167,6 +167,15 @@ yaru-theme-gnome-shell yaru-theme-gtk yaru-theme-icon yaru-theme-sound"
 
 UBUNTU_MIRROR="http://archive.ubuntu.com/ubuntu"
 
+# Where Ubuntu moves a release at end of life. apt fails the whole update run
+# on one 404, and the persistent source written here can sit unused on an
+# offline machine long enough for its release to be retired.
+UBUNTU_OLD_MIRROR="http://old-releases.ubuntu.com/ubuntu"
+
+# main only: everything installed is there, and Ubuntu policy forbids main
+# depending on universe. universe would add ~500 MB of indices per update.
+UBUNTU_COMPONENTS="main"
+
 # Ubuntu boots with "quiet splash" and Plymouth. This is the only setting that
 # affects boot, so its changes are recorded and UBUNTU_BOOT_SPLASH=0 reverts
 # exactly those.
@@ -205,7 +214,7 @@ DEFAULT_UBUNTU_CODENAME="noble"
 
 # Bump whenever the persistent pin's content changes, so an existing install
 # detects it's stale and rewrites it (see NEED_PERSISTENT_REWRITE below).
-PIN_VERSION="v15-2026-08-29"
+PIN_VERSION="v16-2026-09-19"
 
 # The GNOME Shell extensions that make up the Ubuntu look. Single source of
 # truth, exactly like ubuntu-look.sh's own SHELL_EXTENSIONS.
@@ -1021,10 +1030,14 @@ picture-uri='file://${wp_light}'"
 
   # Set up /etc/dconf/profile/user so GNOME reads the system db.
   # Format: one db per line; user db first, then system db.
-  if [ ! -f "$DCONF_USER_PROFILE" ] || ! grep -q "system-db:local" "$DCONF_USER_PROFILE"; then
+  if [ ! -f "$DCONF_USER_PROFILE" ]; then
     sudo install -d -m 0755 "$(dirname "$DCONF_USER_PROFILE")"
     printf 'user-db:user\nsystem-db:local\n' | sudo tee "$DCONF_USER_PROFILE" > /dev/null
     STATUS_CHANGES+=("Created /etc/dconf/profile/user (system db enabled)")
+  elif ! grep -q '^system-db:local$' "$DCONF_USER_PROFILE"; then
+    # Append, never rewrite: other tools add databases to this same file.
+    printf 'system-db:local\n' | sudo tee -a "$DCONF_USER_PROFILE" > /dev/null
+    STATUS_CHANGES+=("Added system-db:local to /etc/dconf/profile/user (existing lines kept)")
   fi
 
   local tmp
@@ -1071,7 +1084,11 @@ Pin-Priority: 990
 # Ubuntu sources. The glob on ubuntu-wallpapers* is required, because the
 # metapackage depends on the per-release wallpaper pack; whitelisting only the
 # metapackage leaves that dependency at priority -1 and nothing installs.
-Package: yaru-theme-gtk yaru-theme-icon yaru-theme-sound fonts-ubuntu* suru-icon-theme session-migration ubuntu-wallpapers*
+#
+# Nothing Debian ships is listed: only session-migration is Ubuntu-only. A
+# whitelist entry would let Ubuntu replace a Debian package, which this pin
+# exists to prevent.
+Package: yaru-theme-gtk yaru-theme-icon yaru-theme-sound fonts-ubuntu* session-migration ubuntu-wallpapers*
 Pin: release o=Ubuntu
 Pin-Priority: 990
 EOF
@@ -1120,18 +1137,27 @@ GDM_PROFILE_FILE="${GDM_PROFILE_DIR}/10-ubuntu-look"
 write_gdm_profile() {
   local wp_light="${1:-}" wp_dark="${2:-}"
 
-  # Ubuntu's gdm ships this profile; Debian's does not, and without it the
-  # database below is never read -- the greeter falls back to the defaults and
-  # nothing written here reaches it. Created the way write_dconf_profile
-  # creates the user profile, and recorded, so the uninstall removes only a
-  # file this script put there.
+  # Debian's gdm3 profile lives in /usr/share and names no system db, so the
+  # database written below is never read. A profile in /etc overrides it
+  # entirely, so Debian's file-db line is carried over or its greeter defaults
+  # stop being read; system-db:gdm goes first, so keys set here win and the
+  # rest fall through to Debian's. Creation is recorded, so the uninstall
+  # removes only a file this script put there.
   local created="${BACKUP_ORIGINAL}/gdm-profile-created"
+  local want
+  want="$(
+    printf 'user-db:user\nsystem-db:gdm\n'
+    sed -n '/^file-db:/p' /usr/share/dconf/profile/gdm 2>/dev/null
+  )"
   if [ ! -f /etc/dconf/profile/gdm ]; then
     sudo install -d -m 0755 /etc/dconf/profile
-    printf 'user-db:user\nsystem-db:gdm\n' | sudo tee /etc/dconf/profile/gdm > /dev/null
+    printf '%s\n' "$want" | sudo tee /etc/dconf/profile/gdm > /dev/null
     mkdir -p "$BACKUP_ORIGINAL"
     : > "$created"
     STATUS_CHANGES+=("Created /etc/dconf/profile/gdm so the login screen reads its database")
+  elif [ -f "$created" ] && ! printf '%s\n' "$want" | cmp -s - /etc/dconf/profile/gdm; then
+    printf '%s\n' "$want" | sudo tee /etc/dconf/profile/gdm > /dev/null
+    STATUS_CHANGES+=("Repaired /etc/dconf/profile/gdm (restored Debian's greeter defaults)")
   fi
 
   # Ubuntu sets these on the greeter as well as the session. A shell that does
@@ -1647,16 +1673,44 @@ print_summary() {
 # from download_mode() alone; INSTALL mode never calls them.
 ###############################################################################
 
-# One published Ubuntu release as "<version> <state>", state being "stable" or
-# "devel"; empty when the mirror does not publish it, which also drops
-# unpublished candidates. The state comes from Valid-Until, which only the
-# in-development suite carries, so a release is recognised the day it ships.
+# One published Ubuntu release as "<version> <state> <mirror>"; non-zero when
+# neither mirror publishes it. Both hosts are tried: a release moves to
+# old-releases at end of life, and the source list must name whichever answers.
+# "devel" comes from Valid-Until, which only the in-development suite carries.
 ubuntu_release_info() {
-  curl -fsS -m 15 -r 0-2047 "${UBUNTU_MIRROR}/dists/${1}/Release" 2>/dev/null \
-    | awk '
-        /^Version:/     { v = $2 }
-        /^Valid-Until:/ { unreleased = 1 }
-        END { if (v != "") print v, (unreleased ? "devel" : "stable") }'
+  local cn="$1" mirror out
+  for mirror in "$UBUNTU_MIRROR" "${UBUNTU_OLD_MIRROR:-}"; do
+    [ -n "$mirror" ] || continue
+    out="$(curl -fsS --connect-timeout 5 -m 15 -r 0-2047 "${mirror}/dists/${cn}/Release" 2>/dev/null \
+      | awk -v m="$mirror" '
+          /^Version:/     { v = $2 }
+          /^Valid-Until:/ { unreleased = 1 }
+          END { if (v != "") print v, (unreleased ? "devel" : "stable"), m }')"
+    [ -n "$out" ] && { printf '%s\n' "$out"; return 0; }
+  done
+  return 1
+}
+
+# Mirror serving $1. Falls back to the main archive when nothing answers, as
+# this script also runs with no network at all.
+ubuntu_mirror_for() {
+  local info
+  info="$(ubuntu_release_info "$1")" || { printf '%s' "$UBUNTU_MIRROR"; return 0; }
+  printf '%s' "${info##* }"
+}
+
+# True when suite $1 should be written for mirror $2. Only a definitive 404
+# means "absent"; an unreachable mirror must not silently drop the -updates
+# pocket.
+ubuntu_suite_published() {
+  local code
+  code="$(curl -fsS -o /dev/null --connect-timeout 5 -m 15 -r 0-255 -w '%{http_code}' \
+            "${2}/dists/${1}/Release" 2>/dev/null)"
+  case "$code" in
+    2*|3*) return 0 ;;
+    4*)    return 1 ;;
+    *)     return 0 ;;
+  esac
 }
 
 # The newest MAX_UBUNTU_CANDIDATES Ubuntu releases the archive is serving right
@@ -1681,7 +1735,7 @@ discover_ubuntu_codenames() {
     info="$(ubuntu_release_info "$cn")"
     [ -z "$info" ] && continue
     ver="${info%% *}"
-    state="${info##* }"
+    state="$(printf '%s' "$info" | awk '{print $2}')"
     if [ "$state" = "devel" ] && [ "$UBUNTU_INCLUDE_DEVEL" != "1" ]; then
       message "  skipping '${cn}' (${ver}) - not released yet; UBUNTU_INCLUDE_DEVEL=1 to use it" >&2
       continue
@@ -1765,7 +1819,7 @@ download_mode() {
   fi
 
   step "Discover current Ubuntu releases"
-  local dl_codenames cn
+  local dl_codenames cn _m
   dl_codenames="$(discover_ubuntu_codenames)"
   [ -z "$dl_codenames" ] && error "No Ubuntu release reachable at ${UBUNTU_MIRROR} — check your internet connection."
   message "candidate Ubuntu releases (oldest to newest): ${dl_codenames}"
@@ -1778,8 +1832,10 @@ download_mode() {
   {
     echo "# Ubuntu — Yaru theme + wallpapers (written by ubuntu-look-offline.sh --download)"
     for cn in $dl_codenames; do
-      echo "deb [signed-by=${UBUNTU_KEYRING}] ${UBUNTU_MIRROR} ${cn} main universe"
-      echo "deb [signed-by=${UBUNTU_KEYRING}] ${UBUNTU_MIRROR} ${cn}-updates main universe"
+      _m="$(ubuntu_mirror_for "$cn")"
+      echo "deb [signed-by=${UBUNTU_KEYRING}] ${_m} ${cn} ${UBUNTU_COMPONENTS}"
+      ubuntu_suite_published "${cn}-updates" "$_m" \
+        && echo "deb [signed-by=${UBUNTU_KEYRING}] ${_m} ${cn}-updates ${UBUNTU_COMPONENTS}"
     done
   } | sudo tee "$UBUNTU_LIST" > /dev/null
 
@@ -2228,8 +2284,10 @@ if [ $NEED_PERSISTENT_REWRITE -eq 1 ]; then
     echo "# Ubuntu — Yaru theme + wallpapers (written by ubuntu-look-offline.sh)"
     echo "# Only usable once this machine has internet — installs during this"
     echo "# offline run come from the local bundle, not this source."
-    echo "deb [signed-by=${UBUNTU_KEYRING}] ${UBUNTU_MIRROR} ${UBUNTU_CODENAME} main universe"
-    echo "deb [signed-by=${UBUNTU_KEYRING}] ${UBUNTU_MIRROR} ${UBUNTU_CODENAME}-updates main universe"
+    _m="$(ubuntu_mirror_for "$UBUNTU_CODENAME")"
+    echo "deb [signed-by=${UBUNTU_KEYRING}] ${_m} ${UBUNTU_CODENAME} ${UBUNTU_COMPONENTS}"
+    ubuntu_suite_published "${UBUNTU_CODENAME}-updates" "$_m" \
+      && echo "deb [signed-by=${UBUNTU_KEYRING}] ${_m} ${UBUNTU_CODENAME}-updates ${UBUNTU_COMPONENTS}"
   } | sudo tee "$UBUNTU_LIST" > /dev/null
 
   # The same pin ubuntu-look.sh writes, so a machine set up offline behaves

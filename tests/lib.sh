@@ -55,9 +55,10 @@ load_lookback() {
   echo '  fi'
 }
 
-# The system upgrade step, from the main flow.
+# The system upgrade step, from the main flow. Opt-in since v16: the block
+# starts at the flag, and only the outer "fi" sits in column 0.
 load_upgrade_step() {
-  extract_block '/^upgradable_before=/{p=1} p{print} p && /^fi$/{exit}' \
+  extract_block '/^UBUNTU_LOOK_SYSTEM_UPGRADE=/{p=1} p{print} p && /^fi$/{exit}' \
                 'with-new-pkgs'
 }
 

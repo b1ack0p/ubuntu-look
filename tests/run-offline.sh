@@ -15,9 +15,14 @@ declare -a LOCAL_APT_OPTS=()
 load_fns is_installed predates_install available_packages pkg_installed_version \
          pkg_candidate_version pkg_versions_desc installs_cleanly explain_blocked \
          ensure_package
-# Source configuration is the online script's job; borrow just those two.
-eval "$(awk '/^write_ubuntu_sources\(\) \{/,/^}$/' "$REPO/ubuntu-look.sh")"
-eval "$(awk '/^resolve_ubuntu_pkg_codename\(\) \{/,/^}$/' "$REPO/ubuntu-look.sh")"
+# Source configuration is the online script's job; borrow it from there.
+# write_ubuntu_sources() resolves the mirror per codename, so its helpers have
+# to come along or every source line is skipped and nothing is installable.
+for _f in write_ubuntu_sources resolve_ubuntu_pkg_codename \
+          ubuntu_release_info ubuntu_suite_published ubuntu_mirror_for; do
+  eval "$(awk -v n="$_f" '$0 ~ "^"n"\\(\\) \\{" {p=1} p {print} p && /^}$/ {exit}' "$REPO/ubuntu-look.sh")"
+  declare -F "$_f" >/dev/null || { echo "FATAL: could not borrow $_f" >&2; exit 1; }
+done
 eval "$(awk '/^resolve_ubuntu_codename\(\) \{/,/^}$/' "$REPO/ubuntu-look.sh")"
 quiet() { "$@" >/dev/null 2>&1; }
 STAGE="dconf-cli yaru-theme-gnome-shell yaru-theme-gtk ubuntu-wallpapers"

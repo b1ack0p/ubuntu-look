@@ -13,7 +13,8 @@ fi
 load_fns is_installed predates_install available_packages pkg_installed_version \
          pkg_candidate_version pkg_versions_desc installs_cleanly explain_blocked \
          ensure_package resolve_ubuntu_pkg_codename resolve_ubuntu_codename \
-         write_ubuntu_sources add_ubuntu_key apt_update
+         write_ubuntu_sources add_ubuntu_key apt_update \
+         ubuntu_release_info ubuntu_suite_published ubuntu_mirror_for
 declare -a STATUS_CHANGES=()
 STAGE="dconf-cli yaru-theme-gnome-shell yaru-theme-gtk ubuntu-wallpapers"
 quiet() { "$@" >/dev/null 2>&1; }
@@ -239,7 +240,17 @@ quiet apt_update
 echo "  control — plain 'apt-get upgrade':"
 apt-get -s upgrade 2>/dev/null | sed -n '/kept back/,+1p' | sed 's/^/    /'
 before_manifest="$(wc -l < "$INSTALLED_MANIFEST")"
+
+# Default: a theming script must not upgrade the rest of the system. Debian's
+# "Don't break Debian" names a blanket upgrade as the risk of having a foreign
+# archive configured, so the whole-system path is opt-in.
+( unset UBUNTU_LOOK_SYSTEM_UPGRADE; eval "$(load_upgrade_step)" ) >/dev/null 2>&1
+assert_version plymouth 24.004.60-5 "by default the system upgrade is left alone"
+
+# Opt-in: the old behaviour, still available and still correct.
+export UBUNTU_LOOK_SYSTEM_UPGRADE=1
 eval "$(load_upgrade_step)" >/dev/null 2>&1
+unset UBUNTU_LOOK_SYSTEM_UPGRADE
 assert_version plymouth       24.004.61-1 "the held-back update was applied"
 assert_version plymouth-label 24.004.61-1 "and the package it needed was installed"
 assert_eq "$(wc -l < "$INSTALLED_MANIFEST")" "$before_manifest" "nothing the system upgrade pulled was claimed as ours"

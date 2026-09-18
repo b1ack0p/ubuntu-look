@@ -46,6 +46,11 @@ No release name is baked into the script — neither Debian's nor Ubuntu's:
 - Debian's side is simply whatever suite the machine already runs.
 - If Ubuntu ever rotates its archive signing key, the script fetches the new one
   automatically instead of failing with `NO_PUBKEY`.
+- **A retired Ubuntu release will not break `apt update`.** At end of life a release
+  moves from `archive.ubuntu.com` to `old-releases.ubuntu.com`, and apt fails the *entire*
+  update run on one `404` — which would stop Debian's own security updates arriving. Each
+  suite is probed before it is written and the source names whichever host serves it. A
+  release that has moved is rewritten on the next run.
 
 ### Keeping it current
 
@@ -67,6 +72,12 @@ already current.
 > will not do that on its own. It keeps such a package back, silently. That is why the
 > script upgrades its own packages by name rather than leaving them to the system
 > upgrade.
+
+The script **does not upgrade the rest of your system**. Debian's
+[Don't break Debian](https://wiki.debian.org/DontBreakDebian) names a blanket
+`apt-get upgrade` as the hazard of a configured foreign archive, since it takes every
+installed package to the highest version any source offers. Ordinary system updates stay
+yours to run; `UBUNTU_LOOK_SYSTEM_UPGRADE=1` restores the old behaviour.
 
 Two parts move at different speeds, by necessity:
 
@@ -93,18 +104,45 @@ SUMMARY reports the outcome in its own section:
 | `Kept at the last compatible build` | something newer exists, does not fit this Debian, and the reason apt gave |
 | `Could not be installed on this system` | no build anywhere will install here |
 
-**After a Debian release upgrade, re-run the script.** The new Debian brings a new GNOME
-Shell, and the second row stays resolved against the old one until a run detects the change
-— the extensions declare which shell versions they support, and will not load until they
-are resolved against the one now running. That run re-resolves the pin and then upgrades
-the shell-coupled packages onto it.
+### Upgrading Debian itself
+
+**Before** a Debian release upgrade (13 → 14), run:
+
+```bash
+$ bash ubuntu-look.sh prepare-upgrade
+```
+
+It removes the Ubuntu apt source, the pin, and the three packages tied to the running
+GNOME Shell (`gnome-shell-extension-ubuntu-dock`,
+`gnome-shell-extension-ubuntu-tiling-assistant`, `yaru-theme-gnome-shell`). The Yaru GTK
+and icon themes, fonts and wallpapers stay, so the desktop does not go bare. Then upgrade
+Debian, reboot, and re-run the script to restore the look on the new GNOME Shell.
+
+Measured on a simulated `trixie → forky` `full-upgrade`:
+
+| starting state | packages apt removes |
+|---|---|
+| never ran ubuntu-look | 19 |
+| ubuntu-look installed, not prepared | 21 |
+| ubuntu-look installed, after `prepare-upgrade` | 19 — identical to a clean Debian |
+
+Skipping it is not fatal: the upgrade still completes, with no errors and nothing held
+back. The two extra removals are the dock and tiling extensions, which apt drops because
+their `gnome-shell (<< 49~)` dependency cannot be met. `yaru-theme-gnome-shell` declares
+no upper bound, so it is kept and styles the new Shell with the old Shell's CSS until the
+script is re-run; a run that finds this reports it before the SUMMARY.
 
 ### When Ubuntu outruns your Debian
 
-Only the newest four Ubuntu releases are configured as sources, because each one adds a
-full `Packages` index to every `apt update`. Ubuntu ships twice a year and Debian stable
-stands still for about two, so the release carrying the last compatible shell theme
-eventually drops out of that window while the Debian under it has not changed.
+Only the newest four Ubuntu releases are configured as sources, and only their `main`
+component, because each adds a `Packages` index to every `apt update`. Everything the
+script installs is in `main`, and Ubuntu policy forbids `main` depending on `universe`, so
+the dependency closure is there too; adding `universe` would cost roughly 500 MB of
+indices per update.
+
+Ubuntu ships twice a year and Debian stable stands still for about two, so the release
+carrying the last compatible shell theme eventually drops out of that window while the
+Debian under it has not changed.
 
 When that happens a run says so and reaches further back on its own — up to six more
 published releases — adds the one that does have a compatible theme, and keeps just that
@@ -134,6 +172,11 @@ $ bash ubuntu-look.sh 2-desktop-gnome
 # valid stages: 0-base  1-desktop-base  2-desktop-gnome
 ```
 
+### Before upgrading Debian
+
+Run `bash ubuntu-look.sh prepare-upgrade` first — see
+[Upgrading Debian itself](#upgrading-debian-itself).
+
 ### Overrides
 
 ```bash
@@ -142,6 +185,9 @@ $ UBUNTU_CODENAME=questing bash ubuntu-look.sh
 
 # Adopt the next Ubuntu before it is released (pre-release Yaru, changes daily):
 $ UBUNTU_INCLUDE_DEVEL=1 bash ubuntu-look.sh
+
+# Also upgrade the whole system, as older versions did (off by default):
+$ UBUNTU_LOOK_SYSTEM_UPGRADE=1 bash ubuntu-look.sh
 
 # Leave the boot splash out, or take back one already applied:
 $ UBUNTU_BOOT_SPLASH=0 bash ubuntu-look.sh

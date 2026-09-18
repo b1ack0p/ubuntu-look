@@ -140,6 +140,14 @@ yaru-theme-gnome-shell yaru-theme-gtk yaru-theme-icon yaru-theme-sound"
 UBUNTU_CODENAME="${UBUNTU_CODENAME:-auto}"
 UBUNTU_MIRROR="http://archive.ubuntu.com/ubuntu"
 
+# Where Ubuntu moves a release at end of life. apt fails the whole update run
+# on one 404, so every suite is written with the host that actually serves it.
+UBUNTU_OLD_MIRROR="http://old-releases.ubuntu.com/ubuntu"
+
+# main only: everything installed is there, and Ubuntu policy forbids main
+# depending on universe. Adding universe costs ~500 MB of indices per update.
+UBUNTU_COMPONENTS="main"
+
 # Ubuntu boots with "quiet splash" and Plymouth. This is the only setting that
 # affects boot, so its changes are recorded and UBUNTU_BOOT_SPLASH=0 reverts
 # exactly those.
@@ -179,7 +187,7 @@ MAX_UBUNTU_LOOKBACK=6
 UBUNTU_ARCHIVE_KEY="F6ECB3762474EDA9D21B7022871920D1991BC93C"
 
 # Bump whenever pin/source content changes, so re-runs detect stale config.
-PIN_VERSION="v15-2026-08-29"
+PIN_VERSION="v16-2026-09-19"
 
 # Extensions that make up the Ubuntu look. Single source of truth for the
 # dconf profile, the live-session enable loop, and the verification loop.
@@ -200,6 +208,10 @@ DCONF_USER_PROFILE="/etc/dconf/profile/user"
 UBUNTU_KEYRING=/etc/apt/keyrings/ubuntu-archive.gpg
 UBUNTU_LIST=/etc/apt/sources.list.d/ubuntu-themes.list
 UBUNTU_PIN=/etc/apt/preferences.d/ubuntu-themes
+
+# Per-run cache of "<codename> <version> <state> <mirror>", so later steps do
+# not re-probe the archive.
+UBUNTU_RELEASE_CACHE="$(mktemp)"
 
 # -----------------------------------------------------------------------------
 # Status tracking
@@ -980,16 +992,49 @@ apply_live_settings() {
   done
 }
 
-# One published Ubuntu release as "<version> <state>", state being "stable" or
-# "devel"; empty when the mirror does not publish it, which also drops
-# unpublished candidates. The state comes from Valid-Until, which only the
-# in-development suite carries, so a release is recognised the day it ships.
+# One published Ubuntu release as "<version> <state> <mirror>"; non-zero when
+# neither mirror publishes it. Both hosts are tried: a release moves to
+# old-releases at end of life, and the source list must name whichever answers.
+# "devel" comes from Valid-Until, which only the in-development suite carries.
 ubuntu_release_info() {
-  curl -fsS -m 15 -r 0-2047 "${UBUNTU_MIRROR}/dists/${1}/Release" 2>/dev/null \
-    | awk '
-        /^Version:/     { v = $2 }
-        /^Valid-Until:/ { unreleased = 1 }
-        END { if (v != "") print v, (unreleased ? "devel" : "stable") }'
+  local cn="$1" mirror out
+  for mirror in "$UBUNTU_MIRROR" "${UBUNTU_OLD_MIRROR:-}"; do
+    [ -n "$mirror" ] || continue
+    out="$(curl -fsS --connect-timeout 5 -m 15 -r 0-2047 "${mirror}/dists/${cn}/Release" 2>/dev/null \
+      | awk -v m="$mirror" '
+          /^Version:/     { v = $2 }
+          /^Valid-Until:/ { unreleased = 1 }
+          END { if (v != "") print v, (unreleased ? "devel" : "stable"), m }')"
+    [ -n "$out" ] && { printf '%s\n' "$out"; return 0; }
+  done
+  return 1
+}
+
+# True when suite $1 should be written for mirror $2. Only a definitive 404
+# means "absent"; a timeout or DNS failure must not silently drop the -updates
+# pocket, which would stop point updates arriving until the next run.
+ubuntu_suite_published() {
+  local code
+  code="$(curl -fsS -o /dev/null --connect-timeout 5 -m 15 -r 0-255 -w '%{http_code}' \
+            "${2}/dists/${1}/Release" 2>/dev/null)"
+  case "$code" in
+    2*|3*) return 0 ;;
+    4*)    return 1 ;;
+    *)     message warn "could not check ${1} on ${2} — keeping it" >&2; return 0 ;;
+  esac
+}
+
+# Mirror serving $1, from the cache; probes live for a forced UBUNTU_CODENAME.
+ubuntu_mirror_for() {
+  local cn="$1" hit info
+  if [ -n "${UBUNTU_RELEASE_CACHE:-}" ]; then
+    hit="$(awk -v c="$cn" '$1 == c { print $4; exit }' "$UBUNTU_RELEASE_CACHE" 2>/dev/null)"
+    [ -n "$hit" ] && { printf '%s' "$hit"; return 0; }
+  fi
+  info="$(ubuntu_release_info "$cn")" || return 1
+  [ -n "${UBUNTU_RELEASE_CACHE:-}" ] \
+    && printf '%s %s\n' "$cn" "$info" >> "$UBUNTU_RELEASE_CACHE"
+  printf '%s' "${info##* }"
 }
 
 # Every released Ubuntu the archive serves, oldest to newest, ordered by each
@@ -1011,11 +1056,19 @@ discover_ubuntu_codenames() {
   # the static seed; the Release probe below still validates every name.
   [ -z "$names" ] && names="$FALLBACK_CODENAMES"
 
+  # A retired release drops out of that listing but stays on old-releases, and
+  # may be the only one with a theme this gnome-shell can load. Re-offer what
+  # the current source list names so it is re-probed, not silently dropped.
+  names="$(printf '%s\n%s\n%s\n' "$names" "$FALLBACK_CODENAMES" \
+    "$(sed -n 's/^# codenames: //p' "$UBUNTU_LIST" 2>/dev/null)" \
+    | tr ' ' '\n' | grep -E '^[a-z]+$' | sort -u)"
+
   for cn in $names; do
-    info="$(ubuntu_release_info "$cn")"
-    [ -z "$info" ] && continue
+    info="$(ubuntu_release_info "$cn")" || continue
     ver="${info%% *}"
-    state="${info##* }"
+    state="$(printf '%s' "$info" | awk '{print $2}')"
+    # write_ubuntu_sources() must name the mirror that answered.
+    [ -n "${UBUNTU_RELEASE_CACHE:-}" ] && printf '%s %s\n' "$cn" "$info" >> "$UBUNTU_RELEASE_CACHE"
     if [ "$state" = "devel" ] && [ "$UBUNTU_INCLUDE_DEVEL" != "1" ]; then
       message "  skipping '${cn}' (${ver}) - not released yet; UBUNTU_INCLUDE_DEVEL=1 to use it" >&2
       continue
@@ -1030,7 +1083,7 @@ discover_ubuntu_codenames() {
 # Write the Ubuntu source list for $UBUNTU_CANDIDATE_CODENAMES. Returns 0 when
 # the file changed, 1 when it was already correct.
 write_ubuntu_sources() {
-  local tmp _c
+  local tmp _c _m
   tmp="$(mktemp)"
   {
     echo "# Ubuntu — Yaru theme + wallpaper (released codenames tried for compatibility)"
@@ -1039,8 +1092,18 @@ write_ubuntu_sources() {
     echo "# codenames: ${UBUNTU_CANDIDATE_CODENAMES}"
     echo ""
     for _c in $UBUNTU_CANDIDATE_CODENAMES; do
-      echo "deb [signed-by=${UBUNTU_KEYRING}] ${UBUNTU_MIRROR} ${_c} main universe"
-      echo "deb [signed-by=${UBUNTU_KEYRING}] ${UBUNTU_MIRROR} ${_c}-updates main universe"
+      # The host that answered, not a fixed one: naming archive.ubuntu.com for
+      # a retired release 404s and fails every apt update on the system.
+      _m="$(ubuntu_mirror_for "$_c")" || _m=""
+      if [ -z "$_m" ]; then
+        message warn "no archive serves Ubuntu '${_c}' — leaving it out of the source list" >&2
+        continue
+      fi
+      echo "deb [signed-by=${UBUNTU_KEYRING}] ${_m} ${_c} ${UBUNTU_COMPONENTS:-main}"
+      # Not every release keeps an -updates pocket.
+      if ubuntu_suite_published "${_c}-updates" "$_m"; then
+        echo "deb [signed-by=${UBUNTU_KEYRING}] ${_m} ${_c}-updates ${UBUNTU_COMPONENTS:-main}"
+      fi
     done
   } > "$tmp"
 
@@ -1160,10 +1223,15 @@ picture-uri='file://${wp_light}'"
 
   # Set up /etc/dconf/profile/user so GNOME reads the system db.
   # Format: one db per line; user db first, then system db.
-  if [ ! -f "$DCONF_USER_PROFILE" ] || ! grep -q "system-db:local" "$DCONF_USER_PROFILE"; then
+  if [ ! -f "$DCONF_USER_PROFILE" ]; then
     sudo install -d -m 0755 "$(dirname "$DCONF_USER_PROFILE")"
     printf 'user-db:user\nsystem-db:local\n' | sudo tee "$DCONF_USER_PROFILE" > /dev/null
     STATUS_CHANGES+=("Created /etc/dconf/profile/user (system db enabled)")
+  elif ! grep -q '^system-db:local$' "$DCONF_USER_PROFILE"; then
+    # Append, never rewrite: other tools (ibus, site profiles) add databases to
+    # this file, and rewriting it drops their lines.
+    printf 'system-db:local\n' | sudo tee -a "$DCONF_USER_PROFILE" > /dev/null
+    STATUS_CHANGES+=("Added system-db:local to /etc/dconf/profile/user (existing lines kept)")
   fi
 
   local tmp
@@ -1233,18 +1301,28 @@ GDM_PROFILE_FILE="${GDM_PROFILE_DIR}/10-ubuntu-look"
 write_gdm_profile() {
   local wp_light="${1:-}" wp_dark="${2:-}"
 
-  # Ubuntu's gdm ships this profile; Debian's does not, and without it the
-  # database below is never read -- the greeter falls back to the defaults and
-  # nothing written here reaches it. Created the way write_dconf_profile
-  # creates the user profile, and recorded, so the uninstall removes only a
-  # file this script put there.
+  # Debian's gdm3 profile lives in /usr/share and names no system db, so the
+  # database written below is never read. A profile in /etc overrides it
+  # entirely, so Debian's file-db line is carried over or its greeter defaults
+  # stop being read; system-db:gdm goes first, so keys set here win and the
+  # rest fall through to Debian's. Creation is recorded, so the uninstall
+  # removes only a file this script put there.
   local created="${BACKUP_ORIGINAL}/gdm-profile-created"
+  local want
+  want="$(
+    printf 'user-db:user\nsystem-db:gdm\n'
+    sed -n '/^file-db:/p' /usr/share/dconf/profile/gdm 2>/dev/null
+  )"
   if [ ! -f /etc/dconf/profile/gdm ]; then
     sudo install -d -m 0755 /etc/dconf/profile
-    printf 'user-db:user\nsystem-db:gdm\n' | sudo tee /etc/dconf/profile/gdm > /dev/null
+    printf '%s\n' "$want" | sudo tee /etc/dconf/profile/gdm > /dev/null
     mkdir -p "$BACKUP_ORIGINAL"
     : > "$created"
     STATUS_CHANGES+=("Created /etc/dconf/profile/gdm so the login screen reads its database")
+  elif [ -f "$created" ] && ! printf '%s\n' "$want" | cmp -s - /etc/dconf/profile/gdm; then
+    # Only a profile this script created is repaired; an admin's is left alone.
+    printf '%s\n' "$want" | sudo tee /etc/dconf/profile/gdm > /dev/null
+    STATUS_CHANGES+=("Repaired /etc/dconf/profile/gdm (restored Debian's greeter defaults)")
   fi
 
   # Ubuntu sets these on the greeter as well as the session. A shell that does
@@ -1298,6 +1376,67 @@ UBUNTU_DING_DIR="$HOME/.local/share/gnome-shell/extensions/ding@rastersoft.com"
 UBUNTU_DING_SCHEMA_DIR="$HOME/.local/share/glib-2.0/schemas"
 UBUNTU_DING_SCHEMA="org.gnome.shell.extensions.ding.gschema.xml"
 UBUNTU_DING_RECORD="${BACKUP_DIR}/ubuntu-ding-version.txt"
+
+# True when the installed version of $1 is served only by Ubuntu. Asks the
+# archives, because version strings are not a reliable marker
+# (ubuntu-wallpapers-resolute is "26.04.2"). Needs the sources still configured.
+pkg_origin_is_ubuntu() {
+  local pkg="$1" ver
+  ver="$(pkg_installed_version "$pkg" || true)"
+  [ -n "$ver" ] || return 1
+  LC_ALL=C apt-cache madison "$pkg" 2>/dev/null | awk -F'|' -v v="$ver" '
+    { gsub(/^[ \t]+|[ \t]+$/, "", $2); gsub(/^[ \t]+|[ \t]+$/, "", $3)
+      if ($2 == v) { if ($3 ~ /ubuntu\.com/) u = 1; else d = 1 } }
+    END { exit (u && !d) ? 0 : 1 }'
+}
+
+# Upper bound on gnome-shell that the installed build of $1 declares, e.g. "49"
+# from "gnome-shell (<< 49~)". Empty when it declares none.
+pkg_shell_upper_bound() {
+  dpkg-query -W -f='${Depends}' "$1" 2>/dev/null \
+    | grep -oE 'gnome-shell \(<< [0-9]+' | grep -oE '[0-9]+$' | head -1
+}
+
+# Warn about installed packages the running gnome-shell has moved past — the
+# state a Debian release upgrade leaves behind until the script is re-run.
+check_shell_coupling_drift() {
+  local shell_major pkg bound drift=0
+  shell_major="$(gnome-shell --version 2>/dev/null | grep -oE '[0-9]+' | head -1)"
+  [ -n "$shell_major" ] || return 0
+
+  for pkg in gnome-shell-extension-ubuntu-dock \
+             gnome-shell-extension-ubuntu-tiling-assistant \
+             gnome-shell-extension-desktop-icons-ng \
+             gnome-shell-extension-appindicator; do
+    is_installed "$pkg" || continue
+    bound="$(pkg_shell_upper_bound "$pkg")"
+    [ -n "$bound" ] || continue
+    if [ "$shell_major" -ge "$bound" ]; then
+      message warn "${pkg} is built for gnome-shell < ${bound}, but ${shell_major} is running"
+      STATUS_FAILED+=("${pkg} does not support gnome-shell ${shell_major} — it will not load")
+      drift=1
+    fi
+  done
+
+  # No upper bound to lean on, so the theme's own release is compared instead.
+  if is_installed yaru-theme-gnome-shell && pkg_origin_is_ubuntu yaru-theme-gnome-shell; then
+    local themed
+    themed="$(dpkg-query -W -f='${Version}' yaru-theme-gnome-shell 2>/dev/null)"
+    # madison prints "<codename>/<component>"; -updates counts as the same
+    # codename.
+    if [ -n "$UBUNTU_CODENAME" ] && [ "$UBUNTU_CODENAME" != "auto" ] \
+       && ! LC_ALL=C apt-cache madison yaru-theme-gnome-shell 2>/dev/null \
+            | grep -F "| ${themed} |" \
+            | grep -qE "[ /]${UBUNTU_CODENAME}(-updates)?/"; then
+      message warn "yaru-theme-gnome-shell ${themed} is not the build for ${UBUNTU_CODENAME}"
+      message warn "  the shell theme may not match gnome-shell ${shell_major}"
+      drift=1
+    fi
+  fi
+
+  [ "$drift" -eq 1 ] && message warn "re-run this script to resolve the theme against the running gnome-shell"
+  return 0
+}
 
 # Newest version of the bundle any configured repository offers. madison lists
 # them all regardless of the pin, which holds this package at -1 so apt can
@@ -1745,13 +1884,89 @@ print_summary() {
   fi
   echo -e "${GREEN}═════════════════════════════════════════════════════════${ENDCOLOR}"
 }
-trap print_summary EXIT
+# Cleanup must preserve the exit status: print_summary reads it as $?, and a
+# cleanup that returns its own status makes every failure look like success.
+_on_exit() {
+  local rc=$?
+  rm -f "$UBUNTU_RELEASE_CACHE"
+  return $rc
+}
+trap '_on_exit; print_summary' EXIT
 
 ###############################################################################
 # Pre-flight checks
 ###############################################################################
 
 [ "$(id -u)" -eq 0 ] && error "Do not run as root. Run as a normal user in the 'sudo' group."
+
+###############################################################################
+# Mode: prepare for a Debian release upgrade
+###############################################################################
+# Debian's release notes say to take foreign packages off before a release
+# upgrade, not during one. Re-running the script afterwards restores the look.
+#
+# Measured on a simulated trixie -> forky full-upgrade: run first, this leaves
+# an upgrade plan identical to a machine that never used ubuntu-look.
+prepare_debian_upgrade() {
+  local pkg drop=""
+
+  message "Preparing this system for a Debian release upgrade."
+  message ""
+  message "This removes the Ubuntu apt source, the pin, and the packages that are"
+  message "tied to the running gnome-shell. The Yaru GTK and icon themes, the fonts"
+  message "and the wallpapers stay, so the desktop keeps its look during the upgrade."
+  message ""
+  confirm_continue
+
+  # Asked while the sources are configured; afterwards apt cannot tell origin.
+  for pkg in gnome-shell-extension-ubuntu-dock \
+             gnome-shell-extension-ubuntu-tiling-assistant \
+             yaru-theme-gnome-shell; do
+    is_installed "$pkg" && pkg_origin_is_ubuntu "$pkg" && drop="${drop} ${pkg}"
+  done
+  drop="$(echo "$drop" | xargs)"
+
+  if [ -n "$drop" ]; then
+    message "removing gnome-shell-coupled Ubuntu packages: ${drop}"
+    # shellcheck disable=SC2086
+    if sudo apt-get remove -y $drop; then
+      STATUS_CHANGES+=("Removed gnome-shell-coupled Ubuntu packages: ${drop}")
+    else
+      error "Could not remove ${drop} — resolve that before upgrading Debian."
+    fi
+  else
+    message "no gnome-shell-coupled Ubuntu packages installed"
+  fi
+
+  local removed_cfg=0
+  if [ -f "$UBUNTU_LIST" ]; then
+    sudo rm -f "$UBUNTU_LIST"; removed_cfg=1
+    STATUS_CHANGES+=("Removed ${UBUNTU_LIST}")
+  fi
+  if [ -f "$UBUNTU_PIN" ]; then
+    sudo rm -f "$UBUNTU_PIN"; removed_cfg=1
+    STATUS_CHANGES+=("Removed ${UBUNTU_PIN}")
+  fi
+  # The keyring stays: an inert public key that no source now names, and it
+  # saves a re-run the keyserver round trip.
+
+  [ "$removed_cfg" -eq 1 ] && { sudo apt-get update || message warn "apt update reported an error"; }
+
+  message ""
+  message "${GREEN}Done.${ENDCOLOR} This is a plain Debian system again. Now:"
+  message "  1. sudo apt update && sudo apt full-upgrade     # the Debian release upgrade"
+  message "  2. reboot"
+  message "  3. bash ubuntu-look.sh                          # restores the Ubuntu look"
+  message ""
+  message "Step 3 re-resolves everything against the new gnome-shell."
+}
+
+case "${arguments}" in
+  prepare-upgrade|--prepare-upgrade)
+    prepare_debian_upgrade
+    exit 0
+    ;;
+esac
 
 if [ -z "$arguments" ]; then
   package_categories="${!packages[@]}"
@@ -1967,7 +2182,11 @@ Pin-Priority: 990
 # Ubuntu sources. The glob on ubuntu-wallpapers* is required, because the
 # metapackage depends on the per-release wallpaper pack; whitelisting only the
 # metapackage leaves that dependency at priority -1 and nothing installs.
-Package: yaru-theme-gtk yaru-theme-icon yaru-theme-sound fonts-ubuntu* suru-icon-theme session-migration ubuntu-wallpapers*
+#
+# Nothing Debian ships is listed: only session-migration is Ubuntu-only. A
+# whitelist entry would let Ubuntu replace a Debian package, which this pin
+# exists to prevent.
+Package: yaru-theme-gtk yaru-theme-icon yaru-theme-sound fonts-ubuntu* session-migration ubuntu-wallpapers*
 Pin: release o=Ubuntu
 Pin-Priority: 990
 EOF
@@ -1981,25 +2200,34 @@ fi
 # Step: apt upgrade
 ###############################################################################
 
-step "Upgrade installed packages"
-# --with-new-pkgs lets an update pull in a package that is not installed yet.
-# Without it apt-get silently keeps such updates back. It never removes
-# anything.
-upgradable_before="$(apt-get -s upgrade --with-new-pkgs 2>/dev/null | grep -c '^Inst ')"
-if [ "$upgradable_before" -gt 0 ]; then
-  message "upgrading ${upgradable_before} package(s)..."
-  # Not fatal: a held package or an unrelated third-party repo must not stop
-  # the Ubuntu look, and every install below is checked anyway.
-  if sudo apt-get upgrade -y --with-new-pkgs; then
-    STATUS_CHANGES+=("Upgraded ${upgradable_before} package(s)")
-    RELOGIN_NEEDED=1
+step "Upgrade this script's own packages"
+# Deliberately not a system-wide "apt-get upgrade": Debian's "Don't break
+# Debian" names that as the hazard of a configured foreign archive. The stage
+# loop below upgrades this script's own packages by name and simulates every
+# candidate first. UBUNTU_LOOK_SYSTEM_UPGRADE=1 restores the old behaviour.
+UBUNTU_LOOK_SYSTEM_UPGRADE="${UBUNTU_LOOK_SYSTEM_UPGRADE:-0}"
+
+if [ "$UBUNTU_LOOK_SYSTEM_UPGRADE" = "1" ]; then
+  upgradable_before="$(apt-get -s upgrade --with-new-pkgs 2>/dev/null | grep -c '^Inst ')"
+  if [ "$upgradable_before" -gt 0 ]; then
+    message warn "UBUNTU_LOOK_SYSTEM_UPGRADE=1 — upgrading ${upgradable_before} package(s) system-wide"
+    # Not fatal: a held package or an unrelated third-party repo must not stop
+    # the Ubuntu look, and every install below is checked anyway.
+    if sudo apt-get upgrade -y --with-new-pkgs; then
+      STATUS_CHANGES+=("Upgraded ${upgradable_before} package(s) system-wide")
+      RELOGIN_NEEDED=1
+    else
+      message warn "apt upgrade failed — continuing; the theming steps do not depend on it"
+      STATUS_FAILED+=("system upgrade (apt-get upgrade returned an error)")
+    fi
   else
-    message warn "apt upgrade failed — continuing; the theming steps do not depend on it"
-    STATUS_FAILED+=("system upgrade (apt-get upgrade returned an error)")
+    message "nothing to upgrade"
+    STATUS_NOCHANGE+=("apt upgrade: nothing to upgrade")
   fi
 else
-  message "nothing to upgrade"
-  STATUS_NOCHANGE+=("apt upgrade: nothing to upgrade")
+  message "leaving the rest of the system to your own 'apt upgrade'"
+  message "  this script upgrades only the packages its stages name"
+  STATUS_NOCHANGE+=("System-wide apt upgrade skipped (UBUNTU_LOOK_SYSTEM_UPGRADE=1 to enable)")
 fi
 
 ###############################################################################
@@ -2354,5 +2582,8 @@ if [ -s "$PKGS_BEFORE_RUN" ]; then
 fi
 rm -f "$PKGS_BEFORE_RUN"
 [ -f "$INSTALLED_MANIFEST" ] && sort -u -o "$INSTALLED_MANIFEST" "$INSTALLED_MANIFEST"
+
+# Report anything that no longer matches the running gnome-shell.
+check_shell_coupling_drift
 
 message "${GREEN}All steps finished. See SUMMARY below.${ENDCOLOR}"

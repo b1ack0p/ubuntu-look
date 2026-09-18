@@ -92,17 +92,19 @@ mkdeb bravo main ubuntu-wallpapers-bravo 25.04.2
 publish bravo Ubuntu 25.04
 
 # charlie: shell theme needs a newer gnome-shell; gtk theme picked up an
-# Ubuntu-only dependency the pin whitelist does not name.
+# Ubuntu-only dependency the pin whitelist does not name. It sits in main, as
+# Ubuntu's own archive requires of anything main depends on, so the pin -- not
+# a missing component -- is what blocks it.
 mkdeb charlie main yaru-theme-gnome-shell        25.10.3-0ubuntu1 'Breaks: gnome-shell (<< 49~)'
 mkdeb charlie main yaru-theme-gtk          25.10.3-0ubuntu1 'Depends: user-session-migration'
-mkdeb charlie universe user-session-migration   0.5.0
+mkdeb charlie main user-session-migration      0.5.0
 mkdeb charlie main ubuntu-wallpapers         25.10.2          'Depends: ubuntu-wallpapers-charlie'
 mkdeb charlie main ubuntu-wallpapers-charlie 25.10.2
 publish charlie Ubuntu 25.10
 
 mkdeb delta main yaru-theme-gnome-shell        26.04.5-0ubuntu1 'Breaks: gnome-shell (<< 49~)'
 mkdeb delta main yaru-theme-gtk          26.04.5-0ubuntu1 'Depends: user-session-migration'
-mkdeb delta universe user-session-migration   0.5.1
+mkdeb delta main user-session-migration      0.5.1
 mkdeb delta main ubuntu-wallpapers         26.04.2          'Depends: ubuntu-wallpapers-delta'
 mkdeb delta main ubuntu-wallpapers-delta   26.04.2
 publish delta Ubuntu 26.04
