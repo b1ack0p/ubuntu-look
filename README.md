@@ -174,8 +174,9 @@ $ bash ubuntu-look.sh 2-desktop-gnome
 
 ### Before upgrading Debian
 
-Run `bash ubuntu-look.sh prepare-upgrade` first — see
-[Upgrading Debian itself](#upgrading-debian-itself).
+Running `bash ubuntu-look.sh prepare-upgrade` first is recommended, not required:
+the upgrade completes either way, but preparing leaves it identical to a plain
+Debian one — see [Upgrading Debian itself](#upgrading-debian-itself).
 
 ### Overrides
 

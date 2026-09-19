@@ -2051,12 +2051,17 @@ prepare_debian_upgrade() {
   [ "$removed_cfg" -eq 1 ] && { sudo apt-get update || message warn "apt update reported an error"; }
 
   message ""
+  local codename
+  codename="$(. /etc/os-release 2>/dev/null; echo "${VERSION_CODENAME:-}")"
+
   message "${GREEN}Done.${ENDCOLOR} This is a plain Debian system again. Now:"
-  message "  1. sudo apt update && sudo apt full-upgrade     # the Debian release upgrade"
-  message "  2. reboot"
-  message "  3. bash ubuntu-look.sh                          # restores the Ubuntu look"
+  message "  1. point your Debian sources at the new release: replace '${codename:-<current codename>}'"
+  message "     with the next codename in /etc/apt/sources.list and /etc/apt/sources.list.d/*"
+  message "  2. sudo apt update && sudo apt full-upgrade     # the Debian release upgrade"
+  message "  3. reboot"
+  message "  4. bash ubuntu-look.sh                          # restores the Ubuntu look"
   message ""
-  message "Step 3 re-resolves everything against the new gnome-shell."
+  message "Step 4 re-resolves everything against the new gnome-shell."
 }
 
 case "${arguments}" in
