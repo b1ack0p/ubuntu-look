@@ -338,9 +338,11 @@ alone.
 ## Tweaking the result
 
 Everything the script applies is an ordinary GSettings key. Each command below
-is complete — copy the line, change the value at the end. `(script: X)` is what
-the installer writes, so a later run overwrites your choice on that key; keys
-without it are left alone. `uninstall.sh` restores them all.
+is complete — copy the line, change the value at the end. `(Ubuntu default: X)`
+is what a stock Ubuntu desktop ships; where one comment covers several commands,
+the values are in the same order. A `*` marks a key the installer writes, so a
+later run overwrites your choice on it; unmarked keys are left alone.
+`uninstall.sh` restores them all.
 
 ```bash
 $ gsettings get   org.gnome.desktop.interface accent-color   # read a key
@@ -352,50 +354,50 @@ $ gsettings reset org.gnome.desktop.interface accent-color   # undo one key
 Ubuntu Dock is a dash-to-dock fork and answers to its schema.
 
 ```bash
-# Position: LEFT RIGHT BOTTOM TOP  (script: LEFT)
+# Position: LEFT RIGHT BOTTOM TOP  (Ubuntu default: LEFT) *
 $ gsettings set org.gnome.shell.extensions.dash-to-dock dock-position BOTTOM
 
-# Span the whole edge, or a centred panel  (script: true)
+# Span the whole edge, or a centred panel  (Ubuntu default: true) *
 $ gsettings set org.gnome.shell.extensions.dash-to-dock extend-height false
 
-# Always visible  (script: true)
+# Always visible  (Ubuntu default: true) *
 $ gsettings set org.gnome.shell.extensions.dash-to-dock dock-fixed false
 
-# Hide under windows
+# Hide under windows  (Ubuntu default: true)
 $ gsettings set org.gnome.shell.extensions.dash-to-dock intellihide true
 
-# What hides it: ALL_WINDOWS FOCUS_APPLICATION_WINDOWS MAXIMIZED_WINDOWS ALWAYS_ON_TOP  (script: ALL_WINDOWS)
+# What hides it: ALL_WINDOWS FOCUS_APPLICATION_WINDOWS MAXIMIZED_WINDOWS ALWAYS_ON_TOP  (Ubuntu default: ALL_WINDOWS) *
 $ gsettings set org.gnome.shell.extensions.dash-to-dock intellihide-mode MAXIMIZED_WINDOWS
 
-# Icon size in pixels
+# Icon size in pixels  (Ubuntu default: 48)
 $ gsettings set org.gnome.shell.extensions.dash-to-dock dash-max-icon-size 32
 
-# Click a running app: minimize cycle-windows previews launch quit focus-or-appspread  (script: focus-or-appspread)
+# Click a running app: minimize cycle-windows previews launch quit focus-or-appspread  (Ubuntu default: focus-or-appspread) *
 $ gsettings set org.gnome.shell.extensions.dash-to-dock click-action minimize
 
-# Scroll over the dock: do-nothing switch-workspace cycle-windows  (script: switch-workspace)
+# Scroll over the dock: do-nothing switch-workspace cycle-windows  (Ubuntu default: switch-workspace) *
 $ gsettings set org.gnome.shell.extensions.dash-to-dock scroll-action cycle-windows
 
-# Running-app marker: DOTS DASHES SQUARES SEGMENTED SOLID METRO CILIORA BINARY  (script: DOTS)
+# Running-app marker: DOTS DASHES SQUARES SEGMENTED SOLID METRO CILIORA BINARY  (Ubuntu default: DOTS) *
 $ gsettings set org.gnome.shell.extensions.dash-to-dock running-indicator-style DASHES
 
-# Log in to the desktop instead of the overview  (script: true)
+# Log in to the desktop instead of the overview  (Ubuntu default: true) *
 $ gsettings set org.gnome.shell.extensions.dash-to-dock disable-overview-on-startup false
 ```
 
 **Trash and drives on the dock:**
 
 ```bash
-# Trash entry
+# Trash entry  (Ubuntu default: true)
 $ gsettings set org.gnome.shell.extensions.dash-to-dock show-trash false
 
-# Drive entries
+# Drive entries  (Ubuntu default: true)
 $ gsettings set org.gnome.shell.extensions.dash-to-dock show-mounts false
 
-# List only drives that are mounted right now  (script: false, i.e. list them all)
+# List only drives that are mounted right now  (Ubuntu default: false, i.e. list them all) *
 $ gsettings set org.gnome.shell.extensions.dash-to-dock show-mounts-only-mounted true
 
-# Include network shares  (script: true)
+# Include network shares  (Ubuntu default: true) *
 $ gsettings set org.gnome.shell.extensions.dash-to-dock show-mounts-network false
 ```
 
@@ -404,11 +406,11 @@ once a window touches the dock. Opacities are fractions — `0.25` is 25% opaque
 (very see-through), `0.8` is nearly solid.
 
 ```bash
-# One opacity that never changes
+# One opacity that never changes  (Ubuntu default: DEFAULT, 0.8)
 $ gsettings set org.gnome.shell.extensions.dash-to-dock transparency-mode FIXED
 $ gsettings set org.gnome.shell.extensions.dash-to-dock background-opacity 0.25
 
-# Two-state, your own ends: desktop clear, then a window against the dock
+# Two-state, your own ends: desktop clear, then a window against the dock  (Ubuntu default: DEFAULT, false, 0.2, 0.8)
 $ gsettings set org.gnome.shell.extensions.dash-to-dock transparency-mode DYNAMIC
 $ gsettings set org.gnome.shell.extensions.dash-to-dock customize-alphas true
 $ gsettings set org.gnome.shell.extensions.dash-to-dock min-alpha 0.1
@@ -422,12 +424,12 @@ $ gsettings reset org.gnome.shell.extensions.dash-to-dock transparency-mode
 `dock-fixed false` or `intellihide true` above first.
 
 ```bash
-# Slide in / out, and the pauses before each
+# Slide in / out, and the pauses before each  (Ubuntu default: 0.2, 0.25, 0.2)
 $ gsettings set org.gnome.shell.extensions.dash-to-dock animation-time 0.0
 $ gsettings set org.gnome.shell.extensions.dash-to-dock show-delay 0.0
 $ gsettings set org.gnome.shell.extensions.dash-to-dock hide-delay 0.0
 
-# Push the screen edge to reveal it, and how hard
+# Push the screen edge to reveal it, and how hard  (Ubuntu default: true, 100.0)
 $ gsettings set org.gnome.shell.extensions.dash-to-dock require-pressure-to-show false
 $ gsettings set org.gnome.shell.extensions.dash-to-dock pressure-threshold 100.0
 ```
@@ -438,62 +440,62 @@ Icons come from `~/Desktop`; there is no key for showing a folder elsewhere —
 symlink it in.
 
 ```bash
-# Corner they start from: top-left top-right bottom-left bottom-right  (script: bottom-right)
+# Corner they start from: top-left top-right bottom-left bottom-right  (Ubuntu default: bottom-right) *
 $ gsettings set org.gnome.shell.extensions.ding start-corner top-left
 
-# Trash on the desktop  (script: false)
+# Trash on the desktop  (Ubuntu default: false) *
 $ gsettings set org.gnome.shell.extensions.ding show-trash true
 
-# Mounted drives on the desktop  (script: false)
+# Mounted drives on the desktop  (Ubuntu default: false) *
 $ gsettings set org.gnome.shell.extensions.ding show-volumes true
 
-# Sort order: NAME DESCENDINGNAME MODIFIEDTIME KIND SIZE  (script: DESCENDINGNAME)
+# Sort order: NAME DESCENDINGNAME MODIFIEDTIME KIND SIZE  (Ubuntu default: DESCENDINGNAME) *
 $ gsettings set org.gnome.shell.extensions.ding arrangeorder NAME
 ```
 
 ### Appearance
 
 ```bash
-# Light / dark. The shell theme follows on its own.
+# Light / dark. The shell theme follows on its own.  (Ubuntu default: default, i.e. light)
 $ gsettings set org.gnome.desktop.interface color-scheme prefer-dark
 
-# Accent: blue teal green yellow orange red pink purple slate  (script: orange)
+# Accent: blue teal green yellow orange red pink purple slate  (Ubuntu default: orange) *
 $ gsettings set org.gnome.desktop.interface accent-color purple
 
-# Wallpaper — set both keys, or the dark theme keeps the old one
+# Wallpaper — set both keys, or the dark theme keeps the old one  (Ubuntu default: warty-final-ubuntu.png, ubuntu-wallpaper-d.png) *
 $ gsettings set org.gnome.desktop.background picture-uri      'file:///usr/share/backgrounds/warty-final-ubuntu.png'
 $ gsettings set org.gnome.desktop.background picture-uri-dark 'file:///usr/share/backgrounds/warty-final-ubuntu.png'
 
-# Window buttons on the left  (script: ':minimize,maximize,close')
+# Window buttons on the left  (Ubuntu default: ':minimize,maximize,close') *
 $ gsettings set org.gnome.desktop.wm.preferences button-layout 'close,minimize,maximize:'
 ```
 
 ### Behaviour
 
 ```bash
-# Clock: 24h is the default on both, so the script leaves it alone
+# Clock: 12h or 24h  (Ubuntu default: taken from your locale, e.g. 12h for en_US)
 $ gsettings set org.gnome.desktop.interface clock-format 12h
 
-# Middle-click paste  (script: false)
+# Middle-click paste  (Ubuntu default: false) *
 $ gsettings set org.gnome.desktop.interface gtk-enable-primary-paste true
 
-# Top-left corner opens the overview: Debian's default, off under Ubuntu  (script: false)
+# Top-left corner opens the overview: on under Debian  (Ubuntu default: false) *
 $ gsettings set org.gnome.desktop.interface enable-hot-corners true
 
-# What the Super key does. '' unbinds it; `gsettings get` first to note the current one.
+# What the Super key does. '' unbinds it  (Ubuntu default: 'Super')
 $ gsettings set org.gnome.mutter overlay-key ''
 
-# Edge tiling: on by default on both, and the tiling assistant builds on it
+# Edge tiling: the tiling assistant builds on it  (Ubuntu default: true)
 $ gsettings set org.gnome.mutter edge-tiling false
 ```
 
 ### Animations
 
 ```bash
-# Master switch: every GNOME and GTK animation, applications included
+# Master switch: every GNOME and GTK animation, applications included  (Ubuntu default: true)
 $ gsettings set org.gnome.desktop.interface enable-animations false
 
-# Tiling assistant: into a tile, out of one, and the half-screen popup
+# Tiling assistant: into a tile, out of one, and the half-screen popup  (Ubuntu default: true, true, true)
 $ gsettings set org.gnome.shell.extensions.tiling-assistant enable-tile-animations false
 $ gsettings set org.gnome.shell.extensions.tiling-assistant enable-untile-animations false
 $ gsettings set org.gnome.shell.extensions.tiling-assistant enable-tiling-popup false
