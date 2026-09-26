@@ -855,7 +855,7 @@ resolve_ubuntu_codename() {
         [ "$pkg" = yaru-theme-gnome-shell ] && { ok=0; break; }
         continue
       fi
-      message "  checking ${pkg} on ${cn} (${ver})..." >&2
+      message "  checking ${cn}: ${pkg}=${ver}" >&2
       allowed=""
       [ "$pkg" = "$COMBINED_EXT_PKG" ] && allowed="$SEPARATE_EXT_PKGS"
       if ! sim="$(LC_ALL=C apt-get install -s "${pkg}=${ver}" 2>&1)" \
@@ -4029,7 +4029,8 @@ esac
   # Debian ships no mutter binary; its library package names the version.
   _wm="$(mutter --version 2>/dev/null | head -1)"
   [ -n "$_wm" ] ||
-    _wm="$(dpkg-query -W -f='${Package} ${Version}\n' 'libmutter-*' 2>/dev/null | head -1)"
+    _wm="$(dpkg-query -W -f='${db:Status-Abbrev}${Package} ${Version}\n' 'libmutter-*' 2>/dev/null \
+      | sed -n 's/^ii *//p' | head -1)"
   echo "### wm      : ${_wm:-unknown}"
   # The pinned release, and the release yaru-theme-gtk came from.
   _rel_version() {
