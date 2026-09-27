@@ -16,6 +16,8 @@
 #               bash ubuntu-look.sh --download        build or refresh packages/ for an
 #                                                     offline install (needs internet)
 #               bash ubuntu-look.sh --offline         install from packages/, no network
+#               bash ubuntu-look.sh --refresh         list available updates, then ask
+#                                                     to apply them
 #               bash ubuntu-look.sh --uninstall       undo it, from your desktop session
 #               bash ubuntu-look.sh --prepare-upgrade before a Debian release upgrade
 #               bash ubuntu-look.sh --help            this text
@@ -26,24 +28,21 @@
 #               UBUNTU_MIRROR=<url>         Ubuntu mirror (default per architecture)
 #               UBUNTU_BOOT_SPLASH=0        no boot splash (removes one applied)
 #               PLYMOUTH_THEME=<name>       boot splash theme (default bgrt)
-#               UBUNTU_LOOK_AUTO_REFRESH=1  daily refresh timer (off by default)
 #               UBUNTU_LOOK_SYSTEM_UPGRADE=1  also run a system-wide apt upgrade
 #               UBUNTU_LOOK_FORCE_BUNDLE=1  accept a bundle built for another Debian
 #                                           release or gnome-shell major
 #               UBUNTU_LOOK_LOG=0           no run log
-#               A full online run saves the first six (--offline only the
-#               boot ones); later runs and the timer reuse them unless given
-#               again (e.g. UBUNTU_CODENAME=auto).
+#               A full online run saves the first five (--offline only the
+#               boot ones); later runs reuse them unless given again
+#               (e.g. UBUNTU_CODENAME=auto).
 #
 # Offline     : Run --download on an online machine with the same Debian
 #               release, architecture and gnome-shell major; copy this script
 #               and packages/ to the target; run --offline there.
 #
-# Refresh     : With UBUNTU_LOOK_AUTO_REFRESH=1, a full online run installs
-#               ubuntu-look-refresh.timer. Daily, it re-runs the system part
-#               (--refresh, as root) after a new or retired Ubuntu release, or a
-#               change of Debian release, gnome-shell major, architecture,
-#               mirror or saved options.
+# Refresh     : --refresh lists what an update would change: a newer Ubuntu
+#               release, a Debian or gnome-shell change, newer builds of the
+#               look's packages. It asks before applying anything.
 #
 # Undo        : bash ubuntu-look.sh --uninstall. Each user undoes their own
 #               settings; the last one also undoes the system changes.
@@ -51,7 +50,7 @@
 # Requires    : Debian with GNOME, sudo rights; internet access except --offline.
 # =============================================================================
 
-# In --refresh mode sudo and apt-get are shell functions; this is intended.
+# sudo is a shell function that makes apt-get wait for its lock.
 # shellcheck disable=SC2033
 
 # Contents
@@ -59,7 +58,7 @@
 #   2. Packages     apt, the Ubuntu release, sources and pin
 #   3. Desktop      Ubuntu's settings, extensions, terminal, login screen
 #   4. Boot         GRUB command line and boot splash
-#   5. Records      migration, daily refresh, summary
+#   5. Records      --refresh, summary
 #   6. Offline      --download, --offline, --prepare-upgrade
 #   7. Setup        help, run log, mode, options, variables
 #   8. Uninstall    --uninstall
@@ -77,10 +76,25 @@ sys_record_write() {
   printf '%s\n' "$2" | sudo tee "$1" > /dev/null
 }
 
-# Append line $2 to record $1.
+# Append line $2 to record $1; not on a --download machine without the look.
 sys_record_append() {
+  [ "$NO_SYSTEM_RECORDS" = 1 ] && return 0
   sys_records_dir
   printf '%s\n' "$2" | sudo tee -a "$1" > /dev/null
+}
+
+# A system change takes effect at the next boot. The record holds this boot's
+# id, so a later run of the same boot still asks for the reboot, and a run
+# after the reboot does not.
+need_reboot() {
+  local id
+  REBOOT_NEEDED=1
+  [ -d "$SYS_RECORDS" ] || return 0
+  id="$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)"
+  [ -n "$id" ] || return 0
+  [ "$(cat "$REBOOT_OWED" 2>/dev/null)" = "$id" ] \
+    || printf '%s\n' "$id" | sudo tee "$REBOOT_OWED" > /dev/null
+  return 0
 }
 
 # Sort record $1 and drop duplicate lines.
@@ -88,20 +102,12 @@ sys_record_sort() {
   [ ! -f "$1" ] || sudo sort -u -o "$1" "$1"
 }
 
-# Install $1 as system record $2, then delete the home record $3.
-move_to_sys_record() {
-  sys_records_dir; sudo install -m 0644 "$1" "$2" && rm -f "$3"
-}
-
 # Set each saved option not given in the environment. The file is parsed,
 # never sourced; unsafe values are ignored.
 load_saved_options() {
-  local key val optin=0
+  local key val
   readable_regular_file "$SAVED_OPTIONS" || return 0
-  # The timer was on by default before; such a saved value is not a choice.
-  grep -qxF "$REFRESH_OPT_IN_MARK" "$SAVED_OPTIONS" && optin=1
   while IFS='=' read -r key val; do
-    [ "$key" = UBUNTU_LOOK_AUTO_REFRESH ] && [ "$optin" -eq 0 ] && continue
     in_word_list "$key" "$SAVED_OPTION_NAMES" && [ -z "${!key+x}" ] || continue
     case "$val" in *[[:space:][:cntrl:]\"\'\`\$\\]*) continue ;; esac
     printf -v "$key" '%s' "$val"
@@ -111,7 +117,8 @@ load_saved_options() {
 # Add mirror $1 to UBUNTU_HOSTS_RE by its full URL, unless it is an ubuntu.com host.
 add_mirror_to_hosts_re() {
   [[ "$1/" =~ $UBUNTU_COM_RE ]] && return 0
-  UBUNTU_HOSTS_RE="${UBUNTU_HOSTS_RE}|^$(printf '%s' "$1" | sed 's/[.+?*()|{}$]/[&]/g') "
+  # ] first and [ last in the bracket: an IPv6 host has both.
+  UBUNTU_HOSTS_RE="${UBUNTU_HOSTS_RE}|^$(printf '%s' "$1" | sed 's/[]$.+?*()|{}[]/[&]/g') "
 }
 
 # message [warn|error|info] <text>
@@ -139,13 +146,27 @@ ask_yes() {
 confirm_continue() { ask_yes || error "Aborted."; }
 
 is_installed() {
-  dpkg-query -W -f='${Status}' "$1" 2>/dev/null | grep -q "install ok installed"
+  # "hold ok installed" is installed too.
+  dpkg-query -W -f='${Status}' "$1" 2>/dev/null | grep -q " ok installed$"
+}
+
+# True when $1 is on the system in any state short of removed: installed, or
+# left half-way by an interrupted or failed dpkg run.
+is_present() {
+  case "$(dpkg-query -W -f='${db:Status-Status}' "$1" 2>/dev/null)" in
+    ''|not-installed|config-files) return 1 ;;
+  esac
+}
+
+# True when the user has put $1 on hold (apt-mark hold); it is never moved.
+is_held() {
+  dpkg-query -W -f='${Status}' "$1" 2>/dev/null | grep -q '^hold '
 }
 
 # Installed packages, sorted; removed-but-not-purged ones excluded.
 installed_package_list() {
   dpkg-query -W -f='${Package} ${Status}\n' 2>/dev/null \
-    | awk '$2 == "install" && $4 == "installed" { print $1 }' | sort
+    | awk '$3 == "ok" && $4 == "installed" { print $1 }' | sort
 }
 
 missing_packages() {
@@ -153,7 +174,7 @@ missing_packages() {
   for pkg in $1; do
     is_installed "$pkg" || missing="$missing $pkg"
   done
-  echo "$missing" | xargs
+  echo "${missing# }"
 }
 
 # True when word $1 is in the space-separated list $2.
@@ -171,6 +192,12 @@ word_list_without() {
 install_if_changed() {
   [ -f "$2" ] && cmp -s "$1" "$2" && return 1
   install -Dm 0644 "$1" "$2" || return 2
+}
+
+# As install_if_changed, through sudo.
+sudo_install_if_changed() {
+  [ -f "$2" ] && cmp -s "$1" "$2" 2>/dev/null && return 1
+  sudo install -D -m 0644 "$1" "$2" || return 2
 }
 
 # Render a space-separated list as a GVariant string array.
@@ -214,25 +241,26 @@ readable_regular_file() {
 
 # dconf on the user's own database only, without any system defaults; a
 # plain dump or list also shows the system databases' keys.
-user_dconf() {
-  local prof rc
-  prof="$(mktemp)" || return 1
-  echo "user-db:user" > "$prof"
-  DCONF_PROFILE="$prof" dconf "$@" 2>/dev/null
-  rc=$?
-  rm -f "$prof"
-  return $rc
-}
+user_dconf() { DCONF_PROFILE=/dev/fd/3 dconf "$@" 2>/dev/null 3<<< "user-db:user"; }
 
 # The user's own value of dconf key $1.
 user_dconf_read() { user_dconf read "$1"; }
 
-# Over SSH or tmux, use the user's session bus when one is running.
+# Use the user's own session bus when one is running: over SSH or tmux there
+# is none in the environment, after 'su user' another user's.
 adopt_session_bus() {
   local uid
   uid="$(id -u)"
-  [ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ] && [ -S "/run/user/${uid}/bus" ] || return 0
-  export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/${uid}}"
+  if [ ! -S "/run/user/${uid}/bus" ]; then
+    # Another user's bus is no session of this user's.
+    case "${DBUS_SESSION_BUS_ADDRESS:-}" in
+      *"/run/user/${uid}/"*) ;;
+      *"/run/user/"*) unset DBUS_SESSION_BUS_ADDRESS ;;
+    esac
+    return 0
+  fi
+  case "${DBUS_SESSION_BUS_ADDRESS:-}" in *"/run/user/${uid}/"*) return 0 ;; esac
+  export XDG_RUNTIME_DIR="/run/user/${uid}"
   export DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/${uid}/bus"
 }
 
@@ -242,9 +270,9 @@ step() {
   echo -e "${YELLOW}━━━ ${STEP}. $1${ENDCOLOR}"
 }
 
-# Save the options of this full run for the refresh timer.
+# Save the options of this full run for later runs.
 save_options() {
-  local tmp head="# Options of the last full run, reused by later runs and the refresh timer."
+  local tmp head="# Options of the last full run, reused by later runs."
   tmp="$(mktemp)"
   if [ "$MODE" = offline ]; then
     # Only the boot options; the release options stay as last saved online.
@@ -260,13 +288,11 @@ save_options() {
     ' "$tmp" > "${tmp}.new" && mv -f "${tmp}.new" "$tmp"
   else {
     echo "$head"
-    echo "${REFRESH_OPT_IN_MARK}"
     echo "UBUNTU_CODENAME=${REQUESTED_CODENAME}"
     echo "UBUNTU_INCLUDE_DEVEL=${UBUNTU_INCLUDE_DEVEL}"
     echo "UBUNTU_MIRROR=${REQUESTED_MIRROR}"
     echo "UBUNTU_BOOT_SPLASH=${UBUNTU_BOOT_SPLASH}"
     echo "PLYMOUTH_THEME=${PLYMOUTH_THEME}"
-    echo "UBUNTU_LOOK_AUTO_REFRESH=${UBUNTU_LOOK_AUTO_REFRESH:-0}"
   } > "$tmp"; fi
   if ! { readable_regular_file "$SAVED_OPTIONS" && cmp -s "$tmp" "$SAVED_OPTIONS"; }; then
     sys_records_dir
@@ -275,9 +301,10 @@ save_options() {
   rm -f "$tmp"
 }
 
-# $1 = wait: block until free. Returns 1 when another run holds the lock,
-# 2 when the lock cannot be made.
+# Take the run lock, waiting while another run holds it, then check dpkg.
+# Stops when the lock cannot be taken.
 take_run_lock() {
+  local fail="Could not take the run lock ${UBUNTU_LOOK_LOCK}."
   # Anything but a root-owned regular file is replaced.
   if [ -L "$UBUNTU_LOOK_LOCK" ] || { [ -e "$UBUNTU_LOOK_LOCK" ] && { [ ! -f "$UBUNTU_LOOK_LOCK" ] \
        || [ "$(stat -c %u "$UBUNTU_LOOK_LOCK" 2>/dev/null)" != 0 ]; }; }; then
@@ -286,21 +313,34 @@ take_run_lock() {
   # Created with noclobber, so two runs never make two lock files.
   [ -f "$UBUNTU_LOOK_LOCK" ] \
     || sudo sh -c 'umask 022; set -C; : > "$1"' _ "$UBUNTU_LOOK_LOCK" 2>/dev/null \
-    || [ -f "$UBUNTU_LOOK_LOCK" ] || return 2
+    || [ -f "$UBUNTU_LOOK_LOCK" ] || error "$fail"
   # The braces keep the stderr redirect from outliving this line.
-  { exec 9< "$UBUNTU_LOOK_LOCK"; } 2>/dev/null || return 2
-  flock -n 9 && return 0
-  [ "${1:-}" = wait ] || return 1
-  message "another ubuntu-look run is in progress — waiting for it to finish"
-  flock 9
+  { exec 9< "$UBUNTU_LOOK_LOCK"; } 2>/dev/null || error "$fail"
+  if ! flock -n 9; then
+    message "another ubuntu-look run is in progress — waiting for it to finish"
+    flock 9 || error "$fail"
+  fi
+  require_dpkg_ready
+}
+
+# Stop when an interrupted dpkg run must be repaired first: apt would refuse
+# every change, and its refusals would read as the look's.
+require_dpkg_ready() {
+  # Only an interrupted run counts: a pending journal, or a package left
+  # half-way. (dpkg --audit also lists harmless things, such as a missing
+  # md5sums file, that 'dpkg --configure -a' does not clear.)
+  [ -z "$(ls -A /var/lib/dpkg/updates 2>/dev/null)" ] \
+    && ! dpkg-query -W -f='${db:Status-Status}\n' 2>/dev/null | grep -qvxE 'installed|config-files|not-installed' \
+    && return 0
+  error "dpkg was interrupted earlier — run 'sudo dpkg --configure -a' and then 'sudo apt-get -f install', then run this again."
 }
 
 debian_codename() { (. /etc/os-release 2>/dev/null; echo "${VERSION_CODENAME:-}"); }
 
-# Checksum of the Ubuntu pin and source list, to detect a change.
-apt_config_sum() { cat "$UBUNTU_LIST" "$UBUNTU_PIN" 2>/dev/null | sha256sum; }
+# Checksum of the Ubuntu pin and apt source, to detect a change.
+apt_config_sum() { cat "$UBUNTU_SOURCES" "$UBUNTU_PIN" 2>/dev/null | sha256sum; }
 
-# Percent-encode a path for a file: URI in a sources.list line.
+# Percent-encode a path for a file: URI in an apt source.
 uri_path_encode() {
   local s="$1"
   s="${s//%/%25}"; s="${s// /%20}"; s="${s//$'\t'/%09}"
@@ -313,36 +353,54 @@ uri_path_encode() {
 ###############################################################################
 
 # True when $1 was installed before this script first ran on this system.
+# The system record, else the copy a user's unfinished uninstall keeps.
 predates_install() {
-  grep -qxF "$1" "$PACKAGES_BEFORE" 2>/dev/null
+  grep -qxF "$1" "$PACKAGES_BEFORE" 2>/dev/null \
+    || { [ ! -f "$PACKAGES_BEFORE" ] && grep -qxF "$1" "${BACKUP_DIR}/packages-before.txt" 2>/dev/null; }
+}
+
+# Back to automatically installed, if it was before. One the user added
+# later keeps its mark.
+restore_auto_mark() {
+  if [ -f "$MANUAL_BEFORE" ] && predates_install "$1" && ! grep -qxF "$1" "$MANUAL_BEFORE"; then
+    sudo apt-mark auto "$1" >/dev/null 2>&1 || true
+  fi
 }
 
 # Record the packages apt simulation $1 newly installs, before installing, so
 # an interrupted run leaves them on record.
 record_planned_installs() {
-  local p
+  local p new=""
   for p in $(printf '%s\n' "$1" | awk '/^Inst / && $3 !~ /^\[/ { print $2 }'); do
     grep -qxF "$p" "$INSTALLED_MANIFEST" 2>/dev/null && continue
-    predates_install "$p" && continue
-    sys_record_append "$INSTALLED_MANIFEST" "$p"
+    in_word_list "$p" "$new" || predates_install "$p" || new="${new} ${p}"
   done
+  # shellcheck disable=SC2086
+  [ -z "$new" ] || sys_record_append "$INSTALLED_MANIFEST" "$(printf '%s\n' $new)"
   # Packages the combined package replaces, the user's included; the uninstall
   # restores them.
+  new=""
   for p in $(printf '%s\n' "$1" | awk '/^Remv /{ print $2 }'); do
-    grep -qxF "$p" "$INSTALLED_MANIFEST" 2>/dev/null && continue
-    grep -qxF "$p" "$REPLACED_BY_COMBINED" 2>/dev/null && continue
-    sys_record_append "$REPLACED_BY_COMBINED" "$p"
+    grep -qxF "$p" "$INSTALLED_MANIFEST" "$REPLACED_BY_COMBINED" 2>/dev/null && continue
+    in_word_list "$p" "$new" && continue
+    new="${new} ${p}"
     STATUS_CHANGES+=("${p} replaced by Ubuntu's ${COMBINED_EXT_PKG}, which carries it — the uninstall puts it back")
   done
+  # shellcheck disable=SC2086
+  [ -z "$new" ] || sys_record_append "$REPLACED_BY_COMBINED" "$(printf '%s\n' $new)"
+}
+
+# True when build $1 of the combined extensions package is the real one that
+# carries the dock, not an older metapackage; apt options follow.
+combined_carries_dock() {
+  [ -n "$1" ] && LC_ALL=C apt-cache "${@:2}" show "${COMBINED_EXT_PKG}=$1" 2>/dev/null \
+    | grep -q '^Provides:.*gnome-shell-extension-ubuntu-dock'
 }
 
 # Use the combined extensions package where the pinned release offers it.
 use_combined_extensions_if_offered() {
-  local stage="2-desktop-gnome" p list="" cand
-  cand="$(pkg_candidate_version "$COMBINED_EXT_PKG")"
-  # Only the real package that carries the dock, not an older metapackage.
-  if [ -n "$cand" ] && LC_ALL=C apt-cache "${APT_OPTS[@]}" show "${COMBINED_EXT_PKG}=${cand}" 2>/dev/null \
-       | grep -q '^Provides:.*gnome-shell-extension-ubuntu-dock'; then
+  local stage="2-desktop-gnome" p list=""
+  if combined_carries_dock "$(pkg_candidate_version "$COMBINED_EXT_PKG")" "${APT_OPTS[@]}"; then
     for p in ${packages[$stage]}; do
       in_word_list "$p" "$SEPARATE_EXT_PKGS" || list="${list} ${p}"
     done
@@ -355,36 +413,40 @@ use_combined_extensions_if_offered() {
   fi
 }
 
-# Drop replaced packages that are installed again from the record.
-prune_replaced_by_combined() {
-  [ -f "$REPLACED_BY_COMBINED" ] || return 0
-  local p keep=""
-  while read -r p; do
-    [ -n "$p" ] && ! is_installed "$p" && keep="${keep} ${p}"
-  done < "$REPLACED_BY_COMBINED"
-  if [ -z "$keep" ]; then
-    sudo rm -f "$REPLACED_BY_COMBINED"
-  else
-    # shellcheck disable=SC2086
-    sys_record_write "$REPLACED_BY_COMBINED" "$(printf '%s\n' $keep)"
-  fi
+not_installed() { ! is_installed "$1"; }
+
+# A package prepare-upgrade removed that is still missing; a separate
+# extension package counts as back while the combined one is installed.
+not_restored() {
+  ! is_installed "$1" \
+    && ! { in_word_list "$1" "$SEPARATE_EXT_PKGS" && is_installed "$COMBINED_EXT_PKG"; }
 }
 
-# Drop manifest entries that are not installed (an install that failed).
-prune_installed_manifest() {
-  [ -f "$INSTALLED_MANIFEST" ] || return 0
+# Keep the packages in record $1 for which test $2 holds; rewritten only when
+# one goes, removed when none is left.
+prune_record() {
+  [ -f "$1" ] || return 0
   local p keep
-  keep="$(while read -r p; do [ -n "$p" ] && is_installed "$p" && echo "$p"; done < "$INSTALLED_MANIFEST")"
-  if [ "$keep" != "$(cat "$INSTALLED_MANIFEST")" ]; then
-    sys_record_write "$INSTALLED_MANIFEST" "$(printf '%s\n' "$keep" | sed '/^$/d')"
+  keep="$(while read -r p; do [ -n "$p" ] && "$2" "$p" && echo "$p"; done < "$1")"
+  if [ -z "$keep" ]; then
+    sudo rm -f "$1"
+  elif [ "$keep" != "$(cat "$1")" ]; then
+    sys_record_write "$1" "$keep"
   fi
 }
 
-# apt-get install with the new packages recorded first. $@ = install arguments.
-apt_install_recorded() {
+# apt-get install $@ after one simulation, with the new packages recorded
+# first. Returns 1, without installing, when apt cannot resolve it or it
+# would remove packages other than ALLOWED_REMOVALS (then in REMOVES); 2
+# when apt fails. Call directly, not in $(...).
+apt_install_checked() {
   local sim
-  sim="$(LC_ALL=C apt-get -s install "${APT_OPTS[@]}" "$@" 2>&1)" && record_planned_installs "$sim"
-  sudo apt-get install -y "${APT_OPTS[@]}" "$@"
+  REMOVES=""
+  sim="$(LC_ALL=C apt-get -s install "${APT_OPTS[@]}" "$@" 2>&1)" || return 1
+  REMOVES="$(unexpected_removals "$sim")"
+  [ -z "$REMOVES" ] || return 1
+  record_planned_installs "$sim"
+  sudo apt-get install -y "${APT_OPTS[@]}" "$@" || return 2
 }
 
 # Keep only packages available in the apt cache.
@@ -393,12 +455,14 @@ available_packages() {
   for pkg in $1; do
     apt-cache "${APT_OPTS[@]}" show "$pkg" >/dev/null 2>&1 && avail="$avail $pkg"
   done
-  echo "$avail" | xargs
+  echo "${avail# }"
 }
 
-# Installed version of $1, empty when not installed (as in is_installed).
+# Installed version of $1, empty and non-zero when not installed (as in
+# is_installed).
 pkg_installed_version() {
-  is_installed "$1" && dpkg-query -W -f='${Version}' "$1" 2>/dev/null
+  dpkg-query -W -f='${Status} ${Version}\n' "$1" 2>/dev/null \
+    | awk '$2 == "ok" && $3 == "installed" { print $4; f = 1; exit } END { exit !f }'
 }
 
 # apt's chosen version for $1; empty when the pin leaves no candidate.
@@ -407,11 +471,14 @@ pkg_candidate_version() {
     | awk '/^  Candidate:/ { if ($2 != "(none)") print $2; exit }'
 }
 
-# Every version of $1 the pin allows (priority 0 or more), newest first.
+# Every version of $1 the pin allows (priority 0 or more), from apt's
+# candidate down, newest first; nothing when there is no candidate.
 pkg_allowed_versions_desc() {
   LC_ALL=C apt-cache "${APT_OPTS[@]}" policy "$1" 2>/dev/null | awk '
-    $1 == "***" && $3 ~ /^[0-9]+$/ { print $2; next }
-    NF == 2 && $1 !~ /:$/ && $2 ~ /^[0-9]+$/ { print $1 }'
+    /^  Candidate:/ { cand = $2; next }
+    $1 == "***" && $3 ~ /^[0-9]+$/ { v = $2 }
+    NF == 2 && $1 !~ /:$/ && $2 ~ /^[0-9]+$/ { v = $1 }
+    v != "" { if (v == cand) on = 1; if (on) print v; v = "" }'
 }
 
 # Removals in apt simulation $1 other than ALLOWED_REMOVALS.
@@ -424,6 +491,16 @@ installs_cleanly() {
   local sim
   sim="$(LC_ALL=C apt-get install -s "${APT_OPTS[@]}" "$@" 2>&1)" || return 1
   [ -z "$(unexpected_removals "$sim")" ]
+}
+
+# The build of $1 an update would install: the newest allowed one that
+# installs cleanly and is newer than installed version $2 (if any).
+refresh_target() {
+  local v
+  for v in $(pkg_allowed_versions_desc "$1"); do
+    [ -z "$2" ] || dpkg --compare-versions "$v" gt "$2" || return 0
+    installs_cleanly "${1}=${v}" && { echo "$v"; return 0; }
+  done
 }
 
 # One-line reason why $1 cannot be installed at $2 (default: its candidate).
@@ -457,9 +534,10 @@ explain_blocked() {
   fi
   # Unmet dependencies: none on offer, or one apt did not select.
   for dep in $(echo "$sim" \
-      | grep -oE '(Pre)?Depends: [^ ]+ but it is not (installable|going to be installed)' \
+      | grep -oE '(Pre)?Depends: [^ ]+( \([^)]*\))? but ' \
       | awk '{print $2}' | sort -u); do
-    if [ -z "$(pkg_candidate_version "$dep")" ] && apt-cache show "$dep" >/dev/null 2>&1; then
+    if [ -z "$(pkg_candidate_version "$dep")" ] \
+       && apt-cache "${APT_OPTS[@]}" show "$dep" >/dev/null 2>&1; then
       out="${out} ${dep} (Ubuntu-only, blocked by ${UBUNTU_PIN})"
     else
       out="${out} ${dep}"
@@ -477,46 +555,64 @@ explain_blocked() {
 #   1  nothing on offer can be installed here
 #   2  already at the newest version that fits
 ensure_package() {
-  local pkg="$1" have cand ver
+  local pkg="$1" have ver log rc busy
   ENSURE_VERSION=""
   have="$(pkg_installed_version "$pkg")"
-  cand="$(pkg_candidate_version "$pkg")"
 
   # Without a candidate the pin blocks every build; nothing to try.
-  [ -n "$cand" ] && for ver in $(pkg_allowed_versions_desc "$pkg"); do
-    dpkg --compare-versions "$ver" gt "$cand" && continue
+  for ver in $(pkg_allowed_versions_desc "$pkg"); do
     if [ -n "$have" ] && dpkg --compare-versions "$ver" le "$have"; then
       ENSURE_VERSION="$have"
       return 2
     fi
-    if ! installs_cleanly "${pkg}=${ver}"; then
-      REJECTED_BUILDS="${REJECTED_BUILDS} ${pkg}=${ver}"
-      continue
-    fi
-    if apt_install_recorded "${pkg}=${ver}"; then
+    log="$(mktemp)"
+    # Run here, not in a pipeline subshell, so its records reach the summary;
+    # C locale so the messages below can be read.
+    LC_ALL=C apt_install_checked "${pkg}=${ver}" > >(tee "$log") 2>&1
+    rc=$?
+    wait $! 2>/dev/null
+    # A busy apt, a lost network or an interrupted dpkg says nothing about
+    # the build: stop here.
+    busy=0
+    [ "$rc" -eq 2 ] && grep -qE 'Could not get lock|(Failed|Unable) to fetch (https?|ftp)://|Temporary failure resolving|dpkg was interrupted' "$log" && busy=1
+    rm -f "$log"
+    if [ "$rc" -eq 0 ]; then
       ENSURE_VERSION="$ver"
       return 0
     fi
-    APT_ERRORS=$((APT_ERRORS + 1))
+    [ "$busy" -eq 0 ] \
+      || error "apt is busy or the network failed while installing ${pkg} — nothing more is changed; run this again later."
     REJECTED_BUILDS="${REJECTED_BUILDS} ${pkg}=${ver}"
-    message warn "${pkg}=${ver} would not install after all — trying an older build"
+    [ "$rc" -eq 1 ] || message warn "${pkg}=${ver} would not install after all — trying an older build"
   done
 
   [ -n "$have" ] && { ENSURE_VERSION="$have"; return 2; }
   return 1
 }
 
-# One Ubuntu release as "<version> <state> <mirror>", also added to the
-# release cache; non-zero when neither mirror publishes it. "devel" comes from
-# Valid-Until.
+# One Ubuntu release as "<version> <state> <mirror>", from the run's release
+# cache, else probed and added to it: on mirror $2 only, if given. "devel"
+# comes from Valid-Until. Returns 1 when no mirror publishes it, 2 when a
+# mirror could not be read (no connection, a server error).
 ubuntu_release_info() {
-  local cn="$1" mirror out
-  for mirror in "$UBUNTU_MIRROR" "${UBUNTU_OLD_MIRROR:-}"; do
+  local cn="$1" mirror out code unread=0
+  local -a mirrors=("$UBUNTU_MIRROR" "${UBUNTU_OLD_MIRROR:-}")
+  [ -z "${2:-}" ] || mirrors=("$2")
+  out="$(awk -v c="$cn" '$1 == c { print $2, $3, $4; exit }' "${UBUNTU_RELEASE_CACHE:-/dev/null}" 2>/dev/null)"
+  [ -n "$out" ] && { printf '%s\n' "$out"; return 0; }
+  for mirror in "${mirrors[@]}"; do
     [ -n "$mirror" ] || continue
-    # A timeout is retried; a 404 is not.
-    out="$(curl -fsSL --connect-timeout 5 -m 15 --retry 2 --retry-delay 2 -r 0-2047 \
-             "${mirror}/dists/${cn}/Release" 2>/dev/null \
-      | awk -v m="$mirror" '
+    # A timeout or a server error is retried; a 404 is not. The reply's HTTP
+    # code comes last.
+    out="$(curl -sSL --connect-timeout 5 -m 15 --retry 2 --retry-delay 2 -r 0-2047 \
+             -w '\n%{http_code}' "${mirror}/dists/${cn}/Release" 2>/dev/null)"
+    code="${out##*$'\n'}"
+    case "$code" in
+      2*) ;;
+      4*) continue ;;
+      *)  unread=1; continue ;;
+    esac
+    out="$(printf '%s\n' "${out%$'\n'*}" | awk -v m="$mirror" '
           /^Version:/     { v = $2 }
           /^Valid-Until:/ { unreleased = 1 }
           END { if (v != "") print v, (unreleased ? "devel" : "stable"), m }')"
@@ -526,34 +622,37 @@ ubuntu_release_info() {
       return 0
     fi
   done
+  [ "$unread" -eq 0 ] || return 2
   return 1
 }
 
 # True when suite $1 should be written for mirror $2. Only a 4xx reply means absent.
 ubuntu_suite_published() {
-  local code
+  local code hit memo="${UBUNTU_RELEASE_CACHE:+${UBUNTU_RELEASE_CACHE}.suites}"
+  memo="${memo:-/dev/null}"
+  # Answered once per run.
+  hit="$(awk -v s="$1" -v m="$2" '$1 == s && $2 == m { print $3; exit }' "$memo" 2>/dev/null)"
+  [ -n "$hit" ] && return "$hit"
   code="$(curl -fsSL -o /dev/null --connect-timeout 5 -m 15 -r 0-255 -w '%{http_code}' \
             "${2}/dists/${1}/Release" 2>/dev/null)"
   case "$code" in
-    2*|3*) return 0 ;;
-    4*)    return 1 ;;
+    2*|3*) echo "$1 $2 0" >> "$memo"; return 0 ;;
+    4*)    echo "$1 $2 1" >> "$memo"; return 1 ;;
     *)     message warn "could not check ${1} on ${2} — keeping it" >&2; return 0 ;;
   esac
 }
 
-# Mirror serving $1: from the run's cache, else probed live and cached.
+# Mirror serving $1.
 ubuntu_mirror_for() {
-  local cn="$1" hit info
-  hit="$(awk -v c="$cn" '$1 == c { print $4; exit }' "$UBUNTU_RELEASE_CACHE" 2>/dev/null)"
-  [ -n "$hit" ] && { printf '%s' "$hit"; return 0; }
-  info="$(ubuntu_release_info "$cn")" || return 1
+  local info
+  info="$(ubuntu_release_info "$1")" || return 1
   printf '%s' "${info##* }"
 }
 
 # Codenames listed in a mirror's dists/ directory.
 list_dists() {
   curl -fsSL -m 30 "${1}/dists/" 2>/dev/null \
-    | grep -oiE 'href="[^"?]+/"' \
+    | grep -oE 'href="[^"?]+/"' \
     | sed -E 's|.*href="([^"]+)/"|\1|' \
     | grep -E '^[a-z]+$' | grep -vx devel | sort -u
 }
@@ -561,56 +660,135 @@ list_dists() {
 # Every released Ubuntu the archive serves, oldest to newest (development
 # series only with UBUNTU_INCLUDE_DEVEL=1). distro-info-data is frozen on Debian.
 discover_ubuntu_codenames() {
-  local names cn info ver state versioned=""
+  local names header cn info ver state versioned="" rc
   # A mirror without a directory listing falls back to the default mirror.
   names="$(list_dists "$UBUNTU_MIRROR")"
   [ -n "$names" ] || names="$(list_dists "$UBUNTU_DEFAULT_MIRROR")"
 
   # Re-probe the configured releases; a retired one is on old-releases.
-  names="$(printf '%s\n%s\n' "$names" \
-    "$(sed -n 's/^# codenames: //p' "$UBUNTU_LIST" 2>/dev/null)" \
+  header="$(sed -n 's/^# codenames: //p' "$UBUNTU_SOURCES" 2>/dev/null)"
+  [ -z "$names" ] && [ -n "$header" ] \
+    && message warn "could not list Ubuntu releases at ${UBUNTU_MIRROR} — newer releases are not checked this run" >&2
+  names="$(printf '%s\n%s\n' "$names" "$header" \
     | tr ' ' '\n' | grep -E '^[a-z]+$' | sort -u)"
 
   for cn in $names; do
-    info="$(ubuntu_release_info "$cn")" || continue
+    info="$(ubuntu_release_info "$cn")"; rc=$?
+    [ "$rc" -eq 2 ] && { release_unread "$cn"; return 2; }
+    [ "$rc" -eq 0 ] || continue
     ver="${info%% *}"
     state="${info#* }"; state="${state%% *}"
-    # Cached for ubuntu_mirror_for().
     if [ "$state" = "devel" ] && [ "$UBUNTU_INCLUDE_DEVEL" != "1" ]; then
-      message "  skipping '${cn}' (${ver}) - not released yet; UBUNTU_INCLUDE_DEVEL=1 to use it" >&2
+      message "  skipping '${cn}' (${ver}) — not released yet; UBUNTU_INCLUDE_DEVEL=1 to use it" >&2
       continue
     fi
     versioned="${versioned}${ver} ${cn}
 "
   done
 
-  printf '%s' "$versioned" | sort -V | awk '{print $2}' | tr '\n' ' ' | xargs
+  printf '%s' "$versioned" | oldest_first | xargs
 }
 
 # Retired releases not already known, at most MAX_UBUNTU_LOOKBACK.
 discover_retired_codenames() {
-  local cn info versioned=""
+  local cn info versioned="" rc
   for cn in $(list_dists "$UBUNTU_OLD_MIRROR"); do
     in_word_list "$cn" "$UBUNTU_ALL_CODENAMES" && continue
-    info="$(ubuntu_release_info "$cn")" || continue
+    info="$(ubuntu_release_info "$cn" "$UBUNTU_OLD_MIRROR")"; rc=$?
+    [ "$rc" -eq 2 ] && { release_unread "$cn"; return 2; }
+    [ "$rc" -eq 0 ] || continue
     versioned="${versioned}${info%% *} ${cn}
 "
   done
-  printf '%s' "$versioned" | sort -V | awk '{print $2}' \
-    | tail -n "$MAX_UBUNTU_LOOKBACK" | xargs
+  printf '%s' "$versioned" | oldest_first | tail -n "$MAX_UBUNTU_LOOKBACK" | xargs
 }
 
-# Write the Ubuntu source list. Returns 0 = changed, 1 = already correct,
-# 2 = no archive answered. With no argument, every candidate is written.
+# Install the missing tools in $1 (curl, ca-certificates). Generic tools, not
+# recorded: the uninstall keeps them.
+install_prereqs() {
+  local prereq
+  [ -n "$1" ] || return 0
+  if sudo apt-get update -qq; then APT_LISTS_FRESH=1; else message warn "apt update reported an error"; fi
+  for prereq in $1; do
+    installs_cleanly "$prereq" \
+      || error "Installing prerequisite ${prereq} would remove packages or cannot be done — install it by hand"
+    sudo apt-get install -y "$prereq" < /dev/null \
+      || error "Failed to install prerequisite: $prereq"
+    STATUS_CHANGES+=("Installed prerequisite: $prereq (kept on uninstall)")
+  done
+}
+
+# Report on stderr that release $1 could not be read from the archive.
+release_unread() {
+  message error "Could not read Ubuntu ${1} from the archive — check the connection, then run this again." >&2
+}
+
+# The codenames of "<version> <codename>" lines on stdin, oldest first.
+oldest_first() { LC_ALL=C sort -V | awk '{ print $NF }'; }
+
+# Codenames $@ ordered oldest to newest by their release versions.
+codenames_by_version() {
+  local cn
+  for cn in "$@"; do
+    printf '%s %s\n' "$(ubuntu_release_info "$cn" | cut -d' ' -f1)" "$cn"
+  done | oldest_first | xargs
+}
+
+# UBUNTU_CANDIDATE_CODENAMES: the newest releases of UBUNTU_ALL_CODENAMES,
+# plus a requested release ($1, unless "auto") outside that window.
+set_candidate_codenames() {
+  UBUNTU_CANDIDATE_CODENAMES="$(echo "$UBUNTU_ALL_CODENAMES" | tr ' ' '\n' \
+    | tail -n "$MAX_UBUNTU_CANDIDATES" | xargs)"
+  if [ "$1" != auto ] && ! in_word_list "$1" "$UBUNTU_CANDIDATE_CODENAMES"; then
+    ubuntu_release_info "$1" >/dev/null
+    case $? in
+      0) ;;
+      2) release_unread "$1"; exit 1 ;;
+      *) error "UBUNTU_CODENAME=${1} is not published on ${UBUNTU_MIRROR} or ${UBUNTU_OLD_MIRROR}" ;;
+    esac
+    # shellcheck disable=SC2086
+    UBUNTU_CANDIDATE_CODENAMES="$(codenames_by_version $UBUNTU_CANDIDATE_CODENAMES "$1")"
+  fi
+}
+
+# Read the published releases into UBUNTU_ALL_CODENAMES and set the
+# candidates for requested release $1; stops when no archive answers.
+discover_releases() {
+  message "reading published Ubuntu releases from ${UBUNTU_MIRROR}..."
+  UBUNTU_ALL_CODENAMES="$(discover_ubuntu_codenames)" || exit 1
+  [ -n "$UBUNTU_ALL_CODENAMES" ] \
+    || error "No Ubuntu release reachable at ${UBUNTU_MIRROR} — check your internet connection."
+  set_candidate_codenames "$1"
+}
+
+# False when the Ubuntu index is empty, as for an architecture Ubuntu does not serve.
+ubuntu_index_has_packages() {
+  madison_rows gnome-shell-extension-ubuntu-dock yaru-theme-icon \
+    | awk -F'|' -v re="$UBUNTU_HOSTS_RE" '$2 ~ re { f = 1 } END { exit !f }'
+}
+
+# Ubuntu's archive keys, from Debian's own ubuntu-keyring; the run stops without them.
+ensure_ubuntu_keyring() {
+  if ! is_installed ubuntu-keyring; then
+    # The prerequisites' update, if any, is recent enough.
+    [ "${APT_LISTS_FRESH:-0}" = 1 ] || sudo apt-get update -qq || message warn "apt update reported an error"
+    apt_install_checked ubuntu-keyring \
+      || error "Could not install Debian's ubuntu-keyring package (Ubuntu's archive keys)."
+    STATUS_CHANGES+=("Installed ubuntu-keyring (Ubuntu's archive keys, from Debian)")
+  fi
+  [ -s "$UBUNTU_KEYRING" ] || error "${UBUNTU_KEYRING} is missing — reinstall ubuntu-keyring."
+}
+
+# Write the Ubuntu apt source (deb822), one stanza per release. Returns 0 =
+# changed, 1 = already correct, 2 = no archive answered, 3 = the file could
+# not be written. With no argument, every candidate is written.
 write_ubuntu_sources() {
-  local tmp _c _m _deb _comp _missing="" _list="${*:-$UBUNTU_CANDIDATE_CODENAMES}"
+  local tmp _c _m _suites _comp _missing="" _list="${*:-$UBUNTU_CANDIDATE_CODENAMES}"
   tmp="$(mktemp)"
   {
     echo "# Written by ubuntu-look.sh — the Ubuntu look packages. Pinned: see ${UBUNTU_PIN}."
-    echo "# The lines below are read by later runs to re-check these releases."
+    echo "# Later runs read the next line to re-check these releases."
     echo "# codenames: ${UBUNTU_CANDIDATE_CODENAMES}"
-    echo "# configured: ${_list}"
-    echo ""
     for _c in $_list; do
       # The pinned release gets universe too.
       _comp="$UBUNTU_COMPONENTS"
@@ -619,19 +797,23 @@ write_ubuntu_sources() {
       esac
       # The host that answered; a retired release is on old-releases.
       if ! _m="$(ubuntu_mirror_for "$_c")" || [ -z "$_m" ]; then
-        message warn "no archive serves Ubuntu '${_c}' — leaving it out of the source list" >&2
+        message warn "no archive serves Ubuntu '${_c}' — leaving it out of the apt source" >&2
         _missing="${_missing} ${_c}"
         continue
       fi
-      # arch= keeps foreign architectures off; target=Packages skips translations.
-      _deb="deb [arch=${UBUNTU_ARCH} signed-by=${UBUNTU_KEYRING} target=Packages] ${_m}"
-      echo "${_deb} ${_c} ${_comp}"
-      ubuntu_suite_published "${_c}-updates" "$_m" && echo "${_deb} ${_c}-updates ${_comp}"
+      # A mirror found without universe stays on main; narrow_ubuntu_sources
+      # tries universe again on the next run.
+      grep -qxF "${_c} ${_m}" "$NO_UNIVERSE_RECORD" 2>/dev/null && _comp="$UBUNTU_COMPONENTS"
+      _suites="$_c"
+      ubuntu_suite_published "${_c}-updates" "$_m" && _suites="${_c} ${_c}-updates"
+      # Architectures keeps foreign architectures off; Targets skips translations.
+      printf '\nTypes: deb\nURIs: %s\nSuites: %s\nComponents: %s\nArchitectures: %s\nSigned-By: %s\nTargets: Packages\n' \
+        "$_m" "$_suites" "$_comp" "$UBUNTU_ARCH" "$UBUNTU_KEYRING"
     done
   } > "$tmp"
 
-  # No release reachable, or the pinned one missing: keep the current list.
-  if ! grep -q '^deb ' "$tmp" \
+  # No release reachable, or the pinned one missing: keep the current source.
+  if ! grep -q '^Types: ' "$tmp" \
      || { [ -n "${UBUNTU_CODENAME:-}" ] && [ "$UBUNTU_CODENAME" != auto ] \
           && [[ " $_missing " == *" $UBUNTU_CODENAME "* ]]; }; then
     rm -f "$tmp"
@@ -639,14 +821,16 @@ write_ubuntu_sources() {
     return 2
   fi
 
-  if [ -f "$UBUNTU_LIST" ] && cmp -s "$tmp" "$UBUNTU_LIST"; then
-    rm -f "$tmp"
-    return 1
-  fi
+  local rc=0
+  if [ -f "$UBUNTU_SOURCES" ] && cmp -s "$tmp" "$UBUNTU_SOURCES"; then
+    rc=1
   # 0644: apt reads sources as any user.
-  sudo install -m 0644 "$tmp" "$UBUNTU_LIST"
+  elif ! sudo install -m 0644 "$tmp" "$UBUNTU_SOURCES"; then
+    STATUS_FAILED+=("Could not write ${UBUNTU_SOURCES}")
+    rc=3
+  fi
   rm -f "$tmp"
-  return 0
+  return "$rc"
 }
 
 # Bring the look packages back to the pinned release. apt never downgrades by
@@ -660,30 +844,30 @@ align_look_packages() {
   for pkg in $LOOK_PACKAGES $UBUNTU_SHELL_EXT_PKGS; do
     have="$(pkg_installed_version "$pkg")"
     [ -n "$have" ] || continue
+    is_held "$pkg" && continue
     if [ "$MODE" = offline ]; then
       # The bundle's build; a downgrade only over a Debian or other-release build.
-      want="$(LC_ALL=C apt-cache "${APT_OPTS[@]}" madison "$pkg" 2>/dev/null \
-              | awk -F'|' '{gsub(/ /,"",$2); print $2}' | sort -V | tail -1)"
+      want="$(madison_rows "${APT_OPTS[@]}" "$pkg" | awk -F'|' '{ print $1; exit }')"
       [ -n "$want" ] && [ "$have" != "$want" ] || continue
       if dpkg --compare-versions "$want" lt "$have"; then
         codes="$(pkg_version_ubuntu_codenames "$pkg" "$have")"
         if ! pkg_version_is_debian "$pkg" "$have" \
            && { [ -z "$codes" ] || printf '%s\n' "$codes" | grep -qxF "$UBUNTU_CODENAME"; }; then
           STATUS_NOCHANGE+=("${pkg} stays at ${have} — newer than the bundle's ${want}, and not shown to be from another release")
+          ALIGN_KEPT="${ALIGN_KEPT} ${pkg}"
           continue
         fi
       fi
     else
       # The pinned release's newest build, up or down.
       pkg_version_in_codename "$pkg" "$have" "$UBUNTU_CODENAME" && continue
-      want="$(LC_ALL=C apt-cache madison "$pkg" 2>/dev/null \
-              | grep -E "[ /]${UBUNTU_CODENAME}(-updates)?/" \
-              | awk -F'|' '{gsub(/ /,"",$2); print $2}' | sort -V | tail -1)"
+      want="$(release_build "$pkg" "$UBUNTU_CODENAME")"
       [ -n "$want" ] && [ "$want" != "$have" ] || continue
     fi
     # Already tried and turned down while installing.
     if in_word_list "${pkg}=${want}" "$REJECTED_BUILDS"; then
       STATUS_NOCHANGE+=("${pkg} stays at ${have} — ${want} was already tried and would not install")
+      ALIGN_KEPT="${ALIGN_KEPT} ${pkg}"
       continue
     fi
     if dpkg --compare-versions "$want" lt "$have"; then is_down[$pkg]=1; any_down=1; fi
@@ -698,17 +882,25 @@ align_look_packages() {
   done
 
   message "aligning the look to ${UBUNTU_CODENAME}:${plan}"
-  local done_list="" failed=""
+  local done_list="" failed="" down=""
+  [ "$any_down" = 1 ] && down=--allow-downgrades
   # shellcheck disable=SC2086
-  if align_install "$any_down" $plan; then
+  if apt_install_checked $down $plan; then
     done_list="$plan"
   else
+    [ -n "$REMOVES" ] && message warn "aligning ${plan# } would remove: ${REMOVES} — skipped"
     # One package that cannot move must not hold back the others.
     for pkg in $plan; do
-      if align_install "${is_down[${pkg%%=*}]:-0}" "$pkg"; then
+      down=""
+      [ "${is_down[${pkg%%=*}]:-0}" = 1 ] && down=--allow-downgrades
+      # shellcheck disable=SC2086
+      if apt_install_checked $down "$pkg"; then
         done_list="${done_list} ${pkg}"
       else
+        [ -n "$REMOVES" ] && message warn "aligning ${pkg} would remove: ${REMOVES} — skipped"
         failed="${failed} ${pkg%%=*}"
+        # Reported here; the drift check does not repeat it.
+        ALIGN_KEPT="${ALIGN_KEPT} ${pkg%%=*}"
       fi
     done
   fi
@@ -718,138 +910,208 @@ align_look_packages() {
     RELOGIN_NEEDED=1
   done
   [ -n "$failed" ] && STATUS_FAILED+=("Not aligned to ${UBUNTU_CODENAME}:${failed} — apt refused or it would remove packages")
-
-  # A per-release wallpaper pack left unused is not removed; the user is told.
-  local orphan
-  orphan="$(apt-get -s autoremove 2>/dev/null | awk '/^Remv /{print $2}' \
-            | grep -E '^ubuntu-wallpapers-' | xargs)"
-  [ -n "$orphan" ] && STATUS_NOCHANGE+=("${orphan} is now unused — 'sudo apt autoremove' reclaims it")
   return 0
 }
 
-# Install "pkg=version ..." with downgrades allowed, only when a simulation
-# shows nothing removed. Returns 0 installed, 1 refused, 2 apt failed.
-align_install() {
-  local opts=("${APT_OPTS[@]}") sim removes
-  [ "$1" = 1 ] && opts+=(--allow-downgrades)
-  shift
-  sim="$(LC_ALL=C apt-get -s install "${opts[@]}" "$@" 2>&1)" || return 1
-  removes="$(unexpected_removals "$sim")"
-  if [ -n "$removes" ]; then
-    message warn "aligning $* would remove: ${removes} — skipped"
-    return 1
+# A per-release wallpaper pack a release change left unused goes, unless it
+# predates the install.
+remove_unused_wallpaper_packs() {
+  local pkg orphan purge=""
+  orphan="$(LC_ALL=C apt-get -s autoremove 2>/dev/null | awk '/^Remv /{print $2}' \
+            | grep -E '^ubuntu-wallpapers-' | xargs)"
+  # Only this user's wallpaper can be seen: a look shared by several users
+  # keeps the pack.
+  if [ "$(cat "$SYS_USERS" 2>/dev/null | grep -c .)" -gt 1 ]; then
+    [ -n "$orphan" ] && STATUS_NOCHANGE+=("${orphan} is now unused — kept, as another user may show it; 'sudo apt autoremove' reclaims it")
+    return 0
   fi
-  record_planned_installs "$sim"
-  sudo apt-get install -y "${opts[@]}" "$@" && return 0
-  APT_ERRORS=$((APT_ERRORS + 1))
-  return 2
+  # The packages owning the wallpapers in use (URIs with plain paths).
+  local key path owners=""
+  for key in picture-uri picture-uri-dark; do
+    path="$(dconf read "/org/gnome/desktop/background/${key}" 2>/dev/null | tr -d "'")"
+    path="${path#file://}"
+    [ -n "$path" ] && owners="${owners} $(dpkg -S "$path" 2>/dev/null | cut -d: -f1 | tr "," " ")"
+  done
+  for pkg in $orphan; do
+    predates_install "$pkg" && continue
+    # A pack holding the wallpaper in use stays.
+    if in_word_list "$pkg" "$owners"; then
+      STATUS_NOCHANGE+=("${pkg} kept — your wallpaper is one of its pictures")
+      continue
+    fi
+    purge="${purge} ${pkg}"
+  done
+  # shellcheck disable=SC2086
+  if [ -n "$purge" ] && sudo apt-get purge -y $purge; then
+    STATUS_CHANGES+=("Removed the wallpaper pack the old release left unused:${purge}")
+  elif [ -n "$purge" ]; then
+    STATUS_FAILED+=("Could not remove the unused wallpaper pack:${purge}")
+  fi
+  return 0
 }
 
-# Narrow the source list to the pinned release before anything installs.
+# Print the Ubuntu apt source $1 with the Components of release $2's stanza
+# on mirror $3 set to UBUNTU_COMPONENTS. The stanzas are write_ubuntu_sources'
+# own: URIs and Suites come before Components.
+source_on_main() {
+  CN="$2" MIRROR="$3" COMPS="$UBUNTU_COMPONENTS" awk '
+    /^$/           { uri = ""; hit = 0 }
+    /^URIs:/       { uri = $2 }
+    /^Suites:/     { for (i = 2; i <= NF; i++) { s = $i; sub(/-[a-z]+$/, "", s); if (s == ENVIRON["CN"]) hit = 1 } }
+    /^Components:/ && hit && uri == ENVIRON["MIRROR"] { print "Components: " ENVIRON["COMPS"]; next }
+    { print }' "$1"
+}
+
+# After a failed Ubuntu apt update caused by universe: put the apt source on
+# main and record each release and mirror, so later runs stay there. Returns
+# 1 when universe was not the cause or nothing changed.
+drop_unserved_universe() {
+  # "<release> <mirror>" of each universe index apt found missing (404);
+  # progress lines and passing network errors name universe too.
+  local pairs
+  pairs="$(sed -nE 's#^(E|W): Failed to fetch (.*)/dists/([a-z]+)(-[a-z]+)?/universe/.*[[:space:]]404[[:space:]].*#\3 \2#p' \
+           <<< "${APT_UPDATE_OUTPUT:-}" | sort -u)"
+  [ -n "$pairs" ] || return 1
+  local tmp cn m dropped=""
+  tmp="$(mktemp)" || return 1
+  cp "$UBUNTU_SOURCES" "$tmp"
+  # Only those releases' stanzas go to main.
+  while read -r cn m; do
+    source_on_main "$tmp" "$cn" "$m" > "${tmp}.new" && mv -f "${tmp}.new" "$tmp"
+    sys_record_append "$NO_UNIVERSE_RECORD" "${cn} ${m}"
+    dropped="${dropped} ${cn}"
+  done <<< "$pairs"
+  sys_record_sort "$NO_UNIVERSE_RECORD"
+  if cmp -s "$tmp" "$UBUNTU_SOURCES" || ! sudo install -m 0644 "$tmp" "$UBUNTU_SOURCES"; then
+    rm -f "$tmp"; return 1
+  fi
+  rm -f "$tmp"
+  # Once per run.
+  local msg="Ubuntu mirror without universe for:${dropped} — its source stays on main; humanity-icon-theme may be missing"
+  printf '%s\n' "${STATUS_FAILED[@]}" | grep -qxF "$msg" || STATUS_FAILED+=("$msg")
+  return 0
+}
+
+# Narrow the apt source to the pinned release before anything installs.
 # Only a newly added suite needs an apt update.
 narrow_ubuntu_sources() {
   [ -n "${UBUNTU_CODENAME:-}" ] && [ "$UBUNTU_CODENAME" != "auto" ] || return 0
   local before rc=0
-  before="$(grep '^deb ' "$UBUNTU_LIST" 2>/dev/null)"
+  before="$(ubuntu_source_entries)"
+  # Each run tries universe again; the record stays if no archive answers.
+  local no_universe=""
+  if [ -f "$NO_UNIVERSE_RECORD" ]; then
+    no_universe="$(cat "$NO_UNIVERSE_RECORD")"
+    sudo rm -f "$NO_UNIVERSE_RECORD"
+  fi
   write_ubuntu_sources "$UBUNTU_CODENAME" || rc=$?
-  [ "$rc" -eq 2 ] && return 0
-  remove_unattended_origins
+  if [ "$rc" -ge 2 ]; then
+    [ -n "$no_universe" ] && sys_record_write "$NO_UNIVERSE_RECORD" "$no_universe"
+    return 0
+  fi
   if [ "$rc" -eq 0 ] \
-     && grep '^deb ' "$UBUNTU_LIST" | grep -qvxF -f <(printf '%s\n' "$before"); then
-    if ! apt_update_ubuntu_only; then
-      # A mirror without universe would break apt update: stay on main this time.
-      local _tmp
-      _tmp="$(mktemp)"
-      if grep -q '/universe' <<< "$APT_UPDATE_OUTPUT" \
-         && sed "s/^\(deb .*\) ${UBUNTU_PINNED_COMPONENTS}\$/\1 ${UBUNTU_COMPONENTS}/" "$UBUNTU_LIST" > "$_tmp" \
-         && ! cmp -s "$_tmp" "$UBUNTU_LIST" && sudo install -m 0644 "$_tmp" "$UBUNTU_LIST"; then
-        STATUS_FAILED+=("apt update failed for ${UBUNTU_CODENAME}'s universe — the source stays on main; humanity-icon-theme may be missing")
-      else
-        STATUS_FAILED+=("apt update failed for ${UBUNTU_CODENAME}'s sources")
-      fi
-      rm -f "$_tmp"
-      APT_ERRORS=$((APT_ERRORS + 1))
+     && ubuntu_source_entries | grep -qvxF -f <(printf '%s\n' "$before"); then
+    # A mirror without universe goes to main and is fine; any other failure counts.
+    if ! apt_update_ubuntu_only \
+       && ! { drop_unserved_universe && apt_update_ubuntu_only; }; then
+      STATUS_FAILED+=("apt update failed for ${UBUNTU_CODENAME}'s sources")
     fi
   fi
-  if [ "$(cat "$UBUNTU_LIST" 2>/dev/null)" != "${INITIAL_UBUNTU_LIST:-}" ]; then
+  if [ "$(cat "$UBUNTU_SOURCES" 2>/dev/null)" != "${INITIAL_UBUNTU_SOURCES:-}" ]; then
     local comps="$UBUNTU_COMPONENTS"
-    grep -q " ${UBUNTU_PINNED_COMPONENTS}\$" "$UBUNTU_LIST" && comps="$UBUNTU_PINNED_COMPONENTS"
+    grep -qxF "Components: ${UBUNTU_PINNED_COMPONENTS}" "$UBUNTU_SOURCES" && comps="$UBUNTU_PINNED_COMPONENTS"
     STATUS_CHANGES+=("Ubuntu apt sources: ${UBUNTU_CODENAME} (${comps})")
   else
     STATUS_NOCHANGE+=("Ubuntu apt sources already current")
   fi
 }
 
-# Ubuntu packages are never updated unattended; the file earlier versions
-# wrote for unattended-upgrades is removed.
-remove_unattended_origins() {
-  [ -f "$UNATTENDED_ORIGINS" ] || return 0
-  sudo rm -f "$UNATTENDED_ORIGINS" \
-    && STATUS_CHANGES+=("unattended-upgrades no longer updates the Ubuntu look packages — 'apt upgrade' does")
+# The Ubuntu apt source as one line per suite: "<URI> <suite> <components>".
+ubuntu_source_entries() {
+  awk '
+    function flush(  i) { for (i = 1; i <= n; i++) print uri, suite[i], comps; uri = comps = ""; n = 0 }
+    /^$/           { flush(); next }
+    /^URIs:/       { uri = $2 }
+    /^Suites:/     { n = 0; for (i = 2; i <= NF; i++) suite[++n] = $i }
+    /^Components:/ { comps = $0; sub(/^Components:[ \t]*/, "", comps) }
+    END            { flush() }' "$UBUNTU_SOURCES" 2>/dev/null
 }
 
-# Codenames the Ubuntu source list names (the field after the URL).
+# Codenames the Ubuntu apt source names.
 configured_codenames() {
-  awk '/^deb /{ for (i = 2; i < NF; i++) if ($i ~ /:\/\//) { print $(i + 1); break } }' \
-    "$UBUNTU_LIST" 2>/dev/null | sed 's/-updates$//' | sort -u
+  ubuntu_source_entries | awk '{ sub(/-updates$/, "", $2); print $2 }' | sort -u
 }
 
 # apt-get update for the Ubuntu sources only, waiting for a lock. The output
 # is kept in APT_UPDATE_OUTPUT.
 apt_update_ubuntu_only() {
-  local log rc try=1
+  local log rc
   log="$(mktemp)" || return 1
-  while :; do
-    # shellcheck disable=SC2024  # the log is this user's file
-    LC_ALL=C sudo apt-get update -o Dir::Etc::sourcelist="$UBUNTU_LIST" \
-      -o Dir::Etc::sourceparts=- -o APT::Get::List-Cleanup=0 > "$log" 2>&1
-    rc=$?
-    [ "$rc" -ne 0 ] && [ "$try" -lt 5 ] \
-      && grep -q 'Could not get lock' "$log" || break
-    message "apt is busy — trying again in a minute"
-    try=$((try + 1)); sleep 60
-  done
+  apt_update_waiting "$log" quiet -o Dir::Etc::sourcelist="$UBUNTU_SOURCES" \
+    -o Dir::Etc::sourceparts=- -o APT::Get::List-Cleanup=0
+  rc=$?
   APT_UPDATE_OUTPUT="$(cat "$log")"
   rm -f "$log"
   return "$rc"
 }
 
-# apt-get update that waits for a lock and tolerates other repositories' errors.
-apt_update() {
-  local log rc try=1
-  log="$(mktemp)"
+# apt-get update with options $3..., output in file $1 (and on screen unless
+# $2 is "quiet"); up to five tries a minute apart while apt is locked.
+apt_update_waiting() {
+  local log="$1" mode="$2" rc try=1
+  shift 2
   while :; do
-    LC_ALL=C sudo apt-get update 2>&1 | tee "$log"
-    rc=${PIPESTATUS[0]}
+    if [ "$mode" = quiet ]; then
+      # shellcheck disable=SC2024  # the log is this user's file
+      LC_ALL=C sudo apt-get update "$@" > "$log" 2>&1
+      rc=$?
+    else
+      LC_ALL=C sudo apt-get update "$@" 2>&1 | tee "$log"
+      rc=${PIPESTATUS[0]}
+    fi
     [ "$rc" -ne 0 ] && [ "$try" -lt 5 ] \
       && grep -q 'Could not get lock' "$log" || break
     message "apt is busy — trying again in a minute"
     try=$((try + 1)); sleep 60
   done
+  return "$rc"
+}
+
+# apt-get update that waits for a lock and tolerates other repositories' errors.
+# Returns 3 when apt stayed locked.
+apt_update() {
+  local log rc
+  log="$(mktemp)" || return 1
+  apt_update_waiting "$log" show
+  rc=$?
   [ "$rc" -eq 0 ] && { rm -f "$log"; return 0; }
   # Still locked after five tries.
-  grep -q 'Could not get lock' "$log" && { rm -f "$log"; return "$rc"; }
+  grep -q 'Could not get lock' "$log" && { rm -f "$log"; return 3; }
   rm -f "$log"
 
   # Another repository failed; the Ubuntu part is what matters.
-  if [ -f "$UBUNTU_LIST" ] && apt_update_ubuntu_only; then
+  if [ -f "$UBUNTU_SOURCES" ] && apt_update_ubuntu_only; then
     message warn "apt update reported errors for another repository — continuing"
     STATUS_NOCHANGE+=("apt update: another repository reported an error (see above)")
+    return 0
+  fi
+  # A mirror without universe: its sources go to main and apt tries again.
+  if [ -f "$UBUNTU_SOURCES" ] && drop_unserved_universe && apt_update_ubuntu_only; then
+    message warn "an Ubuntu mirror does not serve universe — continuing on main"
     return 0
   fi
   return "$rc"
 }
 
-# Newest candidate release whose shell theme and dock both install here.
-# Empty when nothing fits.
+# Newest candidate release whose shell theme installs here, and its dock too
+# when it has one. Empty when nothing fits.
 resolve_ubuntu_codename() {
-  local cn pkg ver sim ok allowed
+  local cn pkg ver ok allowed
   for cn in $(echo "$UBUNTU_CANDIDATE_CODENAMES" | tr ' ' '\n' | tac); do
     ok=1
     # The dock comes as its own package, or in the combined one.
     for pkg in yaru-theme-gnome-shell gnome-shell-extension-ubuntu-dock "$COMBINED_EXT_PKG"; do
-      ver="$(LC_ALL=C apt-cache madison "$pkg" 2>/dev/null \
-        | awk -F'|' -v c="$cn" '$3 ~ ("[ /]" c "(-updates)?/") { gsub(/^[ \t]+|[ \t]+$/, "", $2); print $2; exit }')"
+      ver="$(release_build "$pkg" "$cn")"
       if [ -z "$ver" ]; then
         # The theme is required; the dock is optional.
         [ "$pkg" = yaru-theme-gnome-shell ] && { ok=0; break; }
@@ -858,8 +1120,7 @@ resolve_ubuntu_codename() {
       message "  checking ${cn}: ${pkg}=${ver}" >&2
       allowed=""
       [ "$pkg" = "$COMBINED_EXT_PKG" ] && allowed="$SEPARATE_EXT_PKGS"
-      if ! sim="$(LC_ALL=C apt-get install -s "${pkg}=${ver}" 2>&1)" \
-         || [ -n "$(ALLOWED_REMOVALS="$allowed" unexpected_removals "$sim")" ]; then
+      if ! ALLOWED_REMOVALS="$allowed" installs_cleanly "${pkg}=${ver}"; then
         ok=0; break
       fi
       [ "$pkg" = gnome-shell-extension-ubuntu-dock ] && break
@@ -869,9 +1130,15 @@ resolve_ubuntu_codename() {
   return 0
 }
 
-# apt-cache madison $1 as trimmed "<version>|<source>" lines.
+# Newest build of $1 that release $2 (or its -updates) serves; empty if none.
+release_build() {
+  LC_ALL=C apt-cache madison "$1" 2>/dev/null \
+    | awk -F'|' -v c="$2" '$3 ~ ("[ /]" c "(-updates)?/") { gsub(/[ \t]/, "", $2); print $2; exit }'
+}
+
+# apt-cache madison $@ (apt options, packages) as trimmed "<version>|<source>" lines.
 madison_rows() {
-  LC_ALL=C apt-cache madison "$1" 2>/dev/null | awk -F'|' '
+  LC_ALL=C apt-cache madison "$@" 2>/dev/null | awk -F'|' '
     { gsub(/^[ \t]+|[ \t]+$/, "", $2); gsub(/^[ \t]+|[ \t]+$/, "", $3); print $2 "|" $3 }'
 }
 
@@ -926,20 +1193,32 @@ check_shell_coupling_drift() {
   local themepkg themed want
   if [ -n "$UBUNTU_CODENAME" ] && [ "$UBUNTU_CODENAME" != "auto" ]; then
     for themepkg in $LOOK_PACKAGES; do
-      pkg_origin_is_ubuntu "$themepkg" || continue
+      # Any installed build not Debian's; after narrowing, one from another
+      # Ubuntu release has no source left to show it as Ubuntu's.
       themed="$(pkg_installed_version "$themepkg")"
+      [ -n "$themed" ] || continue
+      is_held "$themepkg" && continue
+      # Kept on purpose by align_look_packages, which says why.
+      in_word_list "$themepkg" "$ALIGN_KEPT" && continue
+      pkg_version_is_debian "$themepkg" "$themed" && continue
       pkg_version_in_codename "$themepkg" "$themed" "$UBUNTU_CODENAME" && continue
       [ "$MODE" = offline ] && bundle_has_version "$themepkg" "$PACKAGES_DIR" "$themed" >/dev/null && continue
-      want="$(LC_ALL=C apt-cache "${APT_OPTS[@]}" madison "$themepkg" 2>/dev/null \
-              | grep -E "[ /]${UBUNTU_CODENAME}(-updates)?/|^ *${themepkg} *\| .* \| file:" \
-              | awk -F'|' '{gsub(/ /,"",$2); print $2}' | sort -V | tail -1)"
+      want="$(madison_rows "${APT_OPTS[@]}" "$themepkg" | awk -F'|' -v c="$UBUNTU_CODENAME" '
+              $2 ~ ("[ /]" c "(-updates)?/") || $2 ~ /^file:/ { print $1; exit }')"
       message warn "${themepkg} ${themed} is not the build for ${UBUNTU_CODENAME}"
       # apt does not downgrade by itself.
-      if [ -n "$want" ]; then
+      if [ -n "$want" ] && ! in_word_list "${themepkg}=${want}" "$REJECTED_BUILDS" \
+         && installs_cleanly --allow-downgrades "${themepkg}=${want}"; then
         message warn "  to align it: sudo apt install --allow-downgrades ${themepkg}=${want}"
         STATUS_FAILED+=("${themepkg} is ${themed}, but ${UBUNTU_CODENAME} ships ${want} — see the command above")
+      elif [ -n "$want" ]; then
+        local why
+        why="$(explain_blocked "$themepkg" "$want")"
+        message warn "  ${why} — ${themed} stays"
+        STATUS_FAILED+=("${themepkg} stays at ${themed} — ${why}")
       else
         message warn "  ${UBUNTU_CODENAME} offers no build of it in the configured sources"
+        STATUS_FAILED+=("${themepkg} stays at ${themed} — ${UBUNTU_CODENAME} offers no build of it")
       fi
       drift=1
     done
@@ -973,19 +1252,21 @@ pkg_version_ubuntu_codenames() {
 # The release the Ubuntu pin $1 (default: UBUNTU_PIN) names; empty without one.
 pinned_codename() { sed -n 's/^Pin: release o=Ubuntu, n=//p' "${1:-$UBUNTU_PIN}" 2>/dev/null | head -1; }
 
-# Without a pin, write one that blocks every Ubuntu package. Returns 1 when a
-# pin exists.
+# Without a pin, write one that blocks every Ubuntu package. Returns 0 =
+# written, 1 = a pin exists, 2 = the file could not be written.
 write_provisional_pin() {
   [ ! -f "$UBUNTU_PIN" ] || return 1
   printf '%s\n' \
     "# provisional — written before the Ubuntu sources, replaced once the codename resolves" \
     "Package: *" \
     "Pin: release o=Ubuntu" \
-    "Pin-Priority: -1" | sudo tee "$UBUNTU_PIN" > /dev/null
+    "Pin-Priority: -1" | sudo tee "$UBUNTU_PIN" > /dev/null \
+    || { sudo rm -f "$UBUNTU_PIN"; return 2; }
 }
 
 # Write the Ubuntu pin for UBUNTU_CODENAME to $1 (default: UBUNTU_PIN).
-# Returns 0 when the file changed, 1 when already current.
+# Returns 0 when the file changed, 1 when already current, 2 when it could
+# not be written.
 write_ubuntu_pin() {
   local tmp dest="${1:-$UBUNTU_PIN}"
   tmp="$(mktemp)"
@@ -1006,16 +1287,12 @@ EOF
     rm -f "$tmp"
     return 1
   fi
-  if [ "$dest" = "$UBUNTU_PIN" ]; then sudo install -m 0644 "$tmp" "$dest"; else install -m 0644 "$tmp" "$dest"; fi
+  local rc=0
+  if [ "$dest" = "$UBUNTU_PIN" ]; then sudo install -m 0644 "$tmp" "$dest" || rc=2
+  else install -m 0644 "$tmp" "$dest" || rc=2; fi
   rm -f "$tmp"
-  return 0
-}
-
-# Remove the keyring earlier versions wrote, once no source names it.
-remove_legacy_keyring() {
-  [ -f "$LEGACY_UBUNTU_KEYRING" ] || return 0
-  grep -rqsF "$LEGACY_UBUNTU_KEYRING" /etc/apt/sources.list /etc/apt/sources.list.d/ && return 0
-  sudo rm -f "$LEGACY_UBUNTU_KEYRING"
+  [ "$rc" -eq 0 ] || STATUS_FAILED+=("Could not write the Ubuntu pin ${dest}")
+  return $rc
 }
 
 # The package list before this script installs anything, taken once.
@@ -1026,16 +1303,15 @@ record_packages_before() {
     sys_records_dir
     apt-mark showmanual 2>/dev/null | sort > "$tmp"
     sudo install -m 0644 "$tmp" "$MANUAL_BEFORE"
-    installed_package_list > "$tmp"
-    sudo install -m 0644 "$tmp" "$PACKAGES_BEFORE"
     dpkg-query -W -f='${Package} ${Status}\n' 2>/dev/null \
       | awk '$4 == "config-files" { print $1 }' | sort > "$tmp"
     sudo install -m 0644 "$tmp" "$CONFIG_FILES_BEFORE"
+    # Last: its presence marks the snapshot complete.
+    installed_package_list > "$tmp"
+    sudo install -m 0644 "$tmp" "$PACKAGES_BEFORE"
     rm -f "$tmp"
     STATUS_CHANGES+=("Pre-install package list saved → ${PACKAGES_BEFORE}")
   fi
-  [ -f "$MANUAL_BEFORE" ] \
-    || STATUS_NOCHANGE+=("No record of package marks from before the first install — the uninstall leaves the marks as they are")
 }
 
 # Configure the older releases $1 beside the window, and resolve again.
@@ -1044,7 +1320,8 @@ try_older_releases() {
   message "looking further back: $1"
   UBUNTU_CANDIDATE_CODENAMES="$1 $window"
   if write_ubuntu_sources; then apt_update_ubuntu_only || true; fi
-  UBUNTU_CODENAME="$(resolve_ubuntu_codename)"
+  # The window was tried already; only the older releases are simulated.
+  UBUNTU_CODENAME="$(UBUNTU_CANDIDATE_CODENAMES="$1" resolve_ubuntu_codename)"
   if [ -n "$UBUNTU_CODENAME" ]; then
     # Keep only the release found, beside the window.
     UBUNTU_CANDIDATE_CODENAMES="$UBUNTU_CODENAME $window"
@@ -1054,20 +1331,79 @@ try_older_releases() {
   fi
 }
 
-# gnome-shell major of Ubuntu release $1.
-ubuntu_shell_major() {
-  LC_ALL=C apt-cache madison gnome-shell 2>/dev/null \
-    | awk -F'|' -v c="$1" '$3 ~ ("[ /]" c "(-updates)?/") { gsub(/ /, "", $2); split($2, v, "."); print v[1]; exit }'
+# Set UBUNTU_CODENAME to the newest release whose theme and dock install here.
+# Else: the newest release when gnome-shell is newer than every release;
+# otherwise the release pinned before ($1), older listed ones, retired ones;
+# finally the release pinned before, if still published, or the oldest
+# candidate.
+resolve_release() {
+  local hint="$1" older newest debian_shell newest_shell pinned_info
+  UBUNTU_CODENAME="$(resolve_ubuntu_codename)"
+
+  if [ -z "$UBUNTU_CODENAME" ]; then
+    newest="$(echo "$UBUNTU_CANDIDATE_CODENAMES" | awk '{print $NF}')"
+    debian_shell="$(shell_major)"
+    newest_shell="$(ubuntu_shell_major "$newest")"
+    if [ -n "$debian_shell" ] && [ -n "$newest_shell" ] && [ "$debian_shell" -gt "$newest_shell" ]; then
+      UBUNTU_CODENAME="$newest"
+      message warn "gnome-shell ${debian_shell} is newer than any Ubuntu release — using the newest, ${UBUNTU_CODENAME}"
+      return 0
+    fi
+    message warn "no Ubuntu release in the current window has a theme this gnome-shell can load"
+    if [[ "$hint" =~ ^[a-z]+$ ]] && ! in_word_list "$hint" "$UBUNTU_CANDIDATE_CODENAMES"; then
+      try_older_releases "$hint"
+    fi
+    if [ -z "$UBUNTU_CODENAME" ]; then
+      older="$(echo "$UBUNTU_ALL_CODENAMES" | tr ' ' '\n' \
+        | head -n -"$MAX_UBUNTU_CANDIDATES" | tail -n "$MAX_UBUNTU_LOOKBACK" | xargs)"
+      # The hint was tried above.
+      older="$(word_list_without "$older" "$hint" | xargs)"
+      [ -n "$older" ] && try_older_releases "$older"
+    fi
+    if [ -z "$UBUNTU_CODENAME" ]; then
+      older="$(discover_retired_codenames)" || exit 1
+      [ -n "$older" ] && try_older_releases "$older"
+    fi
+  fi
+  if [ -z "$UBUNTU_CODENAME" ]; then
+    local info_rc=1
+    if [[ "$hint" =~ ^[a-z]+$ ]]; then
+      pinned_info="$(ubuntu_release_info "$hint")"; info_rc=$?
+      [ "$info_rc" -eq 2 ] && { release_unread "$hint"; exit 1; }
+    fi
+    if [ "$info_rc" -eq 0 ] \
+       && { [ "$UBUNTU_INCLUDE_DEVEL" = 1 ] || [[ "$pinned_info" != *" devel "* ]]; }; then
+      UBUNTU_CODENAME="$hint"
+      # shellcheck disable=SC2086
+      in_word_list "$hint" "$UBUNTU_CANDIDATE_CODENAMES" \
+        || UBUNTU_CANDIDATE_CODENAMES="$(codenames_by_version $UBUNTU_CANDIDATE_CODENAMES "$hint")"
+    else
+      UBUNTU_CODENAME="$(echo "$UBUNTU_CANDIDATE_CODENAMES" | awk '{print $1}')"
+    fi
+    message warn "no Ubuntu release ships a shell theme for this gnome-shell — using ${UBUNTU_CODENAME}"
+    return 0
+  fi
+  message "resolved Ubuntu release: ${GREEN}${UBUNTU_CODENAME}${ENDCOLOR} ($(gnome-shell --version 2>/dev/null || echo 'gnome-shell not installed')) — verified via simulated install"
 }
 
-# Put back the Ubuntu source list saved in PREV_UBUNTU_LIST.
-restore_prev_ubuntu_list() {
-  if [ -s "$PREV_UBUNTU_LIST" ]; then
-    sudo install -m 0644 "$PREV_UBUNTU_LIST" "$UBUNTU_LIST"
+# gnome-shell major of Ubuntu release $1.
+ubuntu_shell_major() {
+  local v
+  v="$(release_build gnome-shell "$1")"
+  printf '%s' "${v%%.*}"
+}
+
+# Put back the Ubuntu apt source saved in PREV_UBUNTU_SOURCES, and drop a
+# provisional pin this run wrote.
+restore_prev_ubuntu_sources() {
+  if [ -s "$PREV_UBUNTU_SOURCES" ]; then
+    sudo install -m 0644 "$PREV_UBUNTU_SOURCES" "$UBUNTU_SOURCES"
   else
-    sudo rm -f "$UBUNTU_LIST"
+    sudo rm -f "$UBUNTU_SOURCES"
   fi
-  rm -f "$PREV_UBUNTU_LIST"
+  rm -f "$PREV_UBUNTU_SOURCES"
+  [ "${PROVISIONAL_PIN_NEW:-0}" = 1 ] && sudo rm -f "$UBUNTU_PIN"
+  return 0
 }
 
 # Record that $1 replaced version $2, so the uninstall reinstalls it. The first
@@ -1086,58 +1422,28 @@ record_upgraded_pkg() {
 # 3. Desktop: Ubuntu's settings, extensions, terminal, login screen
 ###############################################################################
 
-# Remove the user-local desktop-icons copy of earlier versions; it shadows
-# Debian's package. Returns 0 when something was removed.
-remove_legacy_ding() {
-  local record="${BACKUP_DIR}/ubuntu-ding-version.txt"
-  local d="${HOME}/.local/share/gnome-shell/extensions/ding@rastersoft.com"
-  local sd="${HOME}/.local/share/glib-2.0/schemas"
-  [ -f "$record" ] || return 1
-  rm -rf "$d" "${sd}/org.gnome.shell.extensions.ding.gschema.xml"
-  if ls "${sd}"/*.gschema.xml >/dev/null 2>&1; then
-    glib-compile-schemas "$sd" 2>/dev/null || true
-  else
-    rm -f "${sd}/gschemas.compiled"
-    rmdir "$sd" "${HOME}/.local/share/glib-2.0" 2>/dev/null || true
-  fi
-  rmdir "${HOME}/.local/share/gnome-shell/extensions" \
-        "${HOME}/.local/share/gnome-shell" 2>/dev/null || true
-  rm -f "$record"
-  return 0
-}
-
-# Print the look profile: the system's user profile with the look database
-# right after the user database.
+# Print the look profile: the system's user profile, then the look database
+# last, so the system's own databases come first. user-db:user leads when
+# that profile has no user database.
 look_profile_content() {
-  local base="" line added=0
+  local base=""
   for base in "$DCONF_USER_PROFILE" /usr/share/dconf/profile/user ""; do
     [ -z "$base" ] || [ -f "$base" ] && break
   done
-  if [ -n "$base" ] && grep -q '^user-db:' "$base" 2>/dev/null; then
-    while IFS= read -r line || [ -n "$line" ]; do
-      printf '%s\n' "$line"
-      if [ "$added" -eq 0 ] && [ "${line#user-db:}" != "$line" ]; then
-        printf 'system-db:%s\n' "$LOOK_DB_NAME"
-        added=1
-      fi
-    done < "$base"
-  else
-    printf 'user-db:user\nsystem-db:%s\n' "$LOOK_DB_NAME"
-    [ -n "$base" ] && grep -v '^user-db:' "$base"
-  fi
-  return 0
+  [ -n "$base" ] && grep -q '^user-db:' "$base" 2>/dev/null || echo 'user-db:user'
+  [ -n "$base" ] && grep '' "$base"
+  printf 'system-db:%s\n' "$LOOK_DB_NAME"
 }
 
 # Write the look profile. Returns 0 = changed, 1 = current, 2 = failed.
 write_look_profile() {
-  local tmp rc=1
+  local tmp rc
   # A pending boot-time removal would delete the new profile.
   [ -f "$LOOK_CLEANUP_CONF" ] && sudo rm -f "$LOOK_CLEANUP_CONF"
   tmp="$(mktemp)"
   look_profile_content > "$tmp"
-  if ! { [ -f "$LOOK_PROFILE" ] && cmp -s "$tmp" "$LOOK_PROFILE"; }; then
-    if sudo install -D -m 0644 "$tmp" "$LOOK_PROFILE"; then rc=0; else rc=2; fi
-  fi
+  [ -d /etc/dconf/profile ] || { sys_records_dir; sudo touch "$DCONF_PROFILE_DIR_MADE"; }
+  sudo_install_if_changed "$tmp" "$LOOK_PROFILE"; rc=$?
   rm -f "$tmp"
   return $rc
 }
@@ -1148,16 +1454,15 @@ mask_session_migration() {
   [ "$(readlink "$SESSION_MIGRATION_MASK" 2>/dev/null)" = /dev/null ] && return 1
   [ -e "$SESSION_MIGRATION_MASK" ] || [ -L "$SESSION_MIGRATION_MASK" ] && return 2
   sys_records_dir && sudo touch "$SESSION_MIGRATION_MASKED" || return 2
-  sudo mkdir -p "$(dirname "$SESSION_MIGRATION_MASK")" \
+  sudo mkdir -p "${SESSION_MIGRATION_MASK%/*}" \
     && sudo ln -s /dev/null "$SESSION_MIGRATION_MASK" && return 0
   sudo rm -f "$SESSION_MIGRATION_MASKED"
   return 2
 }
 
-# The per-user switch file's content; $1 names the uninstall command.
+# The per-user switch file's content.
 look_env_content() {
-  local by="${1:-"'ubuntu-look.sh --uninstall'"}"
-  printf '# Written by ubuntu-look.sh; removed by %s.\nDCONF_PROFILE=%s' "$by" "$LOOK_PROFILE_NAME"
+  printf "# Written by ubuntu-look.sh; removed by 'ubuntu-look.sh --uninstall'.\nDCONF_PROFILE=%s" "$LOOK_PROFILE_NAME"
 }
 
 # Make this user's sessions read the look profile from the next login.
@@ -1167,83 +1472,8 @@ enable_look_for_user() {
   want="$(look_env_content)"
   have="$(cat "$LOOK_ENV_FILE" 2>/dev/null)"
   [ "$have" = "$want" ] && return 1
-  # Only the comment of earlier versions differs: the switch is already on.
-  if [ "$have" = "$(look_env_content uninstall.sh)" ]; then
-    printf '%s\n' "$want" > "$LOOK_ENV_FILE" && return 1
-    return 2
-  fi
-  mkdir -p "$(dirname "$LOOK_ENV_FILE")" && printf '%s\n' "$want" > "$LOOK_ENV_FILE" && return 0
+  mkdir -p "${LOOK_ENV_FILE%/*}" && printf '%s\n' "$want" > "$LOOK_ENV_FILE" && return 0
   return 2
-}
-
-# Remove the machine-wide defaults (local.d) of earlier versions and their
-# user profile changes. Returns 0 = removed, 1 = none, 2 = failed.
-retire_legacy_defaults() {
-  local changed=1 failed=0 only_ours=1 f
-  # An admin's own local database keeps system-db:local in place.
-  for f in /etc/dconf/db/local.d/*; do
-    [ -e "$f" ] || continue
-    [ "$f" = "$LEGACY_DB_FILE" ] || only_ours=0
-  done
-  if [ -f "$LEGACY_DB_FILE" ]; then
-    if sudo rm -f "$LEGACY_DB_FILE"; then changed=0; else failed=1; fi
-  fi
-  if [ "$only_ours" -eq 1 ]; then
-    if [ -f "${SYS_RECORDS}/dconf-user-profile-created" ]; then
-      if sudo rm -f "$DCONF_USER_PROFILE"; then
-        sudo rm -f "${SYS_RECORDS}/dconf-user-profile-created"; changed=0
-      else failed=1; fi
-    elif [ -f "${SYS_RECORDS}/dconf-user-profile-appended" ]; then
-      if sudo sed -i '/^system-db:local$/d' "$DCONF_USER_PROFILE"; then
-        sudo rm -f "${SYS_RECORDS}/dconf-user-profile-appended"; changed=0
-      else failed=1; fi
-    elif [ "$changed" -eq 0 ] && [ -f "$DCONF_USER_PROFILE" ] \
-         && [ "$(tr -d '[:space:]' < "$DCONF_USER_PROFILE")" = "user-db:usersystem-db:local" ]; then
-      # The oldest versions kept no record; this is the profile they wrote.
-      sudo rm -f "$DCONF_USER_PROFILE" || failed=1
-    fi
-  fi
-  if [ -f "${SYS_RECORDS}/dconf-local-dir-created" ] && [ "$only_ours" -eq 1 ]; then
-    sudo rmdir /etc/dconf/db/local.d 2>/dev/null && sudo rm -f /etc/dconf/db/local
-    sudo rm -f "${SYS_RECORDS}/dconf-local-dir-created"
-    changed=0
-  fi
-  # Unrecorded leftovers: an empty, unowned local.d and system-db:local.
-  if [ -d /etc/dconf/db/local.d ] && [ -z "$(ls -A /etc/dconf/db/local.d 2>/dev/null)" ] \
-     && ! dpkg -S /etc/dconf/db/local.d > /dev/null 2>&1; then
-    if [ -f "$DCONF_USER_PROFILE" ] && grep -qx 'system-db:local' "$DCONF_USER_PROFILE"; then
-      sudo sed -i '/^system-db:local$/d' "$DCONF_USER_PROFILE" || failed=1
-    fi
-    # The look profile is rewritten without it later in this run.
-    local p in_use=0
-    for p in /etc/dconf/profile/*; do
-      [ "$p" = "$LOOK_PROFILE" ] && continue
-      grep -qsx 'system-db:local' "$p" && in_use=1
-    done
-    if [ "$in_use" -eq 0 ]; then
-      sudo rmdir /etc/dconf/db/local.d && sudo rm -f /etc/dconf/db/local && changed=0
-    fi
-  fi
-  if [ "$changed" -eq 0 ]; then sudo dconf update || failed=1; fi
-  [ "$failed" -eq 1 ] && return 2
-  return $changed
-}
-
-# Remove the shell theme follower user services of earlier versions.
-# Returns 0 = removed, 1 = none.
-remove_theme_followers() {
-  local name unit bin rc=1
-  for name in yaru-shell-theme yaru-color-scheme-sync; do
-    unit="$HOME/.config/systemd/user/${name}.service"
-    bin="$HOME/.local/bin/${name}"
-    [ -f "$unit" ] || [ -f "${bin}.sh" ] || [ -f "${bin}.js" ] || continue
-    systemctl --user disable --now "${name}.service" 2>/dev/null || true
-    rm -f "$unit" "${bin}.sh" "${bin}.js" \
-          "$HOME/.config/systemd/user/graphical-session.target.wants/${name}.service"
-    rc=0
-  done
-  [ "$rc" -eq 0 ] && { systemctl --user daemon-reload 2>/dev/null || true; }
-  return $rc
 }
 
 # Keep only valid extension uuids (name@domain).
@@ -1267,10 +1497,10 @@ ubuntu_dock_usable() {
 }
 
 # Turn a Dash-to-Dock this script turned off back on, as Ubuntu Dock cannot
-# run. Without a session, the autostart does it at the next login.
+# run: in a session through ENABLE_ADD, in the one write of
+# enable_shell_extensions; otherwise the autostart does it at the next login.
 dash_to_dock_back_on() {
   [ -f "$DASH_TO_DOCK_OFF" ] || return 0
-  local en dis keep
   if ! extension_installed "$DASH_TO_DOCK_UUID"; then
     rm -f "$DASH_TO_DOCK_OFF"
     return 0
@@ -1280,48 +1510,57 @@ dash_to_dock_back_on() {
     STATUS_CHANGES+=("Dash-to-Dock is turned back on at your next login — Ubuntu Dock cannot run on this gnome-shell")
     return 0
   fi
-  en="$(extension_uuids /org/gnome/shell/enabled-extensions)"
-  dis="$(extension_uuids /org/gnome/shell/disabled-extensions)"
-  keep="$(word_list_without "$dis" "$DASH_TO_DOCK_UUID")"
-  in_word_list "$DASH_TO_DOCK_UUID" "$en" || en="$en $DASH_TO_DOCK_UUID"
-  if dconf write /org/gnome/shell/enabled-extensions "$(gvariant_string_array "$en")" 2>/dev/null \
-     && { [ "$(echo "$keep" | xargs)" = "$(echo "$dis" | xargs)" ] \
-          || dconf write /org/gnome/shell/disabled-extensions "$(gvariant_string_array "$keep")" 2>/dev/null; }; then
-    rm -f "$DASH_TO_DOCK_OFF"
-    STATUS_CHANGES+=("Dash-to-Dock turned back on — Ubuntu Dock cannot run on this gnome-shell")
-  else
-    STATUS_FAILED+=("Dash-to-Dock could not be turned back on — Ubuntu Dock cannot run on this gnome-shell")
-  fi
+  ENABLE_ADD="$DASH_TO_DOCK_UUID"
 }
 
 # Ubuntu Dock stands aside while Dash-to-Dock is on, so turn that off for
-# this user; the uninstall turns it back on.
+# this user; the uninstall turns it back on. In a session whose shell knows
+# Ubuntu Dock it goes through ENABLE_DROP, in the one write of
+# enable_shell_extensions; otherwise the next login does it.
 turn_off_dash_to_dock() {
   local en
   if ! ubuntu_dock_usable; then dash_to_dock_back_on; return 0; fi
   en="$(extension_uuids /org/gnome/shell/enabled-extensions)"
   in_word_list "$DASH_TO_DOCK_UUID" "$en" || return 0
   mkdir -p "$BACKUP_DIR" && touch "$DASH_TO_DOCK_OFF"
-  if [ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ]; then
+  if [ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ] \
+     || ! LC_ALL=C gnome-extensions info ubuntu-dock@ubuntu.com > /dev/null 2>&1; then
     DASH_TO_DOCK_PENDING=1
     STATUS_CHANGES+=("Dash-to-Dock is turned off at your next login — Ubuntu Dock takes its place")
     return 0
   fi
-  if dconf write /org/gnome/shell/enabled-extensions \
-       "$(gvariant_string_array "$(word_list_without "$en" "$DASH_TO_DOCK_UUID")")" 2>/dev/null; then
-    STATUS_CHANGES+=("Dash-to-Dock turned off for you — Ubuntu Dock takes its place; the uninstall turns it back on")
-  else
-    STATUS_FAILED+=("Dash-to-Dock could not be turned off — Ubuntu Dock stays hidden while it is on")
+  ENABLE_DROP="$DASH_TO_DOCK_UUID"
+}
+
+# Report the Dash-to-Dock switch; $1 is enable_shell_extensions' result.
+dash_to_dock_status() {
+  if in_word_list "$DASH_TO_DOCK_UUID" "$ENABLE_DROP"; then
+    if [ "$1" -eq 0 ]; then
+      STATUS_CHANGES+=("Dash-to-Dock turned off for you — Ubuntu Dock takes its place; the uninstall turns it back on")
+    else
+      STATUS_FAILED+=("Dash-to-Dock could not be turned off — Ubuntu Dock stays hidden while it is on")
+    fi
+  elif in_word_list "$DASH_TO_DOCK_UUID" "$ENABLE_ADD"; then
+    if [ "$1" -eq 0 ]; then
+      rm -f "$DASH_TO_DOCK_OFF"
+      STATUS_CHANGES+=("Dash-to-Dock turned back on — Ubuntu Dock cannot run on this gnome-shell")
+    else
+      STATUS_FAILED+=("Dash-to-Dock could not be turned back on — Ubuntu Dock cannot run on this gnome-shell")
+    fi
   fi
 }
 
-# Enable extensions $@ in the user's dconf database, keeping the others.
+# Enable extensions $@ and those in ENABLE_ADD in the user's dconf database,
+# keeping the others, and take those in ENABLE_DROP off, in one write.
+# Returns 1 when it fails.
 enable_shell_extensions() {
   [ -n "${DBUS_SESSION_BUS_ADDRESS:-}" ] || return 0
-  command -v dconf >/dev/null 2>&1 || return 0
-  [ $# -gt 0 ] || return 0
+  # shellcheck disable=SC2086
+  set -- $ENABLE_ADD "$@"
+  [ $# -gt 0 ] || [ -n "$ENABLE_DROP" ] || return 0
+  command -v dconf >/dev/null 2>&1 || return 1
 
-  local own now merged keep="" e dis want=" $* "
+  local own now merged keep="" e dis
   # Start from the user's own list, not the one the defaults supply.
   own="$(user_dconf_read /org/gnome/shell/enabled-extensions)"
   if [ -n "$own" ]; then
@@ -1329,42 +1568,19 @@ enable_shell_extensions() {
   else
     now="$(extension_uuids /org/gnome/shell/enabled-extensions)"
   fi
-  merged="$(echo "$now $*" | tr ' ' '\n' | awk 'NF && !seen[$0]++' | tr '\n' ' ')"
-  # Skip an unchanged list: each write reloads the shell theme.
+  merged="$(echo "$now $*" | tr ' ' '\n' \
+    | awk -v drop=" $ENABLE_DROP " 'NF && !seen[$0]++ && !index(drop, " " $0 " ")' | tr '\n' ' ')"
+  # Skip an unchanged list: no needless write.
   if [ -z "$own" ] || [ "$(echo $now)" != "$(echo $merged)" ]; then
-    dconf write /org/gnome/shell/enabled-extensions "$(gvariant_string_array "$merged")" 2>/dev/null || return 0
+    dconf write /org/gnome/shell/enabled-extensions "$(gvariant_string_array "$merged")" 2>/dev/null || return 1
   fi
 
   dis="$(extension_uuids /org/gnome/shell/disabled-extensions)"
-  for e in $dis; do in_word_list "$e" "$want" || keep="$keep $e"; done
+  for e in $dis; do in_word_list "$e" "$*" || keep="$keep $e"; done
   [ "$(echo $keep)" = "$(echo $dis)" ] && return 0
-  dconf write /org/gnome/shell/disabled-extensions "$(gvariant_string_array "$keep")" 2>/dev/null || true
-}
-
-# Restore the dock favourites of the snapshot once, undoing the apps earlier
-# versions pinned.
-restore_dock_favourites() {
-  local marker="${BACKUP_ORIGINAL}/favourites-restored"
-  local dump="${BACKUP_ORIGINAL}/dconf-dump.ini"
-  local was now
-  [ ! -f "$marker" ] && [ -f "$dump" ] && [ -n "${DBUS_SESSION_BUS_ADDRESS:-}" ] || return 0
-  command -v dconf >/dev/null 2>&1 || return 0
-
-  was="$(ini_value "$dump" org/gnome/shell favorite-apps)"
-  now="$(dconf read /org/gnome/shell/favorite-apps 2>/dev/null)"
-
-  if [ "$(printf '%s' "$was" | tr -d '[:space:]')" \
-     != "$(printf '%s' "$now" | tr -d '[:space:]')" ]; then
-    if [ -z "$was" ]; then
-      # An unset key and a failed snapshot look the same: leave them alone.
-      STATUS_NOCHANGE+=("Dock favourites left as they are — the snapshot recorded none to put back")
-    else
-      dconf write /org/gnome/shell/favorite-apps "$was" 2>/dev/null || return 0
-      STATUS_CHANGES+=("Dock favourites put back to what they were before this script first ran")
-      RELOGIN_NEEDED=1
-    fi
-  fi
-  : > "$marker"
+  # Only Dash-to-Dock's return depends on this write; it reports a failure.
+  dconf write /org/gnome/shell/disabled-extensions "$(gvariant_string_array "$keep")" 2>/dev/null \
+    || [ -z "$ENABLE_ADD" ] || return 1
 }
 
 # True when extension $1 is installed system-wide, under /usr/local, or for this user.
@@ -1375,7 +1591,9 @@ extension_installed() {
 }
 
 # True when gnome-shell reports extension $1 as active.
-extension_active() { LC_ALL=C gnome-extensions info "$1" 2>/dev/null | grep -q 'State: ACTIVE'; }
+# GNOME Shell before 45 calls a running extension ENABLED, later ones ACTIVE.
+EXT_RUNNING_RE='State: (ACTIVE|ENABLED)$'
+extension_active() { LC_ALL=C gnome-extensions info "$1" 2>/dev/null | grep -qE "$EXT_RUNNING_RE"; }
 
 # The look's installed extensions not yet switched on for this user; with
 # "all", also those not installed.
@@ -1393,103 +1611,97 @@ record_extensions_on() {
   mkdir -p "$BACKUP_DIR" && printf '%s\n' "$@" >> "$EXTENSIONS_ON_RECORD"
 }
 
-# Start the record from the user's extension lists, for users of earlier
-# versions, which kept none.
-seed_extensions_record() {
-  [ -f "$EXTENSIONS_ON_RECORD" ] || [ "${FIRST_RUN_FOR_USER:-0}" = 1 ] && return 0
-  [ -f "$HOME/.config/autostart/ubuntu-look-enable-extensions.desktop" ] && return 0
-  command -v dconf >/dev/null 2>&1 || return 0
-  local lists e seen=()
-  lists="$(user_dconf_read /org/gnome/shell/enabled-extensions)
-$(user_dconf_read /org/gnome/shell/disabled-extensions)"
-  for e in $SHELL_EXTENSIONS; do
-    case "$lists" in *"'${e}'"*) seen+=("$e") ;; esac
-  done
-  mkdir -p "$BACKUP_DIR" && : > "$EXTENSIONS_ON_RECORD"
-  record_extensions_on "${seen[@]}"
+# Remove the one-shot autostart entry, its script, its retry mark and the
+# script's directory.
+remove_extension_autostart() {
+  rm -f "$EXT_AUTOSTART_FILE" "$EXT_AUTOSTART_SCRIPT" "${EXT_AUTOSTART_SCRIPT}.retry"
+  rmdir "${EXT_AUTOSTART_SCRIPT%/*}" 2>/dev/null || true
 }
 
 # Enable the extensions at the next login through a one-shot autostart entry;
 # a running Wayland shell cannot rescan them.
 install_extension_autostart() {
-  local dir="$HOME/.local/share/ubuntu-look"
-  local script="${dir}/enable-extensions.sh"
-  local desktop="$HOME/.config/autostart/ubuntu-look-enable-extensions.desktop"
-  local todo tmp e all_on=1 want='State: ACTIVE' _dock_usable=0 _wrote=0 _rc
-  seed_extensions_record
+  local script="$EXT_AUTOSTART_SCRIPT" dir="${EXT_AUTOSTART_SCRIPT%/*}"
+  local desktop="$EXT_AUTOSTART_FILE" retry="${EXT_AUTOSTART_SCRIPT}.retry"
+  local todo tmp e all_on=1 want="$EXT_RUNNING_RE" dtd _wrote=0 _rc
   todo="$(extensions_to_switch_on)"
-  if [ -z "$todo" ] && [ "$USER_THEME_RETIRE" != 1 ] \
-     && [ "${DASH_TO_DOCK_PENDING:-0}" != 1 ]; then
-    rm -f "$desktop" "$script"
-    rmdir "$dir" 2>/dev/null || true
-    [ "${EXT_RECORDED:-0}" = 1 ] || [ ! -s "$EXTENSIONS_ON_RECORD" ] \
+  if [ -z "$todo" ] && [ "$DASH_TO_DOCK_PENDING" != 1 ]; then
+    remove_extension_autostart
+    [ "$EXT_RECORDED" = 1 ] || [ ! -s "$EXTENSIONS_ON_RECORD" ] \
       || STATUS_NOCHANGE+=("Extensions were switched on before — any you turn off later stay off")
     return 0
   fi
 
-  # Nothing to schedule when the running session has all of them on.
-  if [ -n "${DBUS_SESSION_BUS_ADDRESS:-}" ] && command -v gnome-extensions >/dev/null 2>&1; then
+  # Nothing to schedule when the running session has all of them on and
+  # Dash-to-Dock needs no switch at login.
+  if [ "$DASH_TO_DOCK_PENDING" != 1 ] && [ -n "${DBUS_SESSION_BUS_ADDRESS:-}" ] \
+     && command -v gnome-extensions >/dev/null 2>&1; then
     # A locked screen switches extensions off until unlock.
     gdbus call --session --dest org.gnome.ScreenSaver --object-path /org/gnome/ScreenSaver \
-      --method org.gnome.ScreenSaver.GetActive 2>/dev/null | grep -q true && want='Enabled: Yes'
+      --method org.gnome.ScreenSaver.GetActive 2>/dev/null | grep -q true \
+      && want='Enabled: Yes|State: ENABLED$'
     for e in $todo; do
-      LC_ALL=C gnome-extensions info "$e" 2>/dev/null | grep -q "$want" || { all_on=0; break; }
+      LC_ALL=C gnome-extensions info "$e" 2>/dev/null | grep -qE "$want" || { all_on=0; break; }
     done
-    if [ $all_on -eq 1 ] && [ "$USER_THEME_RETIRE" != 1 ]; then
+    if [ $all_on -eq 1 ]; then
       # shellcheck disable=SC2086
       record_extensions_on $todo
-      rm -f "$desktop" "$script"
-      rmdir "$dir" 2>/dev/null || true
+      remove_extension_autostart
       STATUS_NOCHANGE+=("Extensions are already on — no autostart entry needed")
       return 0
     fi
   fi
 
-  ubuntu_dock_usable && _dock_usable=1
+  # Ubuntu Dock stands aside while Dash-to-Dock is on; where Ubuntu Dock
+  # cannot run, Dash-to-Dock goes back on instead.
+  if ubuntu_dock_usable; then
+    dtd="gnome-extensions disable ${DASH_TO_DOCK_UUID} 2>/dev/null || true"
+  else
+    dtd="gnome-extensions enable ${DASH_TO_DOCK_UUID} 2>/dev/null && rm -f \"${DASH_TO_DOCK_OFF}\""
+  fi
   tmp="$(mktemp)"
 
   cat << EOF > "$tmp"
 #!/bin/bash
 # One-shot, written by ubuntu-look.sh: switches on the look's extensions at
-# login, then removes itself.
+# login, then removes itself. One that fails is tried once more at the next
+# login.
 SHELL_EXTENSIONS="${todo}"
 
 # Wait up to 30 seconds for the shell to answer about an extension.
 for _i in \$(seq 1 30); do
-  for _e in \$SHELL_EXTENSIONS ${DASH_TO_DOCK_UUID} ${USER_THEME_UUID}; do
+  for _e in \$SHELL_EXTENSIONS ${DASH_TO_DOCK_UUID}; do
     gnome-extensions info "\$_e" >/dev/null 2>&1 && break 2
   done
   sleep 1
 done
 
-# Ubuntu Dock stands aside while Dash-to-Dock is on; the installer recorded it.
-# Where Ubuntu Dock cannot run, Dash-to-Dock goes back on instead.
-if [ -f "${DASH_TO_DOCK_OFF}" ]; then
-  if [ "${_dock_usable}" = 1 ]; then
-    gnome-extensions disable ${DASH_TO_DOCK_UUID} 2>/dev/null || true
-  else
-    gnome-extensions enable ${DASH_TO_DOCK_UUID} 2>/dev/null && rm -f "${DASH_TO_DOCK_OFF}"
-  fi
+# Dash-to-Dock, as the installer recorded it; on the first login only.
+if [ -f "${DASH_TO_DOCK_OFF}" ] && [ ! -f "${retry}" ]; then
+  ${dtd}
 fi
 
 # Enable through gnome-shell only; a dconf write as well would enable an
-# extension twice.
+# extension twice. Each one switched on is recorded: switched on once, the
+# user's later choices stand.
+tried=""
+failed=0
 for e in \$SHELL_EXTENSIONS; do
-  gnome-extensions enable "\$e" 2>/dev/null || true
+  grep -qxF "\$e" "${EXTENSIONS_ON_RECORD}" 2>/dev/null && continue
+  tried="\${tried} \$e"
+  if gnome-extensions enable "\$e" 2>/dev/null; then
+    mkdir -p "${BACKUP_DIR}" && printf '%s\\n' "\$e" >> "${EXTENSIONS_ON_RECORD}"
+  else
+    failed=1
+  fi
 done
 
-# user-theme carried Yaru before the theme extension did; it goes once that runs.
-if [ "${USER_THEME_RETIRE}" = 1 ]; then
-  gnome-extensions disable ${USER_THEME_UUID} 2>/dev/null \
-    && dconf reset /org/gnome/shell/extensions/user-theme/name
-fi
-
-# Fallback: remove any of them still listed in disabled-extensions.
+# Fallback: remove any tried now still listed in disabled-extensions.
 keep=""
 still=0
 for e in \$(dconf read /org/gnome/shell/disabled-extensions 2>/dev/null \\
             | sed 's/^@[a-z]* //' | tr -d "[]' " | tr ',' ' '); do
-  case " \$SHELL_EXTENSIONS " in
+  case " \$tried " in
     *" \$e "*) still=1 ;;
     *)          keep="\${keep}'\$e'," ;;
   esac
@@ -1503,14 +1715,13 @@ if [ "\$still" = 1 ]; then
   fi
 fi
 
-# Each one now on is recorded: switched on once, the user's later choices stand.
-on="\$(dconf read /org/gnome/shell/enabled-extensions 2>/dev/null)"
-for e in \$SHELL_EXTENSIONS; do
-  case "\$on" in
-    *"'\$e'"*) mkdir -p "${BACKUP_DIR}" && printf '%s\n' "\$e" >> "${EXTENSIONS_ON_RECORD}" ;;
-  esac
-done
-rm -f "${desktop}" "${script}"
+# Kept for one more login when an extension did not switch on.
+if [ "\$failed" = 1 ] && [ ! -f "${retry}" ]; then
+  : > "${retry}"
+  exit 0
+fi
+rm -f "${desktop}" "${script}" "${retry}"
+rmdir "${dir}" 2>/dev/null || true
 EOF
   install_if_changed "$tmp" "$script"; _rc=$?
   [ "$_rc" -eq 0 ] && _wrote=1
@@ -1538,6 +1749,8 @@ EOF
     STATUS_FAILED+=("Could not write ${desktop} — extensions will not be switched on automatically")
     return 0
   fi
+  # Each run's entry gets its own retry.
+  rm -f "$retry"
 
   if [ "$_wrote" -eq 1 ]; then
     if [ -n "$todo" ]; then
@@ -1559,21 +1772,42 @@ reclaim_dconf_key() {
   local full="/${path}/${key}" effective default
   command -v dconf >/dev/null 2>&1 || return 0
 
+  # No value of the user's: the profile answers already.
+  if [ -z "$(user_dconf_read "$full")" ]; then
+    GSETTINGS_UNCHANGED=$((GSETTINGS_UNCHANGED + 1))
+    return 0
+  fi
   effective="$(dconf read "$full" 2>/dev/null)"
   default="$(dconf read -d "$full" 2>/dev/null)"
 
   if [ "$effective" = "$default" ]; then
+    # A stored copy of the default goes.
     dconf reset "$full" 2>/dev/null || true
     GSETTINGS_UNCHANGED=$((GSETTINGS_UNCHANGED + 1))
   else
-    GSETTINGS_KEPT=$((GSETTINGS_KEPT + 1))
     SETTINGS_KEPT+=("${full} — yours: ${effective:-unset}, Ubuntu's: ${default:-unset}")
   fi
+}
+
+# An older fonts-ubuntu has no "Ubuntu Sans"; its fonts are "Ubuntu" and
+# "Ubuntu Mono", as that release's defaults name them. Checked once per run.
+fit_fonts_to_release() {
+  [ "$FONTS_FITTED" = 1 ] && return 0
+  FONTS_FITTED=1
+  command -v fc-list >/dev/null 2>&1 || return 0
+  fc-list -q 'Ubuntu Sans' && return 0
+  fc-list -q 'Ubuntu' || return 0
+  local i
+  for i in "${!GNOME_SETTINGS[@]}"; do
+    GNOME_SETTINGS[i]="${GNOME_SETTINGS[i]//Ubuntu Sans Mono/Ubuntu Mono}"
+    GNOME_SETTINGS[i]="${GNOME_SETTINGS[i]//Ubuntu Sans/Ubuntu}"
+  done
 }
 
 # Render GNOME_SETTINGS as dconf keyfile groups.
 render_dconf_groups() {
   local line last_path="" path key value
+  fit_fonts_to_release
   for line in "${GNOME_SETTINGS[@]}"; do
     IFS='|' read -r path key value <<< "$line"
     if [ "$path" != "$last_path" ]; then
@@ -1600,9 +1834,11 @@ reclaim_live_settings() {
   for line in "${GNOME_SETTINGS[@]}"; do
     IFS='|' read -r path key value <<< "$line"
     case "$DCONF_ONLY_KEYS" in *" $key "*) continue ;; esac
-    # Yaru-dark is the theme extension's value for the dark style.
+    # Yaru-dark and the accent variants (Yaru-purple, ...) are the theme
+    # extension's values for the colour scheme and the accent colour.
     case "$key" in
-      gtk-theme|icon-theme) [ "$(dconf read "/${path}/${key}" 2>/dev/null)" = "'Yaru-dark'" ] && continue ;;
+      gtk-theme|icon-theme)
+        case "$(dconf read "/${path}/${key}" 2>/dev/null)" in "'Yaru-"*) continue ;; esac ;;
     esac
     reclaim_dconf_key "$path" "$key"
   done
@@ -1612,18 +1848,34 @@ reclaim_live_settings() {
   done
 }
 
-# Fresh install: clear the user's own values of the look's keys, the wallpaper
-# and the dock, so Ubuntu's defaults apply. Dock favourites stay.
-apply_ubuntu_defaults() {
-  local line path key cleared="" failed=0
-  command -v dconf >/dev/null 2>&1 || return 0
-  for line in "${GNOME_SETTINGS[@]}" "$COLOR_SCHEME_KEY" "${WALLPAPER_KEYS[@]}"; do
+# Every key the look writes, as "<path> <key>", the colour scheme first: a
+# running theme extension then picks the theme once. The extension list and
+# the dock have their own steps.
+look_keys() {
+  local line path key
+  for line in "$COLOR_SCHEME_KEY" "${GNOME_SETTINGS[@]}" "${WALLPAPER_KEYS[@]}"; do
     IFS='|' read -r path key _ <<< "$line"
     case "$DCONF_ONLY_KEYS" in *" $key "*) continue ;; esac
     [ "$path" = org/gnome/shell/extensions/dash-to-dock ] && continue
-    [ -n "$(user_dconf_read "/${path}/${key}")" ] || continue
-    if dconf reset "/${path}/${key}" 2>/dev/null; then cleared="${cleared}${cleared:+, }${key}"; else failed=1; fi
+    echo "$path $key"
   done
+}
+
+# Fresh install: clear the user's own values of the look's keys, the wallpaper
+# and the dock, so Ubuntu's defaults apply. Dock favourites stay.
+apply_ubuntu_defaults() {
+  local path key value debian_light cleared="" failed=0
+  command -v dconf >/dev/null 2>&1 || return 1
+  debian_light="$(GSETTINGS_BACKEND=memory gsettings get org.gnome.desktop.background picture-uri 2>/dev/null)"
+  while read -r path key; do
+    value="$(user_dconf_read "/${path}/${key}")"
+    [ -n "$value" ] || continue
+    dconf reset "/${path}/${key}" 2>/dev/null || { failed=1; continue; }
+    # The uninstall's own dark wallpaper (Debian's picture-uri, see
+    # step_restore_gnome_settings) is not the user's choice, so it goes unreported.
+    [ "$key" = picture-uri-dark ] && [ "$value" = "$debian_light" ] && continue
+    cleared="${cleared}${cleared:+, }${key}"
+  done < <(look_keys)
   # The whole dock, including settings the table does not list.
   if [ -n "$(user_dconf dump /org/gnome/shell/extensions/dash-to-dock/)" ]; then
     if dconf reset -f /org/gnome/shell/extensions/dash-to-dock/ 2>/dev/null; then
@@ -1639,35 +1891,26 @@ apply_ubuntu_defaults() {
   rm -f "$DEFAULTS_PENDING"
   if [ -n "$cleared" ]; then
     STATUS_CHANGES+=("Ubuntu's defaults replace your own: ${cleared} — dock favourites kept; the uninstall returns Debian's defaults")
-    RELOGIN_NEEDED=1
+    # A session already on the look profile shows Ubuntu's values at once.
+    session_on_look_profile || RELOGIN_NEEDED=1
   fi
 }
 
-# True when user $1 has the per-user switch.
-look_enabled_for() {
-  local home
-  home="$(getent passwd "$1" | cut -d: -f6)"
-  [ -n "$home" ] && sudo test -f "${home}/${LOOK_ENV_REL}"
+# A blank line and the background group for wallpapers $1 (light) and $2
+# (dark); a missing dark wallpaper falls back to the light one.
+background_group() {
+  local dark="$2"
+  [ -f "$dark" ] || dark="$1"
+  printf "\n[org/gnome/desktop/background]\npicture-uri='file://%s'\npicture-uri-dark='file://%s'" "$1" "$dark"
 }
 
-# Add the per-user switch for another registered user, written as that user.
-enable_look_for_other_user() {
-  sudo -u "$1" -H sh -c 'f="$HOME/$2"; mkdir -p "${f%/*}" && printf "%s\n" "$1" > "$f"' \
-    _ "$(look_env_content)" "$LOOK_ENV_REL" 2>/dev/null
-}
-
-# The system side of the look: Ubuntu's defaults database, the look profile,
-# the session-migration mask and the retirement of earlier versions' defaults.
+# The system side of the look: Ubuntu's defaults database, the look profile
+# and the session-migration mask.
 write_dconf_profile() {
   local wp_light="$1" wp_dark="$2" bg_block=""
-  # A missing dark wallpaper falls back to the light one.
-  [ -f "$wp_dark" ] || wp_dark="$wp_light"
   # Background keys only when the wallpaper file exists.
   if [ -f "$wp_light" ]; then
-    bg_block="
-[org/gnome/desktop/background]
-picture-uri='file://${wp_light}'
-picture-uri-dark='file://${wp_dark}'
+    bg_block="$(background_group "$wp_light" "$wp_dark")
 picture-options='zoom'
 
 [org/gnome/desktop/screensaver]
@@ -1677,40 +1920,9 @@ picture-uri='file://${wp_light}'"
     message warn "run 'bash ubuntu-look.sh 1-desktop-base' (or a full run) first to install ubuntu-wallpapers"
   fi
 
-  # Earlier versions applied the defaults to every user. Registered users get
-  # the per-user switch; the old defaults go once every session reads it.
-  local u _pid pending=""
-  if [ -f "$LEGACY_DB_FILE" ]; then
-    for u in $(cat "$SYS_USERS" 2>/dev/null); do
-      [ "$u" = "$RUN_USER" ] && continue
-      getent passwd "$u" > /dev/null || continue
-      look_enabled_for "$u" && continue
-      if [ "$REFRESH" != 1 ] && enable_look_for_other_user "$u"; then
-        STATUS_CHANGES+=("The look stays enabled for ${u} (per-user switch added)")
-      else
-        pending="${pending} ${u}"
-      fi
-    done
-    # A session still on the old defaults would lose the look; wait for re-login.
-    for u in $(cat "$SYS_USERS" 2>/dev/null) "$RUN_USER"; do
-      _pid="$(pgrep -u "$u" -x gnome-shell 2>/dev/null | head -1)"
-      [ -n "$_pid" ] || continue
-      sudo grep -qa "DCONF_PROFILE=${LOOK_PROFILE_NAME}" "/proc/${_pid}/environ" 2>/dev/null \
-        || { pending="${pending} ${u}"; break; }
-    done
-  fi
-  if [ -n "$pending" ]; then
-    STATUS_NOCHANGE+=("The machine-wide defaults of earlier versions stay until every user of the look has logged in again; a later run removes them")
-  else
-    retire_legacy_defaults
-    case $? in
-      0) STATUS_CHANGES+=("Removed the machine-wide defaults of earlier versions — other users keep Debian's look") ;;
-      2) STATUS_FAILED+=("The machine-wide defaults of earlier versions could not all be removed") ;;
-    esac
-  fi
   write_look_profile
   case $? in
-    0) STATUS_CHANGES+=("dconf profile for users of the look → ${LOOK_PROFILE}") ;;
+    0) STATUS_CHANGES+=("dconf profile for users of the look → ${LOOK_PROFILE}"); RELOGIN_NEEDED=1 ;;
     2) STATUS_FAILED+=("${LOOK_PROFILE} could not be written — the look cannot apply") ;;
   esac
   mask_session_migration
@@ -1729,26 +1941,18 @@ picture-uri='file://${wp_light}'"
     echo "$bg_block"
   } > "$tmp"
 
-  if [ ! -f "$LOOK_DB_FILE" ] || ! cmp -s "$tmp" "$LOOK_DB_FILE"; then
-    if ! sudo install -D -m 0644 "$tmp" "$LOOK_DB_FILE"; then
-      STATUS_FAILED+=("${LOOK_DB_FILE} could not be written — Ubuntu's defaults are not updated")
-    elif compile_dconf; then
-      STATUS_CHANGES+=("Ubuntu's defaults written → ${LOOK_DB_FILE}")
-      RELOGIN_NEEDED=1
-    fi
-  elif dconf_db_stale "$LOOK_DB_NAME"; then
-    # A run stopped before dconf update.
-    compile_dconf && { STATUS_CHANGES+=("Ubuntu's defaults compiled → /etc/dconf/db/${LOOK_DB_NAME}"); RELOGIN_NEEDED=1; }
-  else
-    STATUS_NOCHANGE+=("Ubuntu's defaults already current")
-  fi
+  sudo_install_if_changed "$tmp" "$LOOK_DB_FILE"
+  case $? in
+    0) compile_dconf && { STATUS_CHANGES+=("Ubuntu's defaults written → ${LOOK_DB_FILE}"); RELOGIN_NEEDED=1; } ;;
+    2) STATUS_FAILED+=("${LOOK_DB_FILE} could not be written — Ubuntu's defaults are not updated") ;;
+    *) if dconf_db_stale "$LOOK_DB_NAME"; then
+         # A run stopped before dconf update.
+         compile_dconf && { STATUS_CHANGES+=("Ubuntu's defaults compiled → /etc/dconf/db/${LOOK_DB_NAME}"); RELOGIN_NEEDED=1; }
+       else
+         STATUS_NOCHANGE+=("Ubuntu's defaults already current")
+       fi ;;
+  esac
   rm -f "$tmp"
-
-  # Remove the database under its earlier name.
-  if [ -e "/etc/dconf/db/${OLD_LOOK_DB_NAME}.d" ] || [ -e "/etc/dconf/db/${OLD_LOOK_DB_NAME}" ]; then
-    sudo rm -rf "/etc/dconf/db/${OLD_LOOK_DB_NAME}.d" "/etc/dconf/db/${OLD_LOOK_DB_NAME}" \
-      && STATUS_CHANGES+=("Ubuntu's defaults moved to /etc/dconf/db/${LOOK_DB_NAME}")
-  fi
 }
 
 install_greeter_extension() {
@@ -1769,9 +1973,13 @@ export default class UbuntuLookGreeter extends Extension {
             return;
         Main.setThemeStylesheet(STYLESHEET);
         Main.loadTheme();
+        this._applied = true;
     }
 
     disable() {
+        if (!this._applied)
+            return;
+        this._applied = false;
         Main.setThemeStylesheet(null);
         Main.loadTheme();
     }
@@ -1820,9 +2028,8 @@ EOF
     printf '%s\n' $_made | sudo tee "$LOCAL_SHELL_DIRS_FILE" > /dev/null
   fi
   for f in metadata.json extension.js; do
-    if ! readable_regular_file "${dir}/${f}" || ! cmp -s "${tmp}/${f}" "${dir}/${f}" 2>/dev/null; then
-      if sudo install -Dm 0644 "${tmp}/${f}" "${dir}/${f}"; then changed=1; else failed=1; fi
-    fi
+    sudo_install_if_changed "${tmp}/${f}" "${dir}/${f}"
+    case $? in 0) changed=1 ;; 2) failed=1 ;; esac
   done
   rm -rf "$tmp"
   if [ "$failed" -eq 1 ]; then
@@ -1830,19 +2037,24 @@ EOF
     return 1
   elif [ $changed -eq 1 ]; then
     STATUS_CHANGES+=("${label} → ${dir}")
+    # GNOME Shell loads extension code only when it starts.
+    RELOGIN_NEEDED=1
   else
     STATUS_NOCHANGE+=("${label} already current")
   fi
 }
 
 # Ubuntu's shell theme: Yaru light or dark following the colour scheme, also in
-# the lock screen. Moves the GTK and icon themes between Yaru and Yaru-dark;
-# any other theme is left alone.
+# the lock screen. As on Ubuntu, a Yaru GTK theme, and a Yaru icon theme with
+# it, follow changes of the colour scheme and the accent colour; any other GTK
+# theme is left alone. The Dark Style toggle, as on Ubuntu, also moves the
+# icon theme to Yaru.
 install_theme_extension() {
   install_local_extension "$THEME_EXT_UUID" "Shell theme extension" \
     "Ubuntu look" "Yaru on the desktop and the lock screen, light or dark, as on Ubuntu." \
     '"user", "unlock-dialog"' << 'EOF'
 import Gio from 'gi://Gio';
+import GLib from 'gi://GLib';
 import St from 'gi://St';
 
 import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
@@ -1855,8 +2067,17 @@ const SESSION = {
     colorScheme: 'prefer-light',
 };
 
-// Set by Ubuntu's Appearance panel along with the colour scheme.
-const FOLLOWERS = ['gtk-theme', 'icon-theme'];
+// Ubuntu's Yaru variant for each accent colour; orange is plain Yaru.
+const YARU_VARIANTS = {
+    blue: 'blue', teal: 'prussiangreen', green: 'olive',
+    yellow: 'yellow', orange: 'default', red: 'red', pink: 'magenta',
+    purple: 'purple', slate: 'sage',
+};
+// Yaru variants Ubuntu's libadwaita accepts in a theme name; the last two
+// are older ones it maps to current variants.
+const YARU_KNOWN = ['default', 'blue', 'prussiangreen', 'olive', 'yellow', 'red',
+    'magenta', 'purple', 'sage', 'bark', 'viridian'];
+const YARU_MIGRATED = {bark: 'default', viridian: 'olive'};
 
 export default class UbuntuLookTheme extends Extension {
     enable() {
@@ -1878,14 +2099,37 @@ export default class UbuntuLookTheme extends Extension {
             this._reload();
         }
         this._interface = new Gio.Settings({schema_id: 'org.gnome.desktop.interface'});
+        // GNOME before 47 has no accent colour; the theme stays plain Yaru.
+        this._hasAccent = this._interface.settings_schema.has_key('accent-color');
         this._schemeId = this._interface.connect('changed::color-scheme',
-            () => this._syncThemes());
-        this._syncThemes();
+            () => this._followAppearance());
+        this._accentId = this._hasAccent
+            ? this._interface.connect('changed::accent-color', () => this._followAppearance())
+            : 0;
+        // Only a change moves the themes, as on Ubuntu; a Yaru theme left light
+        // under a dark style (or the reverse) while this was off is set right.
+        const gtk = this._interface.get_string('gtk-theme');
+        if (gtk.startsWith('Yaru') && gtk.endsWith('-dark') !==
+            (this._interface.get_string('color-scheme') === 'prefer-dark'))
+            this._followAppearance();
+        this._hookDarkToggle();
     }
 
     disable() {
+        if (this._hookRetryId) {
+            GLib.source_remove(this._hookRetryId);
+            this._hookRetryId = 0;
+        }
+        this._hookTries = 0;
+        if (this._darkToggle) {
+            // The toggle's own method, from its class, applies again.
+            delete this._darkToggle._toggleMode;
+            this._darkToggle = null;
+        }
         if (this._interface) {
             this._interface.disconnect(this._schemeId);
+            if (this._accentId)
+                this._interface.disconnect(this._accentId);
             this._interface = null;
         }
         if (!this._saved)
@@ -1904,18 +2148,116 @@ export default class UbuntuLookTheme extends Extension {
         St.Settings.get().notify('color-scheme');
     }
 
-    _syncThemes() {
-        const want = this._interface.get_string('color-scheme') === 'prefer-dark'
-            ? 'Yaru-dark' : 'Yaru';
-        for (const key of FOLLOWERS) {
-            const now = this._interface.get_string(key);
-            if (now === want || (now !== 'Yaru' && now !== 'Yaru-dark'))
-                continue;
-            if (this._interface.get_default_value(key)?.unpack() === want)
-                this._interface.reset(key);
-            else
-                this._interface.set_string(key, want);
+    // Ubuntu's Dark Style toggle (gnome-shell patch "darkMode: Add support to
+    // Yaru theme color variants"): the screen transition starts, then the
+    // colour scheme and, with a Yaru GTK theme, the Yaru themes are written.
+    _hookDarkToggle() {
+        const toggle = Main.panel?.statusArea?.quickSettings?._darkMode
+            ?.quickSettingsItems?.[0];
+        if (typeof toggle?._toggleMode !== 'function') {
+            // Quick Settings adds its indicators asynchronously at startup.
+            this._hookTries = (this._hookTries ?? 0) + 1;
+            if (this._hookTries <= 50) {
+                this._hookRetryId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 100, () => {
+                    this._hookRetryId = 0;
+                    this._hookDarkToggle();
+                    return GLib.SOURCE_REMOVE;
+                });
+            }
+            return;
         }
+        this._hookTries = 0;
+        this._darkToggle = toggle;
+        toggle._toggleMode = () => {
+            Main.layoutManager.screenTransition.run();
+            const preferDark = !toggle.checked;
+            this._toggling = true;
+            this._interface.set_string('color-scheme',
+                toggle.checked ? 'default' : 'prefer-dark');
+            this._toggling = false;
+
+            if (this._interface.get_string('gtk-theme').split('-')[0] === 'Yaru')
+                this._setYaruSettings(preferDark);
+        };
+    }
+
+    _setYaruSettings(preferDark) {
+        const currentlyDark =
+            this._interface.get_string('gtk-theme').endsWith('-dark') &&
+            this._interface.get_string('icon-theme').endsWith('-dark');
+
+        if (currentlyDark !== preferDark) {
+            const newTheme = this._yaruTheme(this._accentVariant(), preferDark);
+            this._setTheme('gtk-theme', newTheme);
+            this._setTheme('icon-theme', newTheme);
+        }
+
+        const schemaSource = Gio.SettingsSchemaSource.get_default();
+        const geditSchema = schemaSource.lookup('org.gnome.gedit.preferences.editor', true);
+
+        if (geditSchema) {
+            const geditSettings = Gio.Settings.new_full(geditSchema, null, null);
+            const geditScheme = geditSettings.get_user_value('scheme')?.unpack();
+
+            if (geditScheme?.startsWith('Yaru') &&
+                geditScheme.endsWith('-dark') !== preferDark)
+                geditSettings.set_string('scheme', `Yaru${preferDark ? '-dark' : ''}`);
+        }
+    }
+
+    // Ubuntu's Appearance panel (gnome-control-center patch "background: Update
+    // legacy theme settings matching the accent color"), which Debian's
+    // Settings lacks: after the colour scheme or the accent colour changes,
+    // a Yaru GTK theme and a Yaru icon theme follow them. Settings has already
+    // started the screen transition.
+    _followAppearance() {
+        if (this._toggling)
+            return;
+        if (this._themeVariant() === null)
+            return;
+        const dark = this._interface.get_string('color-scheme') === 'prefer-dark';
+        const theme = this._yaruTheme(this._accentVariant(), dark);
+
+        this._setTheme('gtk-theme', theme);
+        const icons = this._interface.get_string('icon-theme');
+        if (!icons || icons.startsWith('Yaru'))
+            this._setTheme('icon-theme', theme);
+    }
+
+    // The Yaru variant of the GTK theme, as Ubuntu's libadwaita reads it;
+    // null when the GTK theme is not Yaru.
+    _themeVariant() {
+        const theme = this._interface.get_string('gtk-theme');
+        if (theme === 'Yaru' || theme === 'Yaru-dark')
+            return 'default';
+        if (!theme.startsWith('Yaru-'))
+            return null;
+        const variant = theme.split('-')[1];
+        if (!YARU_KNOWN.includes(variant))
+            return null;
+        return YARU_MIGRATED[variant] ?? variant;
+    }
+
+    // The Yaru variant for the accent colour; GNOME before 47 has none.
+    _accentVariant() {
+        if (!this._hasAccent)
+            return this._themeVariant() ?? 'default';
+        return YARU_VARIANTS[this._interface.get_string('accent-color')] ?? 'default';
+    }
+
+    _yaruTheme(variant, dark) {
+        return `Yaru${variant !== 'default' ? `-${variant}` : ''}${dark ? '-dark' : ''}`;
+    }
+
+    // Writes the theme key only when it changes. A theme equal to the system
+    // default is reset instead of stored, so the default stays in one place.
+    _setTheme(key, value) {
+        if (this._interface.get_string(key) === value)
+            return;
+        if (this._interface.get_default_value(key)?.unpack() === value)
+            this._interface.reset(key);
+        else
+            this._interface.set_string(key, value);
     }
 }
 EOF
@@ -1953,29 +2295,32 @@ write_greeter_dconf_profile() {
     return 0
   fi
 
+  local verb
   if [ ! -e "$target" ]; then
-    sudo install -d -m 0755 /etc/dconf/profile
     # Record first, so an interrupted run still leaves a record.
     sys_records_dir
+    [ -d /etc/dconf/profile ] || sudo touch "$DCONF_PROFILE_DIR_MADE"
+    sudo install -d -m 0755 /etc/dconf/profile
     sudo touch "$created"
-    # install creates the file itself rather than opening an existing path.
-    if printf '%s\n' "$want" | sudo install -m 0644 /dev/stdin "$target"; then
-      STATUS_CHANGES+=("Created ${target} so the login screen reads its database")
-    else
-      sudo rm -f "$created"
-      STATUS_FAILED+=("${target} could not be created — the login screen keeps Debian's look")
-    fi
+    verb=Created
   elif [ ! -f "$target" ]; then
     message warn "${target} is not a regular file — leaving it alone"
     STATUS_NOCHANGE+=("${target} is not a regular file and was left alone; the login screen may not pick up the theme")
     return 0
   elif [ -f "$created" ] && ! printf '%s\n' "$want" | cmp -s - "$target"; then
     # Only a profile this script created is repaired.
-    if printf '%s\n' "$want" | sudo install -m 0644 /dev/stdin "$target"; then
-      STATUS_CHANGES+=("Repaired ${target} so the login screen reads its database")
-    else
-      STATUS_FAILED+=("${target} could not be repaired")
-    fi
+    verb=Repaired
+  else
+    return 0
+  fi
+  # install creates the file itself rather than opening an existing path.
+  if printf '%s\n' "$want" | sudo install -m 0644 /dev/stdin "$target"; then
+    STATUS_CHANGES+=("${verb} ${target} so the login screen reads its database")
+  elif [ "$verb" = Created ]; then
+    sudo rm -f "$created"
+    STATUS_FAILED+=("${target} could not be created — the login screen keeps Debian's look")
+  else
+    STATUS_FAILED+=("${target} could not be repaired")
   fi
 }
 
@@ -1985,7 +2330,6 @@ write_gdm_profile() {
     STATUS_NOCHANGE+=("GDM is not installed — login screen left alone")
     return 0
   fi
-  [ -f "$wp_dark" ] || wp_dark="$wp_light"
 
   # The login screen reads the profile of Debian's greeter user, Debian-gdm;
   # the gdm profile is written too, so the two agree.
@@ -1995,13 +2339,7 @@ write_gdm_profile() {
   fi
 
   # Ubuntu sets the wallpaper on the greeter as well.
-  if [ -f "$wp_light" ]; then
-    bg_block="
-[org/gnome/desktop/background]
-picture-uri='file://${wp_light}'
-picture-uri-dark='file://${wp_dark}'
-show-desktop-icons=false"
-  fi
+  [ -f "$wp_light" ] && bg_block="$(background_group "$wp_light" "$wp_dark")"
 
   install_greeter_extension
   # Listed only when on disk; this replaces the greeter's list.
@@ -2019,6 +2357,7 @@ enabled-extensions=['${GREETER_EXT_UUID}']"
 
   # The theme and font values of Ubuntu's defaults, as Ubuntu's greeter has them.
   local tmp line path key value iface=""
+  fit_fonts_to_release
   for line in "${GNOME_SETTINGS[@]}"; do
     IFS='|' read -r path key value <<< "$line"
     [ "$path" = org/gnome/desktop/interface ] || continue
@@ -2036,55 +2375,37 @@ ${ext_block}
 ${bg_block}
 EOF
 
-  if readable_regular_file "$GDM_PROFILE_FILE" && cmp -s "$tmp" "$GDM_PROFILE_FILE"; then
-    rm -f "$tmp"
-    if dconf_db_stale gdm; then
-      compile_dconf && STATUS_CHANGES+=("Login screen defaults compiled → /etc/dconf/db/gdm")
-    elif [ "$_reader" -eq 1 ]; then
-      STATUS_NOCHANGE+=("Login screen theme already current")
-    else
-      STATUS_NOCHANGE+=("${GDM_PROFILE_FILE} is current, but no greeter profile reads it — login screen unchanged")
-    fi
-    return 0
-  fi
-
   if [ ! -d "$GDM_PROFILE_DIR" ]; then
     sys_records_dir; sudo touch "${SYS_RECORDS}/dconf-gdm-dir-created"
   fi
-  if ! sudo install -Dm 0644 "$tmp" "$GDM_PROFILE_FILE"; then
-    rm -f "$tmp"
-    STATUS_FAILED+=("${GDM_PROFILE_FILE} could not be written — login screen unchanged")
-    return 0
-  fi
+  sudo_install_if_changed "$tmp" "$GDM_PROFILE_FILE"
+  case $? in
+    0) compile_dconf && if [ "$_reader" -eq 1 ]; then
+         STATUS_CHANGES+=("Login screen themed → ${GDM_PROFILE_FILE}")
+         RELOGIN_NEEDED=1
+       else
+         STATUS_NOCHANGE+=("${GDM_PROFILE_FILE} written, but no greeter profile reads it — login screen unchanged")
+       fi ;;
+    1) if dconf_db_stale gdm; then
+         compile_dconf && { STATUS_CHANGES+=("Login screen defaults compiled → /etc/dconf/db/gdm"); RELOGIN_NEEDED=1; }
+       elif [ "$_reader" -eq 1 ]; then
+         STATUS_NOCHANGE+=("Login screen theme already current")
+       else
+         STATUS_NOCHANGE+=("${GDM_PROFILE_FILE} is current, but no greeter profile reads it — login screen unchanged")
+       fi ;;
+    2) STATUS_FAILED+=("${GDM_PROFILE_FILE} could not be written — login screen unchanged") ;;
+  esac
   rm -f "$tmp"
-  compile_dconf || return 0
-  if [ "$_reader" -eq 1 ]; then
-    STATUS_CHANGES+=("Login screen themed → ${GDM_PROFILE_FILE}")
-  else
-    STATUS_NOCHANGE+=("${GDM_PROFILE_FILE} written, but no greeter profile reads it — login screen unchanged")
-  fi
+  return 0
 }
 
-retire_user_theme() {
-  local en name
-  en="$(extension_uuids /org/gnome/shell/enabled-extensions)"
-  in_word_list "$USER_THEME_UUID" "$en" || return 0
-  name="$(dconf read /org/gnome/shell/extensions/user-theme/name 2>/dev/null | tr -d "'")"
-  case "$name" in ''|Yaru|Yaru-dark) ;; *) return 0 ;; esac
-  # Without the theme extension (GNOME Shell before 45), user-theme keeps Yaru.
-  extension_installed "$THEME_EXT_UUID" || return 0
-  if ! extension_active "$THEME_EXT_UUID"; then
-    USER_THEME_RETIRE=1
-    STATUS_CHANGES+=("user-theme is switched off at your next login — the theme extension takes its place")
-    return 0
-  fi
-  if dconf write /org/gnome/shell/enabled-extensions \
-       "$(gvariant_string_array "$(word_list_without "$en" "$USER_THEME_UUID")")" 2>/dev/null; then
-    dconf reset /org/gnome/shell/extensions/user-theme/name 2>/dev/null || true
-    STATUS_CHANGES+=("user-theme switched off — the theme extension carries Yaru now")
-  else
-    STATUS_FAILED+=("user-theme could not be switched off — it draws over the theme extension")
-  fi
+# The gnome-terminal profiles marked as the look's, one uuid per line.
+marked_terminal_profiles() {
+  local one
+  for one in $(dconf list "${TERMINAL_PROFILES}/" 2>/dev/null | sed -n 's#^:\(.*\)/$#\1#p'); do
+    [ "$(dconf read "${TERMINAL_PROFILES}/:${one}/ubuntu-look-managed" 2>/dev/null)" = true ] && echo "$one"
+  done
+  return 0
 }
 
 install_terminal_profile() {
@@ -2097,28 +2418,22 @@ install_terminal_profile() {
     return 0
   fi
 
-  local uuid created=0
+  local uuid created=0 fresh=0 managed=""
   uuid="$(sed -n 's/^uuid=//p' "$TERMINAL_PROFILE_RECORD" 2>/dev/null | head -1 | tr -d '\r')"
+  [ -n "$uuid" ] && managed="$(dconf read "${TERMINAL_PROFILES}/:${uuid}/ubuntu-look-managed" 2>/dev/null)"
 
-  # No record: adopt a profile marked as ours, else an unmarked "Ubuntu" one
-  # whose colours all match; otherwise make a new one.
+  # Deleted in gnome-terminal (unlisted, keys cleared): the user's choice stays.
+  if [ -n "$uuid" ] && [ "$managed" != true ] \
+     && ! in_word_list "$uuid" "$(dconf_array_items "${TERMINAL_PROFILES}/list")"; then
+    STATUS_NOCHANGE+=("Ubuntu terminal profile left out — you deleted it")
+    return 0
+  fi
+
+  # No record: adopt a profile marked as ours (a user's own profile named
+  # Ubuntu is never taken); otherwise make a new one.
   if [ -z "$uuid" ]; then
-    local _cand _p _best="" _marked=""
-    for _cand in $(dconf list "${TERMINAL_PROFILES}/" 2>/dev/null | sed -n 's#^:\(.*\)/$#\1#p'); do
-      _p="${TERMINAL_PROFILES}/:${_cand}"
-      if [ "$(dconf read "${_p}/ubuntu-look-managed" 2>/dev/null)" = true ]; then
-        _marked="$_cand"
-        break
-      fi
-      [ -n "$_best" ] && continue
-      [ "$(dconf read "${_p}/visible-name" 2>/dev/null | tr -d \')" = Ubuntu ] || continue
-      [ "$(dconf read "${_p}/use-theme-colors" 2>/dev/null)" = false ] || continue
-      [ "$(dconf read "${_p}/background-color" 2>/dev/null | tr -d \')" = "$TERMINAL_BACKGROUND" ] || continue
-      [ "$(dconf read "${_p}/foreground-color" 2>/dev/null | tr -d \')" = "$TERMINAL_FOREGROUND" ] || continue
-      [ "$(dconf read "${_p}/palette" 2>/dev/null | tr -d ' ')" = "$(printf '%s' "$TERMINAL_PALETTE" | tr -d ' ')" ] || continue
-      _best="$_cand"
-    done
-    uuid="${_marked:-$_best}"
+    fresh=1
+    uuid="$(marked_terminal_profiles | head -1)"
     if [ -z "$uuid" ]; then
       uuid="$(cat /proc/sys/kernel/random/uuid 2>/dev/null)"
       if [ -z "$uuid" ]; then
@@ -2127,13 +2442,17 @@ install_terminal_profile() {
       fi
       created=1
     fi
-    mkdir -p "$BACKUP_DIR"
-    printf 'uuid=%s\n' "$uuid" > "$TERMINAL_PROFILE_RECORD"
     [ "$created" -eq 1 ] || message "adopting the existing Ubuntu terminal profile (${uuid})"
   fi
 
   local base="${TERMINAL_PROFILES}/:${uuid}" changed=0 key val _write_failed=0
-  for key in "ubuntu-look-managed|true" \
+  # A recorded profile is the user's to change; only a new or adopted one is written.
+  local write_keys=1
+  if [ "$fresh" -eq 0 ] && [ "$managed" = true ]; then
+    write_keys=0
+    STATUS_NOCHANGE+=("Terminal: the Ubuntu profile is left as you set it")
+  fi
+  [ "$write_keys" -eq 1 ] && for key in "ubuntu-look-managed|true" \
              "visible-name|'Ubuntu'" \
              "use-theme-colors|false" \
              "background-color|'${TERMINAL_BACKGROUND}'" \
@@ -2145,6 +2464,13 @@ install_terminal_profile() {
       = "$(printf '%s' "$val" | tr -d '[:space:]')" ] && continue
     if dconf write "${base}/${key}" "$val" 2>/dev/null; then changed=1; else _write_failed=1; fi
   done
+  # A new or adopted profile is recorded only once fully written: an unwritten
+  # one is not taken for one the user deleted, and a partly written one is
+  # adopted by its mark and finished on the next run.
+  if [ "$fresh" -eq 1 ] && [ "$_write_failed" -eq 0 ]; then
+    mkdir -p "$BACKUP_DIR"
+    printf 'uuid=%s\n' "$uuid" > "$TERMINAL_PROFILE_RECORD"
+  fi
 
   # Add the profile to the list; unset means gnome-terminal's default list.
   local list
@@ -2183,9 +2509,9 @@ install_terminal_profile() {
     else
       STATUS_CHANGES+=("Terminal: Ubuntu profile applied")
     fi
-    RELOGIN_NEEDED=1
+    # gnome-terminal applies profile changes at once.
   else
-    [ "$_write_failed" -eq 0 ] \
+    [ "$_write_failed" -eq 0 ] && [ "$write_keys" -eq 1 ] \
       && STATUS_NOCHANGE+=("Terminal: Ubuntu profile already current")
   fi
 }
@@ -2269,9 +2595,7 @@ PYEOF
 }
 
 install_app_grid_icon() {
-  local src="" c tmp _icon_rc=0 _icon_raw=0
-  remove_user_icon "$APP_GRID_ICON_OLD" \
-    && STATUS_CHANGES+=("Show Applications icon moved into the Yaru theme; plain Debian sessions keep their own")
+  local src="" c tmp _icon_rc=0 _changed_note="" _current_note=""
   for c in /usr/share/desktop-base/debian-logos/logo.svg \
            /usr/share/desktop-base/debian-logos/openlogo-nd.svg \
            /usr/share/desktop-base/debian-logos/openlogo.svg \
@@ -2285,11 +2609,15 @@ install_app_grid_icon() {
   if [ -z "$src" ]; then
     src="$(find /usr/share/desktop-base /usr/share/icons/hicolor/scalable \
                 -maxdepth 4 -iname '*logo*.svg' 2>/dev/null \
-           | grep -viE 'text|version' | head -1)"
+           | grep -viE 'text|version|nologo|background' | head -1)"
   fi
 
   if [ -z "$src" ]; then
     STATUS_NOCHANGE+=("No Debian logo on this system — Show Applications keeps the generic grid")
+    return 0
+  fi
+  if ! command -v python3 > /dev/null 2>&1; then
+    STATUS_NOCHANGE+=("Show Applications button left alone — python3 is not installed")
     return 0
   fi
 
@@ -2302,7 +2630,11 @@ install_app_grid_icon() {
       return 0
     fi
     cp "$src" "$tmp"
-    _icon_raw=1
+    local why="its viewBox could not be read"
+    python3 -c 'import gi; gi.require_version("GdkPixbuf", "2.0"); from gi.repository import GdkPixbuf' \
+      2>/dev/null || why="python3-gi is not installed"
+    _changed_note=" — copied unscaled, ${why}"
+    _current_note=" — an unscaled copy; ${why}"
   fi
 
   install_if_changed "$tmp" "$APP_GRID_ICON"; _icon_rc=$?
@@ -2314,18 +2646,10 @@ install_app_grid_icon() {
   # No icon cache is needed: GTK finds uncached user icons. An unscaled copy
   # is reported on every run.
   if [ "$_icon_rc" -eq 0 ]; then
-    if [ "$_icon_raw" -eq 1 ]; then
-      STATUS_CHANGES+=("Show Applications button now uses $(basename "$src") — copied unscaled, its viewBox could not be read")
-    else
-      STATUS_CHANGES+=("Show Applications button now uses $(basename "$src")")
-    fi
+    STATUS_CHANGES+=("Show Applications button now uses ${src##*/}${_changed_note}")
     RELOGIN_NEEDED=1
   else
-    if [ "$_icon_raw" -eq 1 ]; then
-      STATUS_NOCHANGE+=("Show Applications button icon already current — an unscaled copy; its viewBox could not be read")
-    else
-      STATUS_NOCHANGE+=("Show Applications button icon already current")
-    fi
+    STATUS_NOCHANGE+=("Show Applications button icon already current${_current_note}")
   fi
   rm -f "$tmp"
 }
@@ -2353,33 +2677,67 @@ plymouth_current_theme() {
   printf '%s' "$t"
 }
 
+# Save plymouthd.conf once, before the look first changes the theme; an
+# absent file is saved as an empty record with ".absent".
+save_plymouth_conf() {
+  [ -f "$PLYMOUTH_CONF_BEFORE" ] || [ -f "${PLYMOUTH_CONF_BEFORE}.absent" ] && return 0
+  sys_records_dir
+  if [ -f "$PLYMOUTH_CONF" ]; then
+    sudo cp -p "$PLYMOUTH_CONF" "$PLYMOUTH_CONF_BEFORE"
+  else
+    sudo touch "${PLYMOUTH_CONF_BEFORE}.absent"
+  fi
+}
+
+# True when Plymouth theme $1 is installed.
+plymouth_theme_installed() { plymouth-set-default-theme -l 2>/dev/null | grep -qxF -- "$1"; }
+
+# Forget the boot splash theme records: the theme before, the one set, and
+# the saved plymouthd.conf.
+drop_plymouth_records() {
+  sudo rm -f "$PLYMOUTH_BEFORE_FILE" "${SYS_RECORDS}/plymouth-theme-set.txt" \
+    "$PLYMOUTH_CONF_BEFORE" "${PLYMOUTH_CONF_BEFORE}.absent"
+}
+
+# Set boot splash theme $1 back: the saved plymouthd.conf when it gives that
+# theme, so the file is as Debian shipped it; else by name.
+put_back_plymouth_theme() {
+  # A theme no longer installed cannot come back; nothing is touched, and the
+  # records stay for a later try.
+  plymouth_theme_installed "$1" || return 1
+  if [ -f "$PLYMOUTH_CONF_BEFORE" ]; then
+    sudo install -m 0644 "$PLYMOUTH_CONF_BEFORE" "$PLYMOUTH_CONF" || return 1
+  elif [ -f "${PLYMOUTH_CONF_BEFORE}.absent" ]; then
+    sudo rm -f "$PLYMOUTH_CONF" || return 1
+  fi
+  [ "$(plymouth_current_theme)" = "$1" ] || sudo plymouth-set-default-theme "$1" || return 1
+  # Kept until the theme is back, so a failed attempt can be retried from it.
+  sudo rm -f "$PLYMOUTH_CONF_BEFORE" "${PLYMOUTH_CONF_BEFORE}.absent"
+}
+
 # Read GRUB_CMDLINE_LINUX_DEFAULT from /etc/default/grub. Prints
 # "<state> <value>"; state is active (value follows), commented, absent, or
 # unparsable (not safe to rewrite). Strict, because a grub file that no
 # longer parses as shell breaks every later update-grub.
 read_grub_cmdline() {
-  local file=/etc/default/grub n line val q body rest
+  local file=/etc/default/grub line val q body rest
   # Unreadable is not absent: callers drop their record on absent.
   if [ -e "$file" ] && [ ! -r "$file" ]; then
     printf 'unparsable \n'; return 0
   fi
   [ -r "$file" ] || { printf 'absent \n'; return 0; }
 
-  n="$(grep -cE '^[[:space:]]*(export[[:space:]]+)?GRUB_CMDLINE_LINUX_DEFAULT=' "$file" 2>/dev/null)"
-  # Two active assignments are not safe to rewrite.
-  if [ "${n:-0}" -gt 1 ]; then
-    printf 'unparsable \n'; return 0
-  fi
-  if [ "${n:-0}" -eq 0 ]; then
-    if grep -qE '^[[:space:]]*#[[:space:]]*(export[[:space:]]+)?GRUB_CMDLINE_LINUX_DEFAULT=' "$file" 2>/dev/null; then
+  line="$(grep -E "$GRUB_KEY_RE" "$file" 2>/dev/null)"
+  if [ -z "$line" ]; then
+    if grep -qE "^[[:space:]]*#${GRUB_KEY_RE#^}" "$file" 2>/dev/null; then
       printf 'commented \n'
     else
       printf 'absent \n'
     fi
     return 0
   fi
-
-  line="$(grep -m1 -E '^[[:space:]]*(export[[:space:]]+)?GRUB_CMDLINE_LINUX_DEFAULT=' "$file")"
+  # Two active assignments are not safe to rewrite.
+  case "$line" in *$'\n'*) printf 'unparsable \n'; return 0 ;; esac
   val="${line#*=}"
 
   # An unquoted value is one word with nothing after it; a comment or shell
@@ -2434,9 +2792,9 @@ write_grub_cmdline() {
   tmp="$(mktemp)" || return 1
 
   # Passed through the environment: awk -v would eat backslashes.
-  val="$val" awk '
+  val="$val" awk -v re="$GRUB_KEY_RE" '
     BEGIN { swapped = 0; val = ENVIRON["val"] }
-    !swapped && /^[[:space:]]*(export[[:space:]]+)?GRUB_CMDLINE_LINUX_DEFAULT=/ {
+    !swapped && $0 ~ re {
       match($0, /^[[:space:]]*(export[[:space:]]+)?/)
       pre = substr($0, 1, RLENGTH)
       match($0, /GRUB_CMDLINE_LINUX_DEFAULT=/)
@@ -2455,7 +2813,7 @@ write_grub_cmdline() {
     END { if (!swapped) printf "GRUB_CMDLINE_LINUX_DEFAULT=\"%s\"\n", val }
   ' /etc/default/grub > "$tmp"
 
-  if [ ! -s "$tmp" ] || ! grep -qE '^[[:space:]]*(export[[:space:]]+)?GRUB_CMDLINE_LINUX_DEFAULT=' "$tmp"; then
+  if [ ! -s "$tmp" ] || ! grep -qE "$GRUB_KEY_RE" "$tmp"; then
     rm -f "$tmp"
     message warn "the /etc/default/grub rewrite did not come out right — leaving it alone"
     return 1
@@ -2468,7 +2826,7 @@ remove_grub_cmdline_line() {
   local tmp
   GRUB_BACKUP_KEPT=""
   tmp="$(mktemp)" || return 1
-  awk '!done && /^[[:space:]]*(export[[:space:]]+)?GRUB_CMDLINE_LINUX_DEFAULT=/ { done = 1; next } { print }' \
+  awk -v re="$GRUB_KEY_RE" '!done && $0 ~ re { done = 1; next } { print }' \
     /etc/default/grub > "$tmp"
   install_grub_file "$tmp"
 }
@@ -2508,6 +2866,10 @@ install_grub_file() {
   return 1
 }
 
+# Forget the words this script added to the kernel command line, and the
+# other records $@.
+forget_grub_words() { sudo rm -f "$GRUB_ADDED_FILE" "${SYS_RECORDS}/grub-line-added" "$@"; }
+
 # Remove line $1 from the grub record; with $2 = "line", also the note that
 # this script added the whole line.
 drop_grub_record() {
@@ -2519,10 +2881,68 @@ drop_grub_record() {
   [ "${2:-}" != line ] || sudo rm -f "${SYS_RECORDS}/grub-line-added"
 }
 
-rebuild_initramfs() { sudo update-initramfs -u -k all 2>/dev/null || sudo update-initramfs -u; }
+# Rebuild the initramfs, owed on record until it succeeds, so a failure or a
+# cut (power loss, a killed run) is retried by the next run.
+rebuild_initramfs_recorded() {
+  # Tried in this run, whatever the outcome: the next run retries a failure.
+  INITRAMFS_REBUILT=1
+  sys_records_dir && sudo touch "$INITRAMFS_PENDING"
+  sudo update-initramfs -u -k all 2>/dev/null || sudo update-initramfs -u || return 1
+  sudo rm -f "$INITRAMFS_PENDING"
+}
+
+# Put back the boot splash theme from before the install, unless the user
+# chose another since; an initramfs rebuild still owed is finished too.
+# Sets PLY_WAS and PLY_CURRENT. Returns 0 restored, 1 nothing to do, 2 the
+# user's own theme kept, 3 theme unreadable, 4 put-back failed, 5 initramfs
+# rebuild failed, 6 owed rebuild finished. On 3-5 the records stay.
+plymouth_put_back() {
+  local ours rc
+  # The theme the install set: its record, else the saved option.
+  ours="$(head -1 "${SYS_RECORDS}/plymouth-theme-set.txt" 2>/dev/null)"
+  ours="${ours:-$PLYMOUTH_THEME}"
+  PLY_CURRENT="$(plymouth_current_theme)"
+  PLY_WAS="$(cat "$PLYMOUTH_BEFORE_FILE" 2>/dev/null)"
+  [ -n "$PLY_CURRENT" ] || return 3
+  if [ -z "$PLY_WAS" ] || [ "$PLY_WAS" = "$PLY_CURRENT" ]; then
+    # Set back by an earlier run whose initramfs rebuild failed.
+    rc=1
+    if [ -f "$INITRAMFS_PENDING" ]; then
+      rebuild_initramfs_recorded || return 5
+      rc=6
+    fi
+  elif [ "$PLY_CURRENT" != "$ours" ]; then
+    rc=2
+  else
+    put_back_plymouth_theme "$PLY_WAS" || return 4
+    rebuild_initramfs_recorded || return 5
+    rc=0
+  fi
+  drop_plymouth_records
+  return $rc
+}
+
+# The rebuild an earlier run owes, if any, for the install's summary.
+retry_owed_initramfs() {
+  [ -f "$INITRAMFS_PENDING" ] || return 0
+  if rebuild_initramfs_recorded; then
+    STATUS_CHANGES+=("Boot splash theme rebuilt into the initramfs")
+    need_reboot
+  else
+    STATUS_FAILED+=("The initramfs rebuild failed again — run: sudo update-initramfs -u")
+  fi
+}
+
+# $1 = set or unset: that boot splash change, then any rebuild an earlier run
+# owes, unless this run rebuilt the initramfs already.
+boot_splash() {
+  INITRAMFS_REBUILT=0
+  "${1}_boot_splash"
+  [ "$INITRAMFS_REBUILT" -eq 1 ] || retry_owed_initramfs
+}
 
 # Add "quiet splash" to the kernel command line and set the Plymouth theme.
-apply_boot_splash() {
+set_boot_splash() {
   local where val new opt added="" before="" kept_out=""
   where="$(read_grub_cmdline)"; val="${where#* }"; where="${where%% *}"
   # A commented line counts as none; a new line is appended to the file.
@@ -2533,10 +2953,15 @@ apply_boot_splash() {
       STATUS_NOCHANGE+=("/etc/default/grub left alone — the boot splash is not applied")
       return 0 ;;
   esac
+  # Tabs separate parameters as spaces do.
+  local val_words="${val//$'\t'/ }"
 
-  # A drop-in in /etc/default/grub.d is read after this file and wins.
-  if grep -qsE '^[[:space:]]*(export[[:space:]]+)?GRUB_CMDLINE_LINUX_DEFAULT=' /etc/default/grub.d/*.cfg; then
-    STATUS_NOCHANGE+=("/etc/default/grub.d sets GRUB_CMDLINE_LINUX_DEFAULT — it overrides /etc/default/grub")
+  # A drop-in in /etc/default/grub.d is read after this file and wins, unless
+  # it only adds to the value.
+  if grep -hsE "$GRUB_KEY_RE" /etc/default/grub.d/*.cfg \
+     | grep -qvE '\$\{?GRUB_CMDLINE_LINUX_DEFAULT'; then
+    message warn "/etc/default/grub.d sets GRUB_CMDLINE_LINUX_DEFAULT — it overrides /etc/default/grub"
+    STATUS_FAILED+=("/etc/default/grub.d sets GRUB_CMDLINE_LINUX_DEFAULT — the change to /etc/default/grub has no effect there")
   fi
 
   # An earlier run stopped between recording its words and update-grub:
@@ -2544,30 +2969,44 @@ apply_boot_splash() {
   local pending="${SYS_RECORDS}/grub-add-pending" pend p_line
   if [ -f "$pending" ]; then
     pend="$(sed -n 1p "$pending")"; p_line="$(sed -n 2p "$pending")"
-    case " ${val//$'\t'/ } " in
-      *" ${pend%% *} "*)
-        if sudo update-grub; then
-          sudo rm -f "$pending"; REBOOT_NEEDED=1
-        else
-          STATUS_FAILED+=("update-grub failed — run: sudo update-grub")
-        fi ;;
-      *)
-        drop_grub_record "$pend" "$p_line"
-        sudo rm -f "$pending" ;;
-    esac
+    if ! in_word_list "${pend%% *}" "$val_words"; then
+      drop_grub_record "$pend" "$p_line"
+      sudo rm -f "$pending"
+    elif sudo update-grub; then
+      sudo rm -f "$pending"; need_reboot
+      STATUS_CHANGES+=("update-grub finished for '${pend}', which an interrupted run added")
+    else
+      STATUS_FAILED+=("update-grub failed — run: sudo update-grub")
+    fi
   fi
 
   # Add the missing words, except recorded ones the user has since removed.
+  # A removal that stopped before update-grub finished. If it wrote the file
+  # (the recorded words are gone), those words are added again, not taken for
+  # the user's choice; if not, the record still holds.
+  if [ -f "${SYS_RECORDS}/grub-strip-pending" ]; then
+    local rec
+    rec="$(head -1 "$GRUB_ADDED_FILE" 2>/dev/null)"
+    { [ -n "$rec" ] && in_word_list "${rec%% *}" "$val_words"; } || forget_grub_words
+    sudo rm -f "${SYS_RECORDS}/grub-strip-pending"
+  fi
   before="$(tr '\n' ' ' 2>/dev/null < "$GRUB_ADDED_FILE")"
+  # The first run records which words were already there, so one the user
+  # takes off later is not put back either.
+  if [ ! -f "$GRUB_SEEN_FILE" ]; then
+    local had=""
+    for opt in quiet splash; do
+      in_word_list "$opt" "$val_words" && had="${had:+${had} }${opt}"
+    done
+    sys_record_write "$GRUB_SEEN_FILE" "$had"
+  fi
+  before="${before} $(cat "$GRUB_SEEN_FILE" 2>/dev/null)"
   new="$val"
   for opt in quiet splash; do
-    # Tabs separate parameters as spaces do.
-    case " ${new//$'\t'/ } " in
-      *" $opt "*) continue ;;
-    esac
-    case " $before " in
-      *" $opt "*) kept_out="${kept_out:+${kept_out} }${opt}"; continue ;;
-    esac
+    in_word_list "$opt" "$val_words" && continue
+    if in_word_list "$opt" "$before"; then
+      kept_out="${kept_out:+${kept_out} }${opt}"; continue
+    fi
     new="${new:+${new} }${opt}"; added="${added:+${added} }${opt}"
   done
 
@@ -2589,10 +3028,11 @@ apply_boot_splash() {
     if write_grub_cmdline "$new"; then
       sudo rm -f "$pending"
       STATUS_CHANGES+=("/etc/default/grub → GRUB_CMDLINE_LINUX_DEFAULT=\"${new}\"")
-      REBOOT_NEEDED=1
+      need_reboot
     else
-      sudo rm -f "$pending"
-      [ -n "$GRUB_BACKUP_KEPT" ] || drop_grub_record "$added" "$line_marker"
+      # With the original not put back, the note and record stay: a later
+      # run finishes update-grub.
+      [ -n "$GRUB_BACKUP_KEPT" ] || { sudo rm -f "$pending"; drop_grub_record "$added" "$line_marker"; }
       STATUS_FAILED+=("/etc/default/grub could not be updated")
       [ -n "$GRUB_BACKUP_KEPT" ] \
         && STATUS_FAILED+=("the file as it was before that attempt is at ${GRUB_BACKUP_KEPT}")
@@ -2606,7 +3046,6 @@ apply_boot_splash() {
     return 0
   fi
 
-  local before_file="$PLYMOUTH_BEFORE_FILE"
   local current new_record=0
   current="$(plymouth_current_theme)"
 
@@ -2614,35 +3053,36 @@ apply_boot_splash() {
     STATUS_NOCHANGE+=("Could not read the current boot splash theme — left as it is")
   elif [ "$current" = "$PLYMOUTH_THEME" ]; then
     # Record it, so a later user choice is left alone.
-    if [ ! -f "$before_file" ]; then
-      sys_records_dir
-      sys_record_write "$before_file" "$current"
-      sys_record_write "${SYS_RECORDS}/plymouth-theme-set.txt" "$current"
-    fi
+    [ -f "$PLYMOUTH_BEFORE_FILE" ] || sys_record_write "$PLYMOUTH_BEFORE_FILE" "$current"
+    [ -f "${SYS_RECORDS}/plymouth-theme-set.txt" ] \
+      || sys_record_write "${SYS_RECORDS}/plymouth-theme-set.txt" "$current"
     STATUS_NOCHANGE+=("Boot splash theme already '${PLYMOUTH_THEME}'")
-  elif [ -f "$before_file" ] && [ -z "$PLYMOUTH_THEME_GIVEN" ]; then
-    # Changed by the user since; a PLYMOUTH_THEME given to this run overrides.
+  elif [ -f "${SYS_RECORDS}/plymouth-theme-set.txt" ] && [ -z "$PLYMOUTH_THEME_GIVEN" ]; then
+    # Set by the look and changed by the user since (the record of the
+    # earlier theme alone may be from a run cut off before setting it); a
+    # PLYMOUTH_THEME given to this run overrides.
     STATUS_NOCHANGE+=("Boot splash theme left as you set it ('${current}')")
-  elif ! plymouth-set-default-theme -l 2>/dev/null | grep -qxF -- "$PLYMOUTH_THEME"; then
+  elif ! plymouth_theme_installed "$PLYMOUTH_THEME"; then
     STATUS_NOCHANGE+=("Boot splash theme '${PLYMOUTH_THEME}' is not installed — left as it is")
   else
     message "setting the boot splash theme to '${PLYMOUTH_THEME}'"
-    if [ ! -f "$before_file" ]; then
-      sys_records_dir
-      sys_record_write "$before_file" "$current"
+    if [ ! -f "$PLYMOUTH_BEFORE_FILE" ]; then
+      sys_record_write "$PLYMOUTH_BEFORE_FILE" "$current"
       new_record=1
     fi
+    save_plymouth_conf
     if sudo plymouth-set-default-theme "$PLYMOUTH_THEME"; then
       sys_record_write "${SYS_RECORDS}/plymouth-theme-set.txt" "$PLYMOUTH_THEME"
-      if rebuild_initramfs; then
+      if rebuild_initramfs_recorded; then
         STATUS_CHANGES+=("Boot splash theme set to '${PLYMOUTH_THEME}' (was '${current}')")
       else
         STATUS_FAILED+=("Boot splash theme changed, but the initramfs rebuild failed — run: sudo update-initramfs -u")
       fi
-      REBOOT_NEEDED=1
+      need_reboot
     else
       # Drop only a record made by this attempt; an older one is the original.
-      [ "$new_record" -eq 1 ] && sudo rm -f "$before_file"
+      [ "$new_record" -eq 1 ] \
+        && drop_plymouth_records
       message warn "could not set the boot splash theme to '${PLYMOUTH_THEME}'"
       STATUS_FAILED+=("Boot splash theme could not be set to '${PLYMOUTH_THEME}'")
     fi
@@ -2650,42 +3090,51 @@ apply_boot_splash() {
 }
 
 # Remove the recorded words from GRUB_CMDLINE_LINUX_DEFAULT; a line this
-# script appended goes whole once nothing else is on it. Sets GRUB_CMDLINE_NEW.
-# Returns 0 = done, 1 = words already gone, 2 = file unparsable, 3 = write failed.
+# script appended goes whole once nothing else is on it. Sets GRUB_ADDED_WORDS
+# (the recorded words) and GRUB_CMDLINE_NEW. Returns 0 = done, 1 = words
+# already gone, 2 = file unparsable, 3 = write failed.
 strip_grub_words() {
-  local added where val
-  added="$(tr '\n' ' ' < "$GRUB_ADDED_FILE")"
+  local where val pending="${SYS_RECORDS}/grub-strip-pending"
+  GRUB_ADDED_WORDS="$(tr '\n' ' ' < "$GRUB_ADDED_FILE")"
+  GRUB_ADDED_WORDS="${GRUB_ADDED_WORDS% }"
   where="$(read_grub_cmdline)"; val="${where#* }"; where="${where%% *}"
   [ "$where" = unparsable ] && return 2
-  if ! GRUB_CMDLINE_NEW="$(grub_without_words "$val" "$added")" || [ "$where" != active ]; then
-    sudo rm -f "$GRUB_ADDED_FILE" "${SYS_RECORDS}/grub-line-added"
+  if ! GRUB_CMDLINE_NEW="$(grub_without_words "$val" "$GRUB_ADDED_WORDS")" || [ "$where" != active ]; then
+    # An earlier run wrote the file but stopped before update-grub finished.
+    if [ -f "$pending" ]; then
+      message "finishing the update-grub an earlier run left undone"
+      sudo update-grub || return 3
+      GRUB_CMDLINE_NEW="$val"
+      forget_grub_words "$pending"
+      return 0
+    fi
+    forget_grub_words
     return 1
   fi
-  message "removing '${added% }' from GRUB_CMDLINE_LINUX_DEFAULT"
+  message "removing '${GRUB_ADDED_WORDS}' from GRUB_CMDLINE_LINUX_DEFAULT"
+  sudo touch "$pending"
   if [ -z "$GRUB_CMDLINE_NEW" ] && [ -f "${SYS_RECORDS}/grub-line-added" ]; then
-    remove_grub_cmdline_line || return 3
+    # Kept when the original could not be put back: a later run then finishes it.
+    remove_grub_cmdline_line || { [ -n "$GRUB_BACKUP_KEPT" ] || sudo rm -f "$pending"; return 3; }
   else
-    write_grub_cmdline "$GRUB_CMDLINE_NEW" || return 3
+    write_grub_cmdline "$GRUB_CMDLINE_NEW" || { [ -n "$GRUB_BACKUP_KEPT" ] || sudo rm -f "$pending"; return 3; }
   fi
-  sudo rm -f "$GRUB_ADDED_FILE" "${SYS_RECORDS}/grub-line-added"
+  forget_grub_words "$pending"
   return 0
 }
 
 # UBUNTU_BOOT_SPLASH=0: remove the recorded words from the kernel command line
 # and restore the previous Plymouth theme.
-revert_boot_splash() {
-  local before_file="$PLYMOUTH_BEFORE_FILE" added
-
+unset_boot_splash() {
   if [ -f "$GRUB_ADDED_FILE" ]; then
-    added="$(tr '\n' ' ' < "$GRUB_ADDED_FILE")"
     strip_grub_words
     case $? in
       0) STATUS_CHANGES+=("/etc/default/grub → GRUB_CMDLINE_LINUX_DEFAULT=\"${GRUB_CMDLINE_NEW}\"")
-         REBOOT_NEEDED=1 ;;
+         need_reboot ;;
       1) STATUS_NOCHANGE+=("/etc/default/grub no longer carries what this script added") ;;
       2) message warn "/etc/default/grub is not in a shape this script will edit — leaving it alone"
-         STATUS_NOCHANGE+=("/etc/default/grub left alone — remove '${added% }' by hand if you want it gone") ;;
-      *) STATUS_FAILED+=("/etc/default/grub could not be updated — '${added% }' is still on the kernel command line")
+         STATUS_NOCHANGE+=("/etc/default/grub left alone — remove '${GRUB_ADDED_WORDS}' by hand if you want it gone") ;;
+      *) STATUS_FAILED+=("/etc/default/grub could not be updated — '${GRUB_ADDED_WORDS}' is still on the kernel command line")
          [ -n "$GRUB_BACKUP_KEPT" ] \
            && STATUS_FAILED+=("the file as it was before that attempt is at ${GRUB_BACKUP_KEPT}") ;;
     esac
@@ -2694,109 +3143,44 @@ revert_boot_splash() {
   fi
 
   # Restore the previous theme, unless the user has chosen another since.
-  if command -v plymouth-set-default-theme >/dev/null 2>&1 && [ -f "$before_file" ]; then
-    local was current set_theme
-    was="$(cat "$before_file" 2>/dev/null)"
-    current="$(plymouth_current_theme)"
-    set_theme="$(head -1 "${SYS_RECORDS}/plymouth-theme-set.txt" 2>/dev/null)"
-    if [ -n "$was" ] && [ "$was" != "$current" ] && [ "$current" = "${set_theme:-$PLYMOUTH_THEME}" ]; then
-      if ! sudo plymouth-set-default-theme "$was"; then
-        message warn "could not set the Plymouth theme back to '${was}' — it may no longer be installed"
-        STATUS_FAILED+=("Boot splash theme still not '${was}' — the record is kept at ${before_file}")
-        return 0
-      fi
-      if rebuild_initramfs; then
-        STATUS_CHANGES+=("Boot splash theme restored to '${was}'")
-      else
-        STATUS_FAILED+=("Boot splash theme restored to '${was}', but the initramfs rebuild failed — run: sudo update-initramfs -u")
-      fi
-      REBOOT_NEEDED=1
-    fi
-    sudo rm -f "$before_file" "${SYS_RECORDS}/plymouth-theme-set.txt"
+  if command -v plymouth-set-default-theme >/dev/null 2>&1 && [ -f "$PLYMOUTH_BEFORE_FILE" ]; then
+    plymouth_put_back
+    case $? in
+      0) STATUS_CHANGES+=("Boot splash theme restored to '${PLY_WAS}'"); need_reboot ;;
+      2) STATUS_NOCHANGE+=("Boot splash theme left on '${PLY_CURRENT}', which you chose after the install") ;;
+      3) STATUS_FAILED+=("Could not read the boot splash theme — not restored; run this again later") ;;
+      4) message warn "could not set the Plymouth theme back to '${PLY_WAS}' — it may no longer be installed"
+         STATUS_FAILED+=("Boot splash theme still not '${PLY_WAS}' — the record is kept at ${PLYMOUTH_BEFORE_FILE}") ;;
+      5) STATUS_FAILED+=("Boot splash theme set to '${PLY_WAS}', but the initramfs rebuild failed — run: sudo update-initramfs -u") ;;
+      6) STATUS_CHANGES+=("Boot splash theme rebuilt into the initramfs"); need_reboot ;;
+    esac
   fi
+
+  return 0
 }
 
 ###############################################################################
-# 5. Records: migration, daily refresh, summary
+# 5. Records: --refresh, summary
 ###############################################################################
 
-# Move the system records that earlier versions kept in the user's
-# home into SYS_RECORDS.
-migrate_home_records() {
-  local legacy dest tmp p f legacy_manifest=0 found=0
-  [ -d "$BACKUP_DIR" ] || return 0
-  for f in "${BACKUP_DIR}"/{installed,removed,upgraded}-by-script.txt \
-           "${BACKUP_ORIGINAL}"/{grub-cmdline-added.txt,packages-before.txt,plymouth-theme-before.txt} \
-           "${BACKUP_ORIGINAL}"/gdm-profile{,-Debian-gdm}-created; do
-    [ -f "$f" ] && { found=1; break; }
-  done
-  [ "$found" -eq 1 ] || return 0
-  tmp="$(mktemp)"
-  # Plain lists: merged with the system record.
-  for legacy in "${BACKUP_DIR}/installed-by-script.txt" "${BACKUP_DIR}/removed-by-script.txt" \
-                "${BACKUP_ORIGINAL}/grub-cmdline-added.txt"; do
-    [ -f "$legacy" ] && [ ! -L "$legacy" ] || continue
-    dest="${SYS_RECORDS}/${legacy##*/}"
-    [ "$dest" = "$INSTALLED_MANIFEST" ] && legacy_manifest=1
-    cat "$legacy" "$dest" 2>/dev/null | sed '/^$/d' | sort -u > "$tmp"
-    move_to_sys_record "$tmp" "$dest" "$legacy"
-  done
-  # The first entry per package holds the original version.
-  legacy="${BACKUP_DIR}/upgraded-by-script.txt"
-  if [ -f "$legacy" ] && [ ! -L "$legacy" ]; then
-    cat "$UPGRADED_MANIFEST" "$legacy" 2>/dev/null | awk 'NF && !seen[$1]++' | sort > "$tmp"
-    move_to_sys_record "$tmp" "$UPGRADED_MANIFEST" "$legacy"
-  fi
-  # A package predates the install only if every snapshot has it.
-  legacy="${BACKUP_ORIGINAL}/packages-before.txt"
-  if [ -f "$legacy" ] && [ ! -L "$legacy" ]; then
-    if [ -f "$PACKAGES_BEFORE" ]; then
-      sort "$legacy" | comm -12 - <(sort "$PACKAGES_BEFORE") > "$tmp"
-    else
-      sort "$legacy" > "$tmp"
-    fi
-    move_to_sys_record "$tmp" "$PACKAGES_BEFORE" "$legacy"
-  fi
-  # An existing system record is the older, original theme.
-  legacy="${BACKUP_ORIGINAL}/plymouth-theme-before.txt"
-  if [ -f "$legacy" ] && [ ! -L "$legacy" ]; then
-    if [ -f "$PLYMOUTH_BEFORE_FILE" ]; then
-      rm -f "$legacy"
-    else
-      move_to_sys_record "$legacy" "$PLYMOUTH_BEFORE_FILE" "$legacy"
-    fi
-  fi
-  for f in gdm-profile-created gdm-profile-Debian-gdm-created; do
-    [ -f "${BACKUP_ORIGINAL}/${f}" ] || continue
-    sys_records_dir; sudo touch "${SYS_RECORDS}/${f}" && rm -f "${BACKUP_ORIGINAL}/${f}"
-  done
-  if [ "$legacy_manifest" -eq 1 ] && [ -f "$PACKAGES_BEFORE" ]; then
-    for p in $LEGACY_STAGE_PACKAGES; do
-      is_installed "$p" || continue
-      grep -qxF "$p" "$PACKAGES_BEFORE" "$INSTALLED_MANIFEST" 2>/dev/null && continue
-      sys_record_append "$INSTALLED_MANIFEST" "$p"
-    done
-  fi
-  # These records came from this home, so this user has the look.
-  grep -qxF "$(id -un)" "$SYS_USERS" 2>/dev/null || sys_record_append "$SYS_USERS" "$(id -un)"
-  rm -f "$tmp"
-}
-
-# What the refresh compares: Debian, gnome-shell, architecture, options and
-# the Ubuntu releases.
-refresh_fingerprint() {
+# What a run is resolved against: Debian, gnome-shell, architecture, the
+# release options of this run (as save_options writes them) and the Ubuntu
+# releases. Compared by later runs and by --refresh.
+release_fingerprint() {
   local pinned pinned_ver configured
   echo "debian $(debian_codename)"
   echo "shell $(shell_major)"
   echo "arch ${UBUNTU_ARCH}"
   # A new pin format counts as a change.
   echo "format ${PIN_VERSION}"
-  sed -n 's/^\([A-Z_]*=.*\)$/option \1/p' "$SAVED_OPTIONS" 2>/dev/null
+  printf 'option %s\n' "UBUNTU_CODENAME=${REQUESTED_CODENAME}" \
+    "UBUNTU_INCLUDE_DEVEL=${UBUNTU_INCLUDE_DEVEL}" "UBUNTU_MIRROR=${REQUESTED_MIRROR}"
   pinned="$(pinned_codename)"
   pinned_ver="$(awk -v c="$pinned" '$1 == c { print $2; exit }' "$UBUNTU_RELEASE_CACHE" 2>/dev/null)"
   configured=" $(configured_codenames | xargs) "
-  # "newer" only for listed releases: a refresh does not probe retired ones.
-  awk -v conf="$configured" -v known=" ${UBUNTU_ALL_CODENAMES:-} " -v pv="${pinned_ver:-0}" '
+  # "newer" only for listed releases; retired ones are not probed. The C
+  # locale reads "25.04" as a number everywhere.
+  LC_ALL=C awk -v conf="$configured" -v known=" ${UBUNTU_ALL_CODENAMES:-} " -v pv="${pinned_ver:-0}" '
     index(conf, " " $1 " ")                            { print "configured", $1, $4 }
     index(known, " " $1 " ") && ($2 + 0) > (pv + 0)    { print "newer", $1, $3 }
   ' "$UBUNTU_RELEASE_CACHE" 2>/dev/null
@@ -2805,14 +3189,14 @@ refresh_fingerprint() {
 # True when nothing changed since the last full run; sets KEPT_CODENAME.
 unchanged_since_last_run() {
   local pinned tmp rc=1
-  [ -f "$UBUNTU_LIST" ] && readable_regular_file "$REFRESH_STATE" || return 1
+  [ -f "$UBUNTU_SOURCES" ] && readable_regular_file "$RELEASE_STATE" || return 1
   # Only when the last full run also chose automatically.
   grep -qx 'UBUNTU_CODENAME=auto' "$SAVED_OPTIONS" 2>/dev/null || return 1
   grep -q "# pin-version: ${PIN_VERSION}" "$UBUNTU_PIN" 2>/dev/null || return 1
   pinned="$(pinned_codename)"
   [ -n "$pinned" ] && configured_codenames | grep -qxF "$pinned" || return 1
   tmp="$(fingerprint_file)"
-  cmp -s "$tmp" "$REFRESH_STATE" && { KEPT_CODENAME="$pinned"; rc=0; }
+  cmp -s "$tmp" "$RELEASE_STATE" && { KEPT_CODENAME="$pinned"; rc=0; }
   rm -f "$tmp"
   return $rc
 }
@@ -2820,180 +3204,145 @@ unchanged_since_last_run() {
 # The current fingerprint in a new temporary file; prints its path.
 fingerprint_file() {
   local tmp
-  tmp="$(mktemp)" && refresh_fingerprint | sort -u > "$tmp" && echo "$tmp"
+  tmp="$(mktemp)" && release_fingerprint | sort -u > "$tmp" && echo "$tmp"
 }
 
-# Save the fingerprint that later runs and the refresh timer compare against.
-save_refresh_state() {
+# --refresh: list what an update would change, then ask. Exits when there is
+# nothing to do or the user declines; returns to apply the update. Before
+# the answer it changes nothing but apt's package lists.
+refresh_check() {
+  local tmp line key p have cand running bound log rc findings=0 combined=0
+  echo ""
+  message "refreshing apt's package lists (nothing is installed yet)"
+  # Plain apt update: its fallbacks (a mirror without universe) would edit
+  # the apt source before the user agrees.
+  log="$(mktemp)" || return 1
+  apt_update_waiting "$log" quiet
+  rc=$?
+  if [ "$rc" -ne 0 ]; then
+    grep -q 'Could not get lock' "$log" && { rm -f "$log"; error "apt is in use by another program — try again later."; }
+    message warn "apt reported errors while refreshing its lists; the list below may be incomplete"
+  else
+    # Only a clean refresh spares the update its second apt update.
+    APT_LISTS_FRESH=1
+  fi
+  rm -f "$log"
+
+  echo ""
+  echo "Updates for the Ubuntu look:"
+  # The Ubuntu release and what it depends on.
+  if [ "$UBUNTU_CODENAME" != auto ]; then
+    echo "  = Ubuntu release fixed by UBUNTU_CODENAME=${UBUNTU_CODENAME}"
+    if ! grep -q "# pin-version: ${PIN_VERSION}" "$UBUNTU_PIN" 2>/dev/null; then
+      echo "  + This script writes a newer apt pin"
+      findings=$((findings + 1))
+    fi
+  elif unchanged_since_last_run; then
+    REFRESH_UNCHANGED=1
+    echo "  = Ubuntu ${KEPT_CODENAME}: still the newest release for this system"
+  elif ! readable_regular_file "$RELEASE_STATE"; then
+    echo "  + No record of the releases checked last time: the Ubuntu release is checked again"
+    findings=$((findings + 1))
+  else
+    tmp="$(fingerprint_file)"
+    while read -r line; do
+      key="${line#?}"
+      case "$line" in
+        ">debian "*)     echo "  + Debian release is now ${key#debian }" ;;
+        ">shell "*)      echo "  + GNOME Shell is now ${key#shell }" ;;
+        ">arch "*)       echo "  + Architecture is now ${key#arch }" ;;
+        ">format "*)     echo "  + This script writes a newer apt pin" ;;
+        ">option "*)     echo "  + Option changed: ${key#option }" ;;
+        ">newer "*)      set -- $key
+                         echo "  + Newer Ubuntu release published: $2 ($(ubuntu_release_info "$2" | cut -d' ' -f1)); whether it fits GNOME Shell $(shell_major) is checked when applying" ;;
+        ">configured "*) set -- $key; echo "  + Ubuntu $2 is now served from $3" ;;
+        *)               continue ;;
+      esac
+      findings=$((findings + 1))
+    done < <(diff "$RELEASE_STATE" "$tmp" | sed -n 's/^\([<>]\) /\1/p')
+    # Only lines that went away (a retired release, a dropped option).
+    if [ "$findings" -eq 0 ]; then
+      echo "  + The Ubuntu releases on offer changed: the Ubuntu release is checked again"
+      findings=1
+    fi
+    rm -f "$tmp"
+  fi
+  # Options outside the fingerprint: one given now that differs from the
+  # saved one. The boot options always; the release options when the release
+  # is fixed (the fingerprint is not compared then).
+  local -a opts=("UBUNTU_BOOT_SPLASH=${UBUNTU_BOOT_SPLASH}" "PLYMOUTH_THEME=${PLYMOUTH_THEME}")
+  [ "$UBUNTU_CODENAME" = auto ] || opts=("UBUNTU_CODENAME=${REQUESTED_CODENAME}" \
+    "UBUNTU_INCLUDE_DEVEL=${UBUNTU_INCLUDE_DEVEL}" "UBUNTU_MIRROR=${REQUESTED_MIRROR}" "${opts[@]}")
+  for line in "${opts[@]}"; do
+    grep -q "^${line%%=*}=" "$SAVED_OPTIONS" 2>/dev/null || continue
+    grep -qxF "$line" "$SAVED_OPTIONS" && continue
+    echo "  + Option changed: ${line}"
+    findings=$((findings + 1))
+  done
+
+  # Newer builds of the look's packages, and packages it lacks, as the update
+  # would handle them.
+  is_installed "$COMBINED_EXT_PKG" && combined=1
+  for p in $ALL_STAGE_PACKAGES; do
+    # Replaced by the combined package, which carries them.
+    [ "$combined" -eq 1 ] && in_word_list "$p" "$SEPARATE_EXT_PKGS" && continue
+    have="$(pkg_installed_version "$p")"
+    if [ -n "$have" ]; then
+      is_held "$p" && continue
+      # A package you had before the look is left to your own apt upgrade.
+      predates_install "$p" && ! in_word_list "$p" "$LOOK_PACKAGES" && continue
+    fi
+    cand="$(refresh_target "$p" "$have")"
+    [ -n "$cand" ] || continue
+    if [ -z "$have" ]; then
+      echo "  + ${p}: not installed; the look installs ${cand}"
+    else
+      echo "  + ${p}: ${have} → ${cand}"
+    fi
+    findings=$((findings + 1))
+  done
+  if [ "$combined" -eq 1 ]; then
+    have="$(pkg_installed_version "$COMBINED_EXT_PKG")"
+    cand=""
+    is_held "$COMBINED_EXT_PKG" || cand="$(refresh_target "$COMBINED_EXT_PKG" "$have")"
+    if [ -n "$cand" ]; then
+      echo "  + ${COMBINED_EXT_PKG}: ${have} → ${cand}"
+      findings=$((findings + 1))
+    fi
+  fi
+
+  # Extensions the running GNOME Shell has moved past.
+  running="$(shell_major)"
+  for p in $UBUNTU_SHELL_EXT_PKGS; do
+    is_installed "$p" || continue
+    bound="$(pkg_shell_upper_bound "$p")"
+    [ -n "$running" ] && [ -n "$bound" ] && [ "$running" -ge "$bound" ] || continue
+    echo "  ! ${p} does not support GNOME Shell ${running}; applying moves it to a release that does"
+    findings=$((findings + 1))
+  done
+
+  echo ""
+  if [ "$findings" -eq 0 ]; then
+    message "The Ubuntu look is up to date — nothing to apply."
+    exit 0
+  fi
+  message "${findings} update(s) found. Apply them now?"
+  ask_yes || { message "Nothing changed."; exit 0; }
+}
+
+# Save the fingerprint that later runs and --refresh compare against.
+save_release_state() {
   local tmp
   tmp="$(fingerprint_file)"
-  if ! { readable_regular_file "$REFRESH_STATE" && cmp -s "$tmp" "$REFRESH_STATE"; }; then
-    sudo install -Dm 0644 "$tmp" "$REFRESH_STATE" || true
-  fi
-  sudo rm -f "$REFRESH_ATTEMPT"
-  rm -f "$tmp"
-}
-
-# True when release $1 is in the release cache.
-release_cached() {
-  awk -v c="$1" '$1 == c { f = 1 } END { exit !f }' "$UBUNTU_RELEASE_CACHE"
-}
-
-# In --refresh mode: exit here unless something relevant has changed.
-refresh_gate() {
-  [ "$REFRESH" = 1 ] || return 0
-  local cn tmp
-  # A timer left by an earlier version, which had it on by default.
-  if [ "${UBUNTU_LOOK_AUTO_REFRESH:-0}" != 1 ]; then
-    message "the daily refresh was not chosen (UBUNTU_LOOK_AUTO_REFRESH=1) — removing it"
-    remove_refresh_timer || true
-    REFRESH_NOOP=1
-    exit 0
-  fi
-  # Finish a compile an earlier run left undone.
-  if dconf_db_stale "$LOOK_DB_NAME" || dconf_db_stale gdm; then
-    compile_dconf || message warn "dconf update failed — the look's defaults may be out of date"
-  fi
-  # A release that did not answer is a network problem, never a retirement.
-  for cn in $(configured_codenames) \
-            $(awk '$1 == "newer" { print $2 }' "$REFRESH_STATE" 2>/dev/null); do
-    # A release not probed yet (no longer listed) is probed now.
-    release_cached "$cn" || ubuntu_mirror_for "$cn" >/dev/null 2>&1
-    if ! release_cached "$cn"; then
-      message warn "Ubuntu '${cn}' did not answer — trying again at the next refresh"
-      REFRESH_NOOP=1
-      exit 0
-    fi
-  done
-  tmp="$(fingerprint_file)"
-  if readable_regular_file "$REFRESH_STATE" && cmp -s "$tmp" "$REFRESH_STATE"; then
-    rm -f "$tmp"
-    message "no new Ubuntu release, no archive move, no gnome-shell change — nothing to do"
-    REFRESH_NOOP=1
-    exit 0
-  fi
-  # The same change tried within the last week and not finished: wait.
-  if readable_regular_file "$REFRESH_ATTEMPT" && cmp -s "$tmp" "$REFRESH_ATTEMPT" \
-     && [ -n "$(find "$REFRESH_ATTEMPT" -mtime -7 2>/dev/null)" ]; then
-    rm -f "$tmp"
-    message warn "the last refresh for this change did not finish — retrying it weekly; see: journalctl -u ubuntu-look-refresh"
-    REFRESH_NOOP=1
-    exit 0
-  fi
-  message "the releases this look was resolved against have changed:"
-  diff "$REFRESH_STATE" "$tmp" 2>/dev/null | sed -n 's/^[<>] /  /p'
-  sudo install -Dm 0644 "$tmp" "$REFRESH_ATTEMPT"
-  rm -f "$tmp"
-}
-
-# Install the daily refresh with UBUNTU_LOOK_AUTO_REFRESH=1; otherwise remove it.
-install_refresh_timer() {
-  if [ "${UBUNTU_LOOK_AUTO_REFRESH:-0}" = "0" ]; then
-    if remove_refresh_timer; then
-      STATUS_CHANGES+=("Daily refresh timer removed — apt changes only when you run this script (UBUNTU_LOOK_AUTO_REFRESH=1 for a timer)")
-    else
-      STATUS_NOCHANGE+=("No daily refresh timer — re-run this script after a Debian release upgrade (UBUNTU_LOOK_AUTO_REFRESH=1 for a timer)")
-    fi
-    return 0
-  fi
-  if ! command -v systemctl >/dev/null 2>&1 || [ ! -d /run/systemd/system ]; then
-    STATUS_NOCHANGE+=("No systemd — re-run this script after Ubuntu or Debian releases")
-    return 0
-  fi
-  # Started from a pipe or process substitution: there is no file to copy.
-  if [ ! -f "${BASH_SOURCE[0]}" ]; then
-    STATUS_NOCHANGE+=("Daily refresh timer not installed — run the script from a file")
-    return 0
-  fi
-
-  local tmp changed=0 exec_start="/bin/bash ${REFRESH_SCRIPT} --refresh"
-  tmp="$(mktemp)"
-  if ! { readable_regular_file "$REFRESH_SCRIPT" && cmp -s "${BASH_SOURCE[0]}" "$REFRESH_SCRIPT"; }; then
-    sudo install -Dm 0755 "${BASH_SOURCE[0]}" "$REFRESH_SCRIPT" && changed=1
-  fi
-
-  cat << EOF > "$tmp"
-# Written by ubuntu-look.sh; removed by 'ubuntu-look.sh --uninstall'.
-[Unit]
-Description=Keep the Ubuntu look on the newest Ubuntu release this Debian can run
-Wants=network-online.target
-After=network-online.target apt-daily.service apt-daily-upgrade.service
-# Guards against a unit left without the pin or the script.
-ConditionPathExists=${UBUNTU_PIN}
-ConditionPathExists=${REFRESH_SCRIPT}
-
-[Service]
-Type=oneshot
-Environment=UBUNTU_LOOK_LOG=0
-ExecStart=${exec_start}
-Nice=19
-CPUSchedulingPolicy=batch
-IOSchedulingClass=best-effort
-IOSchedulingPriority=7
-TimeoutStartSec=2h
-# On stop, let a running dpkg finish.
-KillMode=process
-TimeoutStopSec=15min
-EOF
-  if ! { readable_regular_file "$REFRESH_SERVICE" && cmp -s "$tmp" "$REFRESH_SERVICE"; }; then
-    sudo install -m 0644 "$tmp" "$REFRESH_SERVICE" && changed=1
-  fi
-
-  cat << 'EOF' > "$tmp"
-# Written by ubuntu-look.sh; removed by 'ubuntu-look.sh --uninstall'.
-[Unit]
-Description=Daily check for Ubuntu and Debian releases that affect the Ubuntu look
-
-[Timer]
-OnCalendar=daily
-RandomizedDelaySec=3h
-Persistent=true
-
-[Install]
-WantedBy=timers.target
-EOF
-  if ! { readable_regular_file "$REFRESH_TIMER" && cmp -s "$tmp" "$REFRESH_TIMER"; }; then
-    sudo install -m 0644 "$tmp" "$REFRESH_TIMER" && changed=1
+  if ! { readable_regular_file "$RELEASE_STATE" && cmp -s "$tmp" "$RELEASE_STATE"; }; then
+    sudo install -Dm 0644 "$tmp" "$RELEASE_STATE" || true
   fi
   rm -f "$tmp"
-
-  [ "$changed" -eq 1 ] && sudo systemctl daemon-reload
-  if ! systemctl is-enabled --quiet ubuntu-look-refresh.timer 2>/dev/null \
-     || ! systemctl is-active --quiet ubuntu-look-refresh.timer 2>/dev/null; then
-    if sudo systemctl enable --now ubuntu-look-refresh.timer >/dev/null 2>&1; then
-      changed=1
-    else
-      STATUS_FAILED+=("Daily refresh timer could not be enabled — see: systemctl status ubuntu-look-refresh.timer")
-      return 0
-    fi
-  fi
-
-  if [ "$changed" -eq 1 ]; then
-    STATUS_CHANGES+=("Daily refresh timer in place — follows Ubuntu and Debian releases on its own")
-  else
-    STATUS_NOCHANGE+=("Daily refresh timer already in place")
-  fi
-}
-
-# Returns 0 when something was removed. The uninstall records are kept.
-# Remove the timer, its service and its copy of the script. The fingerprint
-# stays for later runs. Returns 0 when a timer was there.
-remove_refresh_timer() {
-  local removed=1
-  if [ -f "$REFRESH_TIMER" ] || [ -f "$REFRESH_SERVICE" ]; then
-    sudo systemctl disable --now ubuntu-look-refresh.timer >/dev/null 2>&1 || true
-    sudo rm -f "$REFRESH_TIMER" "$REFRESH_SERVICE"
-    sudo systemctl daemon-reload 2>/dev/null || true
-    removed=0
-  fi
-  sudo rm -rf "$REFRESH_LIB_DIR"
-  sudo rm -f "$REFRESH_ATTEMPT"
-  return $removed
 }
 
 # Log what is installed, the pinned release and the extension and terminal state.
 log_final_state() {
-  local p e state v
+  local p e state v enabled
 
   echo ""
   echo "--- state after this run ---"
@@ -3004,15 +3353,18 @@ log_final_state() {
     && printf '  %-46s %s\n' "$COMBINED_EXT_PKG" "$v"
 
   echo "  pin            : $(grep -m1 '^Pin: release o=Ubuntu, n=' "$UBUNTU_PIN" 2>/dev/null || echo 'none')"
-  # Root's dconf says nothing about the user's desktop.
-  [ "$REFRESH" = 1 ] && { echo "--- end of state ---"; return 0; }
   echo "  enabled-ext    : $(dconf_show /org/gnome/shell/enabled-extensions)"
   echo "  disabled-ext   : $(dconf_show /org/gnome/shell/disabled-extensions)"
+  enabled="$(extension_uuids /org/gnome/shell/enabled-extensions)"
   for e in $SHELL_EXTENSIONS; do
     # The running shell knows only the extensions present at login.
     state="$(LC_ALL=C gnome-extensions info "$e" 2>/dev/null | awk -F': ' '/State/{print $2}')"
     if [ -z "$state" ]; then
-      if extension_installed "$e"; then state="loads at the next login"; else state="not installed"; fi
+      if ! extension_installed "$e"; then state="not installed"
+      elif ! in_word_list "$e" "$enabled" \
+           && [ ! -f "$EXT_AUTOSTART_FILE" ]; then state="off"
+      elif [ "$REBOOT_NEEDED" -eq 1 ]; then state="active after the reboot"
+      else state="active after you log in again"; fi
     fi
     printf '  %-46s %s\n' "$e" "$state"
   done
@@ -3040,8 +3392,9 @@ summary_block() {
 
 print_summary() {
   local rc=$?
-  # A refresh with nothing to do reports one line.
-  [ "${REFRESH_NOOP:-0}" = 1 ] && [ $rc -eq 0 ] && return 0
+  # Nothing ran yet: a wrong argument, a declined prompt. (--download has its
+  # own EXIT trap and summary.)
+  [ "${RUN_STARTED:-0}" = 1 ] || return 0
   echo ""
   echo -e "${GREEN}═════════════════════════════════════════════════════════${ENDCOLOR}"
   echo -e "${GREEN}                        SUMMARY${ENDCOLOR}"
@@ -3058,14 +3411,14 @@ print_summary() {
   summary_block "$RED" "Not done (${#STATUS_FAILED[@]}):" "!" \
     "Everything else was applied. Each line gives the reason." "${STATUS_FAILED[@]}"
   summary_block "$RED" "Extensions the setting did not reach (${#STATUS_EXT_FAILED[@]}):" "!" \
-    "Writing enabled-extensions needs a live GNOME session; run this from your desktop, not over SSH." \
+    "Writing enabled-extensions needs a running GNOME session for your user." \
     "${STATUS_EXT_FAILED[@]}"
   summary_block "$GREEN"  "Configuration changes:" + "" "${STATUS_CHANGES[@]}"
   summary_block "$YELLOW" "Already in place (no change):" = "" "${STATUS_NOCHANGE[@]}"
 
   echo ""
-  if [ $((GSETTINGS_UNCHANGED + GSETTINGS_KEPT)) -gt 0 ]; then
-    echo -e "GNOME settings: ${GREEN}${GSETTINGS_UNCHANGED} answered by the system profile${ENDCOLOR}, ${YELLOW}${GSETTINGS_KEPT} left on your own value${ENDCOLOR}"
+  if [ $((GSETTINGS_UNCHANGED + ${#SETTINGS_KEPT[@]})) -gt 0 ]; then
+    echo -e "GNOME settings: ${GREEN}${GSETTINGS_UNCHANGED} answered by the system profile${ENDCOLOR}, ${YELLOW}${#SETTINGS_KEPT[@]} left on your own value${ENDCOLOR}"
     echo ""
   fi
   [ ${#SETTINGS_KEPT[@]} -gt 0 ] && {
@@ -3078,13 +3431,18 @@ print_summary() {
   log_final_state
 
   if [ $rc -ne 0 ]; then
-    echo -e "${RED}✗  Script exited with errors (rc=$rc). See ERROR line above.${ENDCOLOR}"
+    echo -e "${RED}✗  Script stopped (rc=$rc). See the ERROR or WARN lines above.${ENDCOLOR}"
+  elif [ "${PREPARE_UPGRADE:-0}" = 1 ]; then
+    echo -e "${GREEN}✓  Ready.${ENDCOLOR} Upgrade Debian and reboot, then run this script again."
   elif [ $REBOOT_NEEDED -eq 1 ]; then
-    echo -e "${RED}⚠  REBOOT REQUIRED${ENDCOLOR} for GRUB / Plymouth changes."
+    echo -e "${RED}⚠  REBOOT REQUIRED${ENDCOLOR} for the boot splash and kernel command line."
+    echo -e "   The reboot also applies the theme and extensions; no separate log out is needed."
     echo -e "   Run: ${YELLOW}sudo reboot${ENDCOLOR}"
   elif [ $RELOGIN_NEEDED -eq 1 ]; then
     echo -e "${YELLOW}⚠  Log out and back in${ENDCOLOR} so the new theme + extensions fully apply."
     echo -e "   The system defaults are already compiled; one new login applies them."
+  elif [ $(( ${#STATUS_FAILED[@]} + ${#STATUS_EXT_FAILED[@]} + ${#STATUS_UNAVAIL[@]} )) -gt 0 ]; then
+    echo -e "${YELLOW}⚠  Done, except the items listed above as not done — each gives its reason.${ENDCOLOR}"
   elif [ ${#STATUS_CHANGES[@]} -gt 0 ]; then
     echo -e "${GREEN}✓  Done — no re-login needed.${ENDCOLOR}"
   else
@@ -3093,22 +3451,31 @@ print_summary() {
   echo -e "${GREEN}═════════════════════════════════════════════════════════${ENDCOLOR}"
 }
 
+# Remove the run's release cache and its suite memo.
+rm_release_cache() { rm -f "${UBUNTU_RELEASE_CACHE:-}" "${UBUNTU_RELEASE_CACHE:+${UBUNTU_RELEASE_CACHE}.suites}"; }
+
 # Cleanup must preserve the exit status for print_summary.
 _on_exit() {
   local rc=$?
-  rm -f "${UBUNTU_RELEASE_CACHE:-}" "${LOCAL_LIST:-}"
-  rm -rf "$PARTIAL_DIR"
-  # Ending the inhibitor's child ends the inhibitor.
-  if [ -n "${INHIBIT_PID:-}" ]; then
-    pkill -P "$INHIBIT_PID" 2>/dev/null
-    kill "$INHIBIT_PID" 2>/dev/null
-  fi
+  rm_release_cache
+  rm -f "${LOCAL_SOURCES:-}"
+  # Stopped while the widened apt source was being tried: put it back.
+  [ -f "${PREV_UBUNTU_SOURCES:-}" ] && restore_prev_ubuntu_sources
+  # A --download that stopped before its own EXIT trap: its sudo keepalive.
+  stop_sudo_keepalive
   return $rc
 }
 
-# Make the refresh timer re-evaluate the state this script left.
-invalidate_refresh_state() {
-  [ ! -e "$REFRESH_STATE" ] || sudo rm -f "$REFRESH_STATE"
+stop_sudo_keepalive() {
+  [ -n "${SUDO_KEEPALIVE_PID:-}" ] || return 0
+  pkill -P "$SUDO_KEEPALIVE_PID" 2>/dev/null
+  kill "$SUDO_KEEPALIVE_PID" 2>/dev/null
+  SUDO_KEEPALIVE_PID=""
+}
+
+# Make the next run, and --refresh, re-evaluate the state this script left.
+invalidate_release_state() {
+  [ ! -e "$RELEASE_STATE" ] || sudo rm -f "$RELEASE_STATE"
 }
 
 ###############################################################################
@@ -3117,25 +3484,21 @@ invalidate_refresh_state() {
 
 # Take foreign packages off before a release upgrade; a re-run restores the look.
 prepare_debian_upgrade() {
-  local pkg drop=""
+  local pkg drop="" f files=""
+  PREPARE_UPGRADE=1
 
   message "Preparing this system for a Debian release upgrade."
-  message ""
-  message "This removes the Ubuntu apt source, the pin, the refresh timer (if any) and"
-  message "the packages tied to the running gnome-shell. The Yaru GTK and icon themes,"
-  message "the fonts and the wallpapers stay, so the desktop keeps its look during the upgrade."
-  message ""
-  confirm_continue
   sudo -v || error "sudo is required."
-  take_run_lock wait || error "Could not take the run lock ${UBUNTU_LOOK_LOCK}."
+  take_run_lock
 
   # Without the Ubuntu source, the version string tells Ubuntu builds apart.
   local origin_test=apt
-  if [ ! -f "$UBUNTU_LIST" ]; then
+  if [ ! -f "$UBUNTU_SOURCES" ]; then
     origin_test=version
     message warn "the Ubuntu apt source is already gone — going by version strings instead"
   fi
 
+  # The packages tied to the running gnome-shell, which the upgrade would break.
   for pkg in $UBUNTU_SHELL_EXT_PKGS yaru-theme-gnome-shell; do
     is_installed "$pkg" || continue
     if [ "$origin_test" = apt ]; then
@@ -3147,50 +3510,70 @@ prepare_debian_upgrade() {
     fi
   done
   drop="$(echo "$drop" | xargs)"
-
+  # Anything more apt would remove with them, simulated first.
+  local _rm_sim _rm_extra=""
   if [ -n "$drop" ]; then
-    # Simulated first; anything more it would take needs confirmation.
-    local _rm_sim _rm_extra
     # shellcheck disable=SC2086
     _rm_sim="$(LC_ALL=C apt-get -s remove $drop 2>&1)" \
       || error "apt cannot remove ${drop} — resolve that before upgrading Debian."
     _rm_extra="$(printf '%s\n' "$_rm_sim" | awk '/^Remv /{print $2}' \
                  | grep -vxF -e "${drop// /$'\n'}" | xargs)"
-    if [ -n "$_rm_extra" ]; then
-      message warn "removing those would also take: ${_rm_extra}"
-      confirm_continue
-    fi
+  fi
+  for f in "$UBUNTU_SOURCES" "$UBUNTU_PIN"; do
+    [ -f "$f" ] && files="${files} ${f}"
+  done
 
+  # What will change, before anything does.
+  echo ""
+  echo "Before the Debian upgrade, this removes:"
+  if [ -n "$drop" ]; then
+    echo "  Packages tied to the current GNOME Shell (the look installs the new release's afterwards):"
+    printf '    - %s\n' $drop
+  fi
+  if [ -n "$_rm_extra" ]; then
+    echo "  Packages apt removes with them (not put back automatically; reinstall them"
+    echo "  yourself after the upgrade if you want them):"
+    printf '    ! %s\n' $_rm_extra
+  fi
+  if [ -n "$files" ]; then
+    echo "  apt files the look added (its Ubuntu source and pin):"
+    printf '    - %s\n' $files
+  fi
+  if [ -z "${drop}${files}" ]; then
+    echo "  nothing: no Ubuntu source, pin or GNOME Shell-tied package is left"
+  fi
+  echo "It keeps Yaru's app, icon and sound themes, the fonts, the wallpapers and"
+  echo "ubuntu-keyring, so the desktop keeps most of its look during the upgrade."
+  echo "'bash ubuntu-look.sh' afterwards installs the look for the new GNOME Shell."
+  echo ""
+  if [ -n "${drop}${files}" ]; then
+    # Declined: nothing was changed, so no summary.
+    ask_yes || error "Aborted — nothing was changed."
+  fi
+  RUN_STARTED=1
+
+  if [ -n "$drop" ]; then
     message "removing gnome-shell-coupled Ubuntu packages: ${drop}"
-    # Recorded so the uninstall reinstalls Debian's builds.
+    # Recorded first, so the uninstall reinstalls Debian's builds even after
+    # an interrupted removal; it checks what is installed.
+    # shellcheck disable=SC2086
+    sys_record_append "$REMOVED_FOR_UPGRADE" "$(printf '%s\n' $drop)"
+    sys_record_sort "$REMOVED_FOR_UPGRADE"
     # shellcheck disable=SC2086
     sudo apt-get remove -y $drop \
       || error "Could not remove ${drop} — resolve that before upgrading Debian."
-    for pkg in $drop; do sys_record_append "$REMOVED_FOR_UPGRADE" "$pkg"; done
     STATUS_CHANGES+=("Removed gnome-shell-coupled Ubuntu packages: ${drop}")
-  else
-    message "no gnome-shell-coupled Ubuntu packages installed"
   fi
 
   # The keyring stays: no source names it now, and a re-run needs it.
-  local f removed_cfg=0
-  for f in "$UBUNTU_LIST" "$UBUNTU_PIN"; do
-    [ -f "$f" ] || continue
-    sudo rm -f "$f"; removed_cfg=1
+  for f in $files; do
+    sudo rm -f "$f"
     STATUS_CHANGES+=("Removed ${f}")
   done
   # Saved copies from an interrupted --download would bring them back.
   sudo rm -rf "$DOWNLOAD_SAVED"
-  if [ -f "$OFFLINE_LOCAL_LIST" ]; then
-    sudo rm -f "$OFFLINE_LOCAL_LIST"; removed_cfg=1
-    STATUS_CHANGES+=("Removed the leftover offline bundle apt source")
-  fi
 
-  # Otherwise the refresh would restore the sources mid-upgrade.
-  remove_refresh_timer && STATUS_CHANGES+=("Removed the daily refresh timer; a later run with UBUNTU_LOOK_AUTO_REFRESH=1 restores it")
-  remove_unattended_origins
-
-  [ "$removed_cfg" -eq 1 ] && { sudo apt-get update || message warn "apt update reported an error"; }
+  [ -n "$files" ] && { sudo apt-get update || message warn "apt update reported an error"; }
 
   message ""
   local codename
@@ -3231,11 +3614,17 @@ bundle_discard() {
   mkdir -p "${DISCARD_DIR}/$(dirname "$rel")" && mv -f "$1" "${DISCARD_DIR}/${rel}"
 }
 
+# With "indexed", a top-level .deb goes back only when packages/Packages lists
+# it, and is deleted otherwise.
 bundle_discard_restore() {
   local f rel
   [ -d "$DISCARD_DIR" ] || return 0
   while IFS= read -r -d '' f; do
     rel="${f#"$DISCARD_DIR"/}"
+    if [ "${1:-}" = indexed ] && [ "$rel" = "${rel##*/}" ] \
+       && ! grep -qxF "Filename: ./${rel}" "${PACKAGES_DIR}/Packages" 2>/dev/null; then
+      continue
+    fi
     mkdir -p "${PACKAGES_DIR}/$(dirname "$rel")" && mv -f "$f" "${PACKAGES_DIR}/${rel}" && BUNDLE_DIRTY=1
   done < <(find "$DISCARD_DIR" -type f -name '*.deb' -print0)
   rm -rf "$DISCARD_DIR"
@@ -3250,14 +3639,14 @@ bundle_has_version() {
   return 1
 }
 
-# Move builds of $1 in $2 other than version $3 out of the bundle.
+# Move builds of $1 other than version $2 out of the bundle.
 drop_superseded() {
   local f keep rc=1
-  keep="$(bundle_has_version "$1" "$2" "$3")" || return 1
+  keep="$(bundle_has_version "$1" "$PACKAGES_DIR" "$2")" || return 1
   while read -r f; do
     [ -n "$f" ] && [ "$f" != "$keep" ] || continue
     bundle_discard "$f" && rc=0
-  done < <(bundle_debs "$1" "$2")
+  done < <(bundle_debs "$1")
   return $rc
 }
 
@@ -3302,10 +3691,13 @@ deb_intact() {
   dpkg-deb --fsys-tarfile "$1" > /dev/null 2>&1
 }
 
-# Candidate version of $1 as a clean machine would get it; empty if none.
-clean_candidate() {
-  LC_ALL=C apt-cache "${CLEAN_APT_OPTS[@]}" policy "$1" 2>/dev/null \
-    | awk '/^  Candidate:/ { if ($2 != "(none)") print $2; exit }'
+# Place .deb $1 in apt's cache, for the uninstall, and record it. Returns 1
+# when one is there already, or it is damaged or cannot be copied.
+cache_deb() {
+  local dest="/var/cache/apt/archives/${1##*/}"
+  [ ! -f "$dest" ] && deb_intact "$1" && sudo install -m 0644 "$1" /var/cache/apt/archives/ || return 1
+  sys_record_append "$CACHED_DEBS" "$dest"
+  return 0
 }
 
 # Download $1 at version $2 into $3, checked against the archive's SHA256;
@@ -3389,16 +3781,19 @@ discard_saved_apt_files() {
 # Put back the apt files a killed --download left changed.
 restore_stale_apt_files() {
   [ -d "$DOWNLOAD_SAVED" ] || return 0
-  local f saved
-  for f in "$UBUNTU_LIST" "$UBUNTU_PIN"; do
+  local f saved put=0
+  # A killed build's keyring mark, for download_mode.
+  [ -e "${DOWNLOAD_SAVED}/keyring-for-build" ] && STALE_BUILD_KEYRING=1
+  for f in "$UBUNTU_SOURCES" "$UBUNTU_PIN"; do
     saved="${DOWNLOAD_SAVED}/${f##*/}"
+    # Counted only when the file differed and was put back.
     if [ -f "$saved" ]; then
-      restore_apt_file "$saved" "$f" || return 1
-    elif [ -e "${saved}.absent" ]; then
-      restore_apt_file absent "$f" || return 1
+      cmp -s "$saved" "$f" 2>/dev/null || { restore_apt_file "$saved" "$f" || return 1; put=1; }
+    elif [ -e "${saved}.absent" ] && [ -e "$f" ]; then
+      restore_apt_file absent "$f" || return 1; put=1
     fi
   done
-  message warn "an earlier bundle build was stopped — the apt files it changed are put back"
+  [ "$put" -eq 1 ] && message warn "an earlier bundle build was stopped — the apt files it changed are put back"
   discard_saved_apt_files
 }
 
@@ -3421,15 +3816,20 @@ _download_exit() {
   # Copies not put back stay in DOWNLOAD_SAVED for the next run.
   restore_apt_file "$PREV_PIN_FILE" "$UBUNTU_PIN" \
     || { restored=0; message warn "could not put back ${UBUNTU_PIN} — the next --download retries"; }
-  restore_apt_file "$PREV_LIST_FILE" "$UBUNTU_LIST" \
-    || { restored=0; message warn "could not put back ${UBUNTU_LIST} — the next --download retries"; }
+  restore_apt_file "$PREV_SOURCES_FILE" "$UBUNTU_SOURCES" \
+    || { restored=0; message warn "could not put back ${UBUNTU_SOURCES} — the next --download retries"; }
   [ "$restored" = 1 ] && [ "$DOWNLOAD_DONE" = 1 ] \
     && message "this machine's Ubuntu apt source and pin are put back as they were"
-  [ "$restored" = 1 ] && [ -n "${PREV_LIST_FILE}${PREV_PIN_FILE}" ] && discard_saved_apt_files
-  if [ -n "$SUDO_KEEPALIVE_PID" ]; then
-    pkill -P "$SUDO_KEEPALIVE_PID" 2>/dev/null
-    kill "$SUDO_KEEPALIVE_PID" 2>/dev/null
+  [ "$restored" = 1 ] && [ -n "${PREV_SOURCES_FILE}${PREV_PIN_FILE}" ] && discard_saved_apt_files
+  # Kept while an Ubuntu source still names its key.
+  if [ "$KEYRING_FOR_BUILD" = 1 ] && [ "$restored" = 1 ] && is_installed ubuntu-keyring; then
+    if sudo apt-get purge -y ubuntu-keyring > /dev/null 2>&1; then
+      message "ubuntu-keyring, installed for this build only, is removed again"
+    else
+      message warn "could not remove ubuntu-keyring, installed for this build only — run: sudo apt-get purge ubuntu-keyring"
+    fi
   fi
+  stop_sudo_keepalive
   rm -rf "$PARTIAL_DIR" "${BUILD_PREFS_DIR:-}"
   if [ "$DOWNLOAD_DONE" = 1 ]; then
     rm -rf "$DISCARD_DIR"
@@ -3448,16 +3848,16 @@ _download_exit() {
     done
   fi
   if [ "$BUNDLE_DIRTY" = 1 ]; then
-    if [ "$DOWNLOAD_DONE" = 1 ]; then write_bundle_index; else write_bundle_index index-only; fi \
-      || message warn "could not rewrite ${PACKAGES_DIR}/Packages"
+    # A finished run has written its index already; this one is put back.
+    write_bundle_index index-only || message warn "could not rewrite ${PACKAGES_DIR}/Packages"
   fi
-  rm -f "${UBUNTU_RELEASE_CACHE:-}"
-  return $rc
+  rm_release_cache
+  # A return in an EXIT trap leaves the exit status alone; exit sets it.
+  [ "$restored" = 1 ] || [ "$rc" -ne 0 ] || rc=1
+  exit "$rc"
 }
 
 download_mode() {
-  [ "$(id -u)" -eq 0 ] && error "Do not run as root. Run as a normal user with sudo rights."
-
   message "Building or refreshing the offline bundle at ${GREEN}${PACKAGES_DIR}${ENDCOLOR}"
   message warn "This needs internet access. Ubuntu's archive is added to apt for the build"
   message warn "and this machine's Ubuntu source and pin are put back as they were afterwards."
@@ -3465,35 +3865,29 @@ download_mode() {
   sudo -v || error "User ${RUN_USER} cannot use sudo."
   # Keep sudo alive for the long download.
   ( while sleep 60 && kill -0 $$ 2>/dev/null; do sudo -n -v 2>/dev/null || exit 0; done ) \
-    > /dev/null 2>&1 9>&- &
+    > /dev/null 2>&1 &
   SUDO_KEEPALIVE_PID=$!
-  take_run_lock wait || error "Could not take the run lock ${UBUNTU_LOOK_LOCK}."
-  [ -f "$OFFLINE_LOCAL_LIST" ] && sudo rm -f "$OFFLINE_LOCAL_LIST"
-  migrate_home_records
+  take_run_lock
 
   trap '_download_exit' EXIT
-  trap 'echo ""; message warn "interrupted — stopping here"; exit 130' INT
-  trap 'exit 129' HUP; trap 'exit 143' TERM
   restore_stale_apt_files || error "Could not put back what an earlier --download changed (${DOWNLOAD_SAVED})"
   mkdir -p "$PACKAGES_DIR" || error "Cannot create ${PACKAGES_DIR}"
   rm -rf "$PARTIAL_DIR"
 
-  record_packages_before
-
-  # Generic tools, not recorded: uninstall keeps them.
-  local _missing_prereqs prereq
-  _missing_prereqs="$(missing_packages "curl ca-certificates")"
-  if [ -n "$_missing_prereqs" ]; then
-    sudo apt-get update -qq || message warn "apt update reported an error"
-    for prereq in $_missing_prereqs; do
-      installs_cleanly "$prereq" \
-        || error "Installing prerequisite ${prereq} would remove packages or cannot be done — install it by hand"
-      sudo apt-get install -y "$prereq" < /dev/null \
-        || error "Failed to install prerequisite: $prereq"
-      message "installed prerequisite ${prereq} (kept on uninstall)"
-      STATUS_CHANGES+=("Installed prerequisite: $prereq (kept on uninstall)")
-    done
+  # A machine without the look keeps no records of the build, and
+  # ubuntu-keyring only for the build.
+  if [ -s "$SYS_USERS" ]; then
+    record_packages_before
+  else
+    NO_SYSTEM_RECORDS=1
+    if [ "$STALE_BUILD_KEYRING" = 1 ] || ! is_installed ubuntu-keyring; then
+      KEYRING_FOR_BUILD=1
+      # A killed build leaves this mark; the next build removes the keyring.
+      sudo install -d "$DOWNLOAD_SAVED" && sudo touch "${DOWNLOAD_SAVED}/keyring-for-build"
+    fi
   fi
+
+  install_prereqs "$(missing_packages "curl ca-certificates")"
 
   bundle_discard_restore
   # A damaged .deb is dropped here and fetched again below.
@@ -3507,86 +3901,42 @@ download_mode() {
   done
 
   step "Discover current Ubuntu releases"
-  message "reading published Ubuntu releases from ${UBUNTU_MIRROR}..."
-  UBUNTU_ALL_CODENAMES="$(discover_ubuntu_codenames)"
-  [ -z "$UBUNTU_ALL_CODENAMES" ] && error "No Ubuntu release reachable at ${UBUNTU_MIRROR} — check your internet connection."
-  UBUNTU_CANDIDATE_CODENAMES="$(echo "$UBUNTU_ALL_CODENAMES" | tr ' ' '\n' \
-    | tail -n "$MAX_UBUNTU_CANDIDATES" | xargs)"
-
-  # A requested UBUNTU_CODENAME is configured even outside that window.
-  [ "$REQUESTED_CODENAME" = auto ] || [[ "$REQUESTED_CODENAME" =~ ^[a-z]+$ ]] \
-    || error "UBUNTU_CODENAME must be a codename in lower case letters, or auto."
-  if [ "$REQUESTED_CODENAME" != auto ] && ! in_word_list "$REQUESTED_CODENAME" "$UBUNTU_CANDIDATE_CODENAMES"; then
-    ubuntu_release_info "$REQUESTED_CODENAME" >/dev/null \
-      || error "UBUNTU_CODENAME=${REQUESTED_CODENAME} is not published on ${UBUNTU_MIRROR} or ${UBUNTU_OLD_MIRROR}"
-    UBUNTU_CANDIDATE_CODENAMES="$UBUNTU_CANDIDATE_CODENAMES $REQUESTED_CODENAME"
-  fi
+  discover_releases "$REQUESTED_CODENAME"
   message "candidate Ubuntu releases (oldest to newest): ${UBUNTU_CANDIDATE_CODENAMES}"
 
   step "Configure Ubuntu archive apt sources"
-  if ! is_installed ubuntu-keyring; then
-    sudo apt-get update -qq || message warn "apt update reported an error"
-    installs_cleanly ubuntu-keyring && apt_install_recorded ubuntu-keyring >/dev/null \
-      || error "Could not install Debian's ubuntu-keyring package (Ubuntu's archive keys)."
-    STATUS_CHANGES+=("Installed ubuntu-keyring (Ubuntu's archive keys, from Debian)")
-  fi
-  [ -s "$UBUNTU_KEYRING" ] || error "${UBUNTU_KEYRING} is missing — reinstall ubuntu-keyring."
+  ensure_ubuntu_keyring
 
-  # Kept so the source list and pin can be restored.
-  PREV_LIST_FILE="$(save_apt_file "$UBUNTU_LIST")" || error "Could not save ${UBUNTU_LIST}"
+  # Kept so the apt source and pin can be restored.
+  PREV_SOURCES_FILE="$(save_apt_file "$UBUNTU_SOURCES")" || error "Could not save ${UBUNTU_SOURCES}"
   PREV_PIN_FILE="$(save_apt_file "$UBUNTU_PIN")" || error "Could not save ${UBUNTU_PIN}"
 
   # Block every Ubuntu package until the full pin exists (this run only).
-  write_provisional_pin || true
+  write_provisional_pin
+  [ $? -eq 2 ] && error "Could not write ${UBUNTU_PIN}; the apt source was not changed."
   PINNED_BEFORE="$(pinned_codename)"
-  write_ubuntu_sources || true
+  # A fixed release is configured alone; auto chooses among the candidates.
+  local _codenames="$UBUNTU_CANDIDATE_CODENAMES"
+  [ "$REQUESTED_CODENAME" = auto ] || _codenames="$REQUESTED_CODENAME"
+  # shellcheck disable=SC2086
+  write_ubuntu_sources $_codenames || true
 
   step "Refresh package lists"
-  apt_update || error "apt update failed for the Ubuntu sources — they are put back as they were."
-  # An unserved architecture yields an empty Ubuntu index.
-  LC_ALL=C apt-cache madison gnome-shell-extension-ubuntu-dock yaru-theme-icon 2>/dev/null \
-    | awk -F'|' -v re="$UBUNTU_HOSTS_RE" '{ gsub(/^[ \t]+|[ \t]+$/, "", $3); if ($3 ~ re) f = 1 } END { exit !f }' \
+  apt_update
+  case $? in
+    0) ;;
+    3) error "apt is in use by another program — the sources are put back as they were; try again later." ;;
+    *) error "apt update failed for the Ubuntu sources — they are put back as they were." ;;
+  esac
+  ubuntu_index_has_packages \
     || error "${UBUNTU_MIRROR} serves no Ubuntu packages for ${UBUNTU_ARCH} — the sources are put back as they were."
 
   step "Resolve the gnome-shell-compatible Ubuntu release"
-  local _older _newest _debian_shell _newest_shell _pinned_now _newest_forced=0
   if [ "$REQUESTED_CODENAME" != auto ]; then
     UBUNTU_CODENAME="$REQUESTED_CODENAME"
     message "using the requested Ubuntu release ${GREEN}${UBUNTU_CODENAME}${ENDCOLOR} (UBUNTU_CODENAME)"
   else
-    UBUNTU_CODENAME="$(resolve_ubuntu_codename)"
-    _newest="$(echo "$UBUNTU_CANDIDATE_CODENAMES" | awk '{print $NF}')"
-    _debian_shell="$(shell_major)"
-    _newest_shell="$(ubuntu_shell_major "$_newest")"
-    if [ -z "$UBUNTU_CODENAME" ] && [ -n "$_debian_shell" ] && [ -n "$_newest_shell" ] \
-       && [ "$_debian_shell" -gt "$_newest_shell" ]; then
-      # gnome-shell is newer than every Ubuntu release.
-      UBUNTU_CODENAME="$_newest"; _newest_forced=1
-      message warn "gnome-shell ${_debian_shell} is newer than any Ubuntu release — using the newest, ${UBUNTU_CODENAME}"
-    elif [ -z "$UBUNTU_CODENAME" ]; then
-      message warn "no Ubuntu release in the current window has a theme this gnome-shell can load"
-      # The pinned release first, then older listed releases, then retired ones.
-      _pinned_now="$PINNED_BEFORE"
-      [ -n "$_pinned_now" ] || _pinned_now="$(sed -n 's/^UBUNTU_CODENAME=//p' "$BUNDLE_INFO" 2>/dev/null | head -1)"
-      if [[ "$_pinned_now" =~ ^[a-z]+$ ]] && ! in_word_list "$_pinned_now" "$UBUNTU_CANDIDATE_CODENAMES"; then
-        try_older_releases "$_pinned_now"
-      fi
-      if [ -z "$UBUNTU_CODENAME" ]; then
-        _older="$(echo "$UBUNTU_ALL_CODENAMES" | tr ' ' '\n' \
-          | head -n -"$MAX_UBUNTU_CANDIDATES" | tail -n "$MAX_UBUNTU_LOOKBACK" | xargs)"
-        [ -n "$_older" ] && try_older_releases "$_older"
-      fi
-      if [ -z "$UBUNTU_CODENAME" ]; then
-        _older="$(discover_retired_codenames)"
-        [ -n "$_older" ] && try_older_releases "$_older"
-      fi
-    fi
-    if [ -z "$UBUNTU_CODENAME" ]; then
-      UBUNTU_CODENAME="$(echo "$UBUNTU_CANDIDATE_CODENAMES" | awk '{print $1}')"
-      message warn "no Ubuntu release ships a shell theme for this gnome-shell — using ${UBUNTU_CODENAME}"
-    elif [ "$_newest_forced" = 0 ]; then
-      message "resolved Ubuntu release: ${GREEN}${UBUNTU_CODENAME}${ENDCOLOR} ($(gnome-shell --version 2>/dev/null || echo 'gnome-shell not installed')) — verified via simulated install"
-    fi
+    resolve_release "${PINNED_BEFORE:-$(sed -n 's/^UBUNTU_CODENAME=//p' "$BUNDLE_INFO" 2>/dev/null | head -1)}"
   fi
 
   step "Apply the Ubuntu pin to this build"
@@ -3596,26 +3946,32 @@ download_mode() {
   for f in /etc/apt/preferences.d/*; do
     [ -f "$f" ] && [ "$f" != "$UBUNTU_PIN" ] && cp "$f" "${BUILD_PREFS_DIR}/" 2>/dev/null
   done
-  write_ubuntu_pin "${BUILD_PREFS_DIR}/${UBUNTU_PIN##*/}" || true
+  write_ubuntu_pin "${BUILD_PREFS_DIR}/${UBUNTU_PIN##*/}"
+  [ $? -eq 2 ] && error "Could not write the build's apt pin in ${BUILD_PREFS_DIR}."
   BUILD_APT_OPTS=(-o "Dir::Etc::preferencesparts=${BUILD_PREFS_DIR}")
   # Versions as a clean machine would get them.
   CLEAN_APT_OPTS=("${BUILD_APT_OPTS[@]}" -o Dir::State::status=/dev/null)
 
-  # The chosen release gets universe, as on Ubuntu.
+  # The chosen release gets universe, as on Ubuntu. A release reached by
+  # looking back has joined the candidates.
   local _rc=0
-  write_ubuntu_sources || _rc=$?
+  _codenames="$UBUNTU_CANDIDATE_CODENAMES"
+  [ "$REQUESTED_CODENAME" = auto ] || _codenames="$REQUESTED_CODENAME"
+  # shellcheck disable=SC2086
+  write_ubuntu_sources $_codenames || _rc=$?
   [ "$_rc" -eq 2 ] && error "Ubuntu ${UBUNTU_CODENAME} did not answer — run --download again"
+  [ "$_rc" -eq 3 ] && error "Could not write ${UBUNTU_SOURCES} — run --download again"
   if [ "$_rc" -eq 0 ]; then
     apt_update_ubuntu_only \
+      || { drop_unserved_universe && apt_update_ubuntu_only; } \
       || error "apt update failed for Ubuntu ${UBUNTU_CODENAME} — run --download again"
   fi
 
   step "Resolve the full package set"
   local all_pkgs resolvable="" pkg combined="" ccand
   # The combined extension package where offered, beside the separate ones.
-  ccand="$(clean_candidate "$COMBINED_EXT_PKG")"
-  [ -n "$ccand" ] && LC_ALL=C apt-cache "${CLEAN_APT_OPTS[@]}" show "${COMBINED_EXT_PKG}=${ccand}" 2>/dev/null \
-    | grep -q '^Provides:.*gnome-shell-extension-ubuntu-dock' && combined="$COMBINED_EXT_PKG"
+  ccand="$(candidates_of "$COMBINED_EXT_PKG")"; ccand="${ccand#* }"
+  combined_carries_dock "$ccand" "${CLEAN_APT_OPTS[@]}" && combined="$COMBINED_EXT_PKG"
   # The target decides on the boot splash; ubuntu-keyring signs its source.
   # shellcheck disable=SC2086
   all_pkgs="$(printf '%s\n' ubuntu-keyring plymouth plymouth-themes \
@@ -3631,13 +3987,16 @@ download_mode() {
   done
   resolvable="$(echo "$resolvable" | xargs)"
 
-  local -A CANDIDATE_VER=()
+  # CLEAN_CAND: candidates as a clean machine would get them.
+  local -A CANDIDATE_VER=() CLEAN_CAND=()
   local needed="" sim_pkgs="" cand bver dep_pkg dep_ver
 
   step "Check for package updates (bundle vs. Ubuntu/Debian archive)"
+  # shellcheck disable=SC2086
+  while read -r pkg cand; do CLEAN_CAND[$pkg]="$cand"; done < <(candidates_of $resolvable)
   # Fetch what the bundle lacks, or holds at a version other than the candidate.
   for pkg in $resolvable; do
-    cand="$(clean_candidate "$pkg")"
+    cand="${CLEAN_CAND[$pkg]:-}"
     [ -n "$cand" ] || continue
     CANDIDATE_VER[$pkg]="$cand"
     sim_pkgs="$sim_pkgs $pkg"
@@ -3647,7 +4006,11 @@ download_mode() {
       message "  ${pkg}: not in bundle yet → ${cand}"
     elif [ "$bver" != "$cand" ]; then
       needed="$needed $pkg"
-      message "  ${pkg}: update available ${bver} → ${cand}"
+      if bundle_has_version "$pkg" "$PACKAGES_DIR" "$cand" >/dev/null; then
+        message "  ${pkg}: back to ${cand}, already in the bundle"
+      else
+        message "  ${pkg}: update available ${bver} → ${cand}"
+      fi
     fi
   done
 
@@ -3695,9 +4058,13 @@ download_mode() {
     done
   fi
   # A pkg:arch name belongs to another architecture.
-  for dep_pkg in $(echo "$sim_out" | awk '/^Inst /{print $2}' | grep -v ':' | sort -u); do
+  local inst
+  inst="$(echo "$sim_out" | awk '/^Inst /{print $2}' | grep -v ':' | sort -u)"
+  # shellcheck disable=SC2086
+  while read -r dep_pkg dep_ver; do CLEAN_CAND[$dep_pkg]="$dep_ver"; done < <(candidates_of $inst)
+  for dep_pkg in $inst; do
     [ -n "${CANDIDATE_VER[$dep_pkg]:-}" ] && continue
-    dep_ver="$(clean_candidate "$dep_pkg")"
+    dep_ver="${CLEAN_CAND[$dep_pkg]:-}"
     [ -n "$dep_ver" ] || continue
     CANDIDATE_VER[$dep_pkg]="$dep_ver"
     if [ "$(bundled_version "$dep_pkg")" != "$dep_ver" ]; then
@@ -3705,7 +4072,14 @@ download_mode() {
       message "  ${dep_pkg}: new dependency, not in bundle → ${dep_ver}"
     fi
   done
-  needed="$(echo "$needed" | xargs)"
+  # A bundle holding the candidate beside a newer build needs no fetch; the
+  # newer build is dropped below.
+  local fetch=""
+  for pkg in $needed; do
+    bundle_has_version "$pkg" "$PACKAGES_DIR" "${CANDIDATE_VER[$pkg]}" >/dev/null \
+      || fetch="${fetch} ${pkg}"
+  done
+  needed="$(echo "$fetch" | xargs)"
 
   if [ -z "$needed" ]; then
     message "bundle is already current — nothing new to download"
@@ -3737,13 +4111,13 @@ download_mode() {
   # Every build Debian lists, so an offline uninstall can put them back.
   local dvers dver
   for pkg in $LOOK_PACKAGES; do
-    dvers="$(LC_ALL=C apt-cache madison "$pkg" 2>/dev/null | awk -F'|' -v re="$UBUNTU_HOSTS_RE" '
-      { gsub(/^[ \t]+|[ \t]+$/, "", $2); gsub(/^[ \t]+|[ \t]+$/, "", $3)
-        if ($3 !~ re) print $2 }' | sort -u)"
+    dvers="$(madison_rows "$pkg" | awk -F'|' -v re="$UBUNTU_HOSTS_RE" '$2 !~ re { print $1 }' | sort -u)"
     [ -n "$dvers" ] || continue
     for dver in $dvers; do
       bundle_has_version "$pkg" "$DEBIAN_DEBS_DIR" "$dver" > /dev/null && continue
       if fetch_deb "$pkg" "$dver" "$DEBIAN_DEBS_DIR"; then
+        # An unfinished run takes it out again.
+        FETCHED_NEW+=("$FETCHED_DEB"); FETCHED_ADDED+=("$FETCHED_DEB")
         message "  ${pkg}: Debian's ${dver}"
       else
         message warn "could not download Debian's ${pkg}=${dver}"
@@ -3761,7 +4135,7 @@ download_mode() {
   # Superseded builds go first.
   local pruned=0 deb_pkg deb_arch unresolved="" graph
   for pkg in "${!CANDIDATE_VER[@]}"; do
-    if drop_superseded "$pkg" "$PACKAGES_DIR" "${CANDIDATE_VER[$pkg]}"; then
+    if drop_superseded "$pkg" "${CANDIDATE_VER[$pkg]}"; then
       BUNDLE_DIRTY=1
       message "  removed older builds of ${pkg}"
       pruned=$((pruned + 1))
@@ -3769,7 +4143,10 @@ download_mode() {
   done
   # The rest only when every stage package resolved.
   for pkg in $all_pkgs; do
-    [ -n "${CANDIDATE_VER[$pkg]:-}" ] || unresolved="$unresolved $pkg"
+    [ -n "${CANDIDATE_VER[$pkg]:-}" ] && continue
+    # Carried by the combined package, which the install then uses.
+    [ -n "$combined" ] && in_word_list "$pkg" "$SEPARATE_EXT_PKGS" && continue
+    unresolved="$unresolved $pkg"
   done
   if [ -n "$unresolved" ]; then
     message warn "not resolved this run (${unresolved# }) — leaving the bundle as it is"
@@ -3801,7 +4178,9 @@ download_mode() {
   # A gap is reported, not fatal.
   local missing=""
   for pkg in $all_pkgs; do
-    [ -n "$(bundled_version "$pkg")" ] || missing="$missing $pkg"
+    [ -n "$(bundled_version "$pkg")" ] && continue
+    [ -n "$combined" ] && in_word_list "$pkg" "$SEPARATE_EXT_PKGS" && continue
+    missing="$missing $pkg"
   done
   missing="$(echo "$missing" | xargs)"
   if [ -n "$missing" ]; then
@@ -3812,8 +4191,6 @@ download_mode() {
   fi
 
   step "Write the package index"
-  # The key file older bundles carried; ubuntu-keyring replaces it.
-  rm -f "${PACKAGES_DIR}/ubuntu-archive.gpg"
   write_bundle_index || error "could not write ${PACKAGES_DIR}/Packages"
   DOWNLOAD_DONE=1
 
@@ -3823,7 +4200,7 @@ download_mode() {
   echo -e "${GREEN}  $(grep -c '^Package:' "${PACKAGES_DIR}/Packages") package(s), Ubuntu ${UBUNTU_CODENAME}, ${UBUNTU_ARCH}, Debian $(debian_codename), gnome-shell $(shell_major)${ENDCOLOR}"
   summary_block "$YELLOW" "Not resolvable from any configured repo (${#STATUS_UNAVAIL[@]}):" "!" "" "${STATUS_UNAVAIL[@]}"
   summary_block "$RED" "Not done (${#STATUS_FAILED[@]}):" "!" "" "${STATUS_FAILED[@]}"
-  summary_block "$GREEN" "Changes to this machine:" "+" "" "${STATUS_CHANGES[@]}"
+  summary_block "$GREEN" "Changes (this machine and the bundle):" "+" "" "${STATUS_CHANGES[@]}"
   echo -e "${GREEN}Copy ubuntu-look.sh and packages/ to an offline machine with the same Debian release, architecture and gnome-shell, then run: bash ubuntu-look.sh --offline${ENDCOLOR}"
   echo -e "${GREEN}═════════════════════════════════════════════════════════${ENDCOLOR}"
   exit 0
@@ -3842,7 +4219,11 @@ load_bundle() {
 
   local key val b_codename="" b_mirror="" b_debian="" b_arch="" b_shell=""
   while IFS='=' read -r key val || [ -n "$key" ]; do
-    [[ "$val" =~ ^[A-Za-z0-9._:/+-]*$ ]] || continue
+    if ! [[ "$val" =~ ^[A-Za-z0-9._:/+-]*$ ]]; then
+      [ "$key" = UBUNTU_MIRROR ] \
+        && message warn "${BUNDLE_INFO} names a mirror with unsafe characters — ignored; ${UBUNTU_MIRROR} is used"
+      continue
+    fi
     case "$key" in
       UBUNTU_CODENAME) b_codename="$val" ;;
       UBUNTU_MIRROR)   b_mirror="$val" ;;
@@ -3894,7 +4275,7 @@ prepare_offline() {
       grep -qxF "Filename: ./${f##*/}" "${PACKAGES_DIR}/Packages" 2>/dev/null \
         || { rm -f "$f" && BUNDLE_DIRTY=1; }
     done
-    bundle_discard_restore
+    bundle_discard_restore indexed
     [ "$BUNDLE_DIRTY" = 1 ] && { write_bundle_index index-only || error "Could not rewrite ${PACKAGES_DIR}/Packages"; }
   elif [ -d "$DISCARD_DIR" ]; then
     error "${PACKAGES_DIR} holds an unfinished --download and cannot be written here.
@@ -3902,64 +4283,62 @@ prepare_offline() {
   fi
   restore_stale_apt_files || error "Could not put back what an earlier --download changed (${DOWNLOAD_SAVED})"
 
-  LOCAL_LIST="$(mktemp --suffix=.list)" || error "Could not create a temporary apt source"
-  printf 'deb [trusted=yes] file://%s ./\n' "$(uri_path_encode "$PACKAGES_DIR")" > "$LOCAL_LIST"
-  APT_OPTS=(-o "Dir::Etc::sourcelist=${LOCAL_LIST}" -o "Dir::Etc::sourceparts=-")
+  LOCAL_SOURCES="$(mktemp --suffix=.sources)" || error "Could not create a temporary apt source"
+  printf 'Types: deb\nURIs: file://%s\nSuites: ./\nTrusted: yes\n' "$(uri_path_encode "$PACKAGES_DIR")" > "$LOCAL_SOURCES"
+  APT_OPTS=(-o "Dir::Etc::sourcelist=${LOCAL_SOURCES}" -o "Dir::Etc::sourceparts=-")
   sudo apt-get update "${APT_OPTS[@]}" -o APT::Get::List-Cleanup=0 2>/dev/null \
     || error "Failed to load the package index of ${PACKAGES_DIR}"
   message "bundle: $(grep -c '^Package:' "${PACKAGES_DIR}/Packages") packages, Ubuntu ${UBUNTU_CODENAME}${BUNDLE_DATE:+, built ${BUNDLE_DATE}}"
 
   # Debian's builds of the look packages go into apt's cache, for the uninstall.
   for f in "$DEBIAN_DEBS_DIR"/*_"$UBUNTU_ARCH".deb "$DEBIAN_DEBS_DIR"/*_all.deb; do
-    [ -f "$f" ] && [ ! -f "/var/cache/apt/archives/${f##*/}" ] || continue
-    if deb_intact "$f" && sudo install -m 0644 "$f" /var/cache/apt/archives/; then
-      sys_record_append "$CACHED_DEBS" "/var/cache/apt/archives/${f##*/}"
-      n=$((n + 1))
-    fi
+    [ -f "$f" ] && cache_deb "$f" && n=$((n + 1))
   done
   [ "$n" -gt 0 ] && STATUS_CHANGES+=("Debian's builds of ${n} look package(s) placed in apt's cache, for the uninstall")
 
   step "Write the Ubuntu pin"
   apt_before="$(apt_config_sum)"
   if ! is_installed ubuntu-keyring; then
-    if installs_cleanly ubuntu-keyring && apt_install_recorded ubuntu-keyring >/dev/null; then
+    if apt_install_checked ubuntu-keyring; then
       STATUS_CHANGES+=("Installed ubuntu-keyring (Ubuntu's archive keys, from Debian)")
     else
       message warn "ubuntu-keyring could not be installed from the bundle"
     fi
   fi
-  if write_ubuntu_pin; then
-    STATUS_CHANGES+=("Ubuntu theme pin applied (${UBUNTU_CODENAME})")
-  else
-    STATUS_NOCHANGE+=("Ubuntu theme pin already current")
-  fi
-  remove_unattended_origins
-  # An existing Ubuntu source list is kept, and narrowed after aligning.
-  if [ -f "$UBUNTU_LIST" ] && configured_codenames | grep -qxF "$UBUNTU_CODENAME"; then
+  write_ubuntu_pin
+  case $? in
+    0) STATUS_CHANGES+=("Ubuntu theme pin applied (${UBUNTU_CODENAME})") ;;
+    1) STATUS_NOCHANGE+=("Ubuntu theme pin already current") ;;
+    2) error "Could not write ${UBUNTU_PIN}; Ubuntu packages stay blocked. Run this again." ;;
+  esac
+  # An existing Ubuntu apt source is kept, and narrowed after aligning.
+  if [ -f "$UBUNTU_SOURCES" ] && configured_codenames | grep -qxF "$UBUNTU_CODENAME"; then
     NARROW_WITHOUT_ARCHIVE=1
-  elif [ -f "$UBUNTU_LIST" ]; then
+  elif [ -f "$UBUNTU_SOURCES" ]; then
     STATUS_NOCHANGE+=("Ubuntu apt source left as it is (it does not name ${UBUNTU_CODENAME}) — an online run updates it")
   else
     STATUS_NOCHANGE+=("No Ubuntu apt source written offline — an online run adds it")
   fi
-  [ "$(apt_config_sum)" != "$apt_before" ] && invalidate_refresh_state
+  [ "$(apt_config_sum)" != "$apt_before" ] && invalidate_release_state
   return 0
 }
 
-# --offline: keep only the bundle's release in the source list.
+# --offline: keep only the bundle's release in the apt source.
 narrow_without_archive() {
-  [ "${NARROW_WITHOUT_ARCHIVE:-0}" = 1 ] && [ -f "$UBUNTU_LIST" ] || return 0
+  [ "${NARROW_WITHOUT_ARCHIVE:-0}" = 1 ] && [ -f "$UBUNTU_SOURCES" ] || return 0
   local tmp
   tmp="$(mktemp)"
-  awk -v cn="$UBUNTU_CODENAME" '
-    /^# configured: / { print "# configured: " cn; next }
-    /^deb / { r = ""
-              for (i = 2; i < NF; i++) if ($i ~ /:\/\//) { r = $(i + 1); break }
-              sub(/-updates$/, "", r); if (r != cn) next }
-    { print }' "$UBUNTU_LIST" > "$tmp"
-  if ! cmp -s "$tmp" "$UBUNTU_LIST" && sudo install -m 0644 "$tmp" "$UBUNTU_LIST"; then
+  # Paragraph by paragraph: the header, and the stanza of that release.
+  CN="$UBUNTU_CODENAME" awk -v RS= '
+    { keep = 1; sub(/\n+$/, "")
+      if (match($0, /(^|\n)Suites:[^\n]*/)) {
+        split(substr($0, RSTART, RLENGTH), f, " ")
+        sub(/-updates$/, "", f[2]); keep = (f[2] == ENVIRON["CN"])
+      }
+      if (keep) printf "%s%s\n", (n++ ? "\n" : ""), $0 }' "$UBUNTU_SOURCES" > "$tmp"
+  if ! cmp -s "$tmp" "$UBUNTU_SOURCES" && sudo install -m 0644 "$tmp" "$UBUNTU_SOURCES"; then
     STATUS_CHANGES+=("Ubuntu apt source narrowed to ${UBUNTU_CODENAME}")
-    invalidate_refresh_state
+    invalidate_release_state
   fi
   rm -f "$tmp"
 }
@@ -3971,9 +4350,7 @@ cache_replaced_debs() {
   while read -r p; do
     [ -n "$p" ] || continue
     while read -r f; do
-      [ -n "$f" ] && [ ! -f "/var/cache/apt/archives/${f##*/}" ] && deb_intact "$f" \
-        && sudo install -m 0644 "$f" /var/cache/apt/archives/ \
-        && sys_record_append "$CACHED_DEBS" "/var/cache/apt/archives/${f##*/}"
+      [ -n "$f" ] && cache_deb "$f"
     done < <(bundle_debs "$p")
   done < "$REPLACED_BY_COMBINED"
 }
@@ -3989,10 +4366,22 @@ for _arg in "$@"; do
   esac
 done
 
-if [ "${UBUNTU_LOOK_LOG:-1}" != "0" ] && [ -z "${UBUNTU_LOOK_LOGGING:-}" ]; then
-  _log_name=ubuntu-look
-  case " $* " in *" --uninstall "*|*" uninstall "*) _log_name=uninstall ;; esac
-  _log_file="${HOME}/${_log_name}-$(date +%Y%m%d-%H%M%S).log"
+RED="\e[31m"
+GREEN="\e[32m"
+YELLOW="\e[33m"
+ENDCOLOR="\e[0m"
+
+# Before the run log, so root leaves no log file behind.
+[ "$(id -u)" -eq 0 ] \
+  && error "Do not run as root. Run as a normal user with sudo rights."
+
+# The logged run re-reads the script, so it must come from a file; the log
+# must be writable, or the run would die with the pipe.
+_log_name=ubuntu-look
+case " $* " in *" --uninstall "*) _log_name=uninstall ;; esac
+_log_file="${HOME:-/nonexistent}/${_log_name}-$(date +%Y%m%d-%H%M%S).log"
+if [ "${UBUNTU_LOOK_LOG:-1}" != "0" ] && [ -z "${UBUNTU_LOOK_LOGGING:-}" ] \
+   && { [ -f "${BASH_SOURCE[0]}" ] && : > "$_log_file"; } 2>/dev/null; then
 
   # Pass on the shell options -u, -e and -x.
   _opts=()
@@ -4002,12 +4391,16 @@ if [ "${UBUNTU_LOOK_LOG:-1}" != "0" ] && [ -z "${UBUNTU_LOOK_LOGGING:-}" ]; then
 
   export UBUNTU_LOOK_LOGGING=1
   echo "Recording this run to ${_log_file}"
-  # tee and sed ignore Ctrl-C, so the summary still reaches the log.
+  # tee and sed ignore Ctrl-C and a closed terminal, so the summary still
+  # reaches the log; a failed log write does not stop the run.
   bash "${_opts[@]}" "${BASH_SOURCE[0]}" "$@" 2>&1 \
-    | (trap '' INT; tee >(trap '' INT; sed -r 's/\x1b\[[0-9;]*[mK]//g' > "$_log_file"))
+    | (trap '' INT HUP; tee --output-error=warn-nopipe \
+         >(trap '' INT HUP; sed -r 's/\x1b\[[0-9;]*[mK]//g' > "$_log_file"))
   _rc=${PIPESTATUS[0]}
   echo "Log written to ${_log_file}"
   exit "$_rc"
+elif [ "${UBUNTU_LOOK_LOG:-1}" != "0" ] && [ -z "${UBUNTU_LOOK_LOGGING:-}" ]; then
+  echo "No run log: the script is not read from a file, or ${_log_file} is not writable."
 fi
 
 # Debian leaves sbin (update-grub, plymouth tools) off a user's PATH.
@@ -4015,6 +4408,10 @@ case ":$PATH:" in
   *:/usr/sbin:*) ;;
   *) PATH="$PATH:/usr/local/sbin:/usr/sbin:/sbin" ;;
 esac
+
+# The look's apt source and pin.
+UBUNTU_SOURCES=/etc/apt/sources.list.d/ubuntu-themes.sources
+UBUNTU_PIN=/etc/apt/preferences.d/ubuntu-themes
 
 # Facts for the log.
 {
@@ -4037,7 +4434,7 @@ esac
     [ -n "$1" ] || return 0
     sed -n 's/^Version: //p' /var/lib/apt/lists/*_dists_"$1"_InRelease 2>/dev/null | head -1
   }
-  _pinned="$(pinned_codename /etc/apt/preferences.d/ubuntu-themes)"
+  _pinned="$(pinned_codename "$UBUNTU_PIN")"
   # The line after "***" is the installed version's source.
   _float="$(apt-cache policy yaru-theme-gtk 2>/dev/null |
     awk '/^ \*\*\*/{getline; if ($0 ~ /:\/\//) print $3; exit}')"
@@ -4047,23 +4444,28 @@ esac
   _u1="${_pv:+${_pv} (${_pinned})}"; _u1="${_u1:-${_pinned}}"
   _u2="${_fv:+${_fv} (${_float})}"; _u2="${_u2:-${_float}}"
   echo "### pinned  : ${_u1:+ubuntu }${_u1:-none pinned yet}"
-  echo "### themes  : ${_u2:+from }${_u2:-not installed yet}"
+  # Installed but with no source left (after --prepare-upgrade, say).
+  if [ -z "$_u2" ] && _yv="$(dpkg-query -W -f='${Version}' yaru-theme-gtk 2>/dev/null)" \
+     && [ -n "$_yv" ] && [ "$(dpkg-query -W -f='${db:Status-Status}' yaru-theme-gtk 2>/dev/null)" = installed ]; then
+    _u2="installed ${_yv}, no source"
+    echo "### themes  : ${_u2}"
+  else
+    echo "### themes  : ${_u2:+from }${_u2:-not installed yet}"
+  fi
   echo ""
 }
 
 set -u
 
-# Mode flags may appear anywhere; other words are stage names. The bare
-# words of earlier versions (download, uninstall, prepare-upgrade), and
-# --no-refresh for --offline, still work.
+# Mode flags may appear anywhere; other words are stage names.
 MODE=online
 arguments=""
 for _arg in "$@"; do
   case "$_arg" in
-    --download|download)     _mode=download ;;
-    --offline|--no-refresh)  _mode=offline ;;
-    --uninstall|uninstall)   _mode=uninstall ;;
-    *)                       arguments="${arguments:+${arguments} }${_arg}"; continue ;;
+    --download)   _mode=download ;;
+    --offline)    _mode=offline ;;
+    --uninstall)  _mode=uninstall ;;
+    *)            arguments="${arguments:+${arguments} }${_arg}"; continue ;;
   esac
   [ "$MODE" = online ] || [ "$MODE" = "$_mode" ] \
     || { echo "Give only one of --download, --offline and --uninstall." >&2; exit 1; }
@@ -4088,66 +4490,59 @@ MANUAL_BEFORE="${SYS_RECORDS}/manual-before.txt"
 INSTALLED_MANIFEST="${SYS_RECORDS}/installed-by-script.txt"
 # "<package> <version it replaced>", one per line.
 UPGRADED_MANIFEST="${SYS_RECORDS}/upgraded-by-script.txt"
-REMOVED_RECORD="${SYS_RECORDS}/removed-by-script.txt"
 REMOVED_FOR_UPGRADE="${SYS_RECORDS}/removed-for-upgrade.txt"
+# "<release> <mirror>" that answered without universe; kept on main until a
+# later run finds universe there.
+NO_UNIVERSE_RECORD="${SYS_RECORDS}/no-universe.txt"
 GRUB_ADDED_FILE="${SYS_RECORDS}/grub-cmdline-added.txt"
+# The id of the boot that owes a reboot for a system change (see need_reboot).
+REBOOT_OWED="${SYS_RECORDS}/reboot-owed"
+# Which of 'quiet splash' the kernel command line had at the first run.
+GRUB_SEEN_FILE="${SYS_RECORDS}/grub-cmdline-seen.txt"
 PLYMOUTH_BEFORE_FILE="${SYS_RECORDS}/plymouth-theme-before.txt"
+# plymouthd.conf as it was before the install, kept for the uninstall.
+PLYMOUTH_CONF=/etc/plymouth/plymouthd.conf
+PLYMOUTH_CONF_BEFORE="${SYS_RECORDS}/plymouthd.conf.before"
+# The uninstall's package snapshot, kept until it finishes; an install drops it.
+UNINSTALL_SNAPSHOT="${SYS_RECORDS}/before-uninstall.txt"
+# Present while an initramfs rebuild has failed and is still owed.
+INITRAMFS_PENDING="${SYS_RECORDS}/initramfs-pending"
 # Debian .debs an offline install placed in apt's cache, one path per line.
 CACHED_DEBS="${SYS_RECORDS}/debs-in-apt-cache.txt"
-BACKUP_REL=.ubuntu-look-backup
-BACKUP_DIR="${HOME:-}/${BACKUP_REL}"
+BACKUP_DIR="${HOME:-}/.ubuntu-look-backup"
+# Copies of system records an unfinished uninstall keeps for a later run.
+DCONF_PROFILE_COPY="${BACKUP_DIR}/dconf-system-profile.ini"
+MANIFEST_COPY="${BACKUP_DIR}/look-packages.txt"
 BACKUP_ORIGINAL="${BACKUP_DIR}/original"
 DASH_TO_DOCK_UUID=dash-to-dock@micxgx.gmail.com
 # Present when the installer turned Dash-to-Dock off for this user.
 DASH_TO_DOCK_OFF="${BACKUP_DIR}/dash-to-dock-turned-off"
 # Present from a fresh install until Ubuntu's defaults replace the user's own.
 DEFAULTS_PENDING="${BACKUP_ORIGINAL}/ubuntu-defaults-pending"
-# Stage packages. Manifests of earlier versions may lack some of them;
-# migration adds those that were not installed before.
-LEGACY_STAGE_PACKAGES="plymouth plymouth-themes dconf-cli fonts-ubuntu ubuntu-wallpapers
-  gnome-shell-extension-user-theme gnome-shell-extension-desktop-icons-ng
-  gnome-shell-extension-ubuntu-dock gnome-shell-extension-ubuntu-tiling-assistant
-  gnome-shell-extension-appindicator gir1.2-dbusmenu-gtk3-0.4 humanity-icon-theme
-  yaru-theme-gnome-shell yaru-theme-gtk yaru-theme-icon yaru-theme-sound"
+SAVED_OPTION_NAMES="UBUNTU_CODENAME UBUNTU_INCLUDE_DEVEL UBUNTU_MIRROR UBUNTU_BOOT_SPLASH PLYMOUTH_THEME"
 
-# Marks an options file whose UBUNTU_LOOK_AUTO_REFRESH is the user's choice.
-REFRESH_OPT_IN_MARK="# auto-refresh: opt-in"
-SAVED_OPTION_NAMES="UBUNTU_CODENAME UBUNTU_INCLUDE_DEVEL UBUNTU_MIRROR UBUNTU_BOOT_SPLASH PLYMOUTH_THEME UBUNTU_LOOK_AUTO_REFRESH"
-
-# --refresh: the unattended root run of ubuntu-look-refresh.service. It
-# updates system state only: sources, pin, look packages, dconf databases.
+# --refresh: list what an update would change, then ask before applying it.
 REFRESH=0
-in_word_list --refresh "$arguments" && REFRESH=1
-# Set when this run was given PLYMOUTH_THEME (not only a saved one).
-PLYMOUTH_THEME_GIVEN=""
-if [ "$REFRESH" = 1 ]; then
-  [ "$(id -u)" -eq 0 ] || { echo "--refresh is run by ubuntu-look-refresh.service, as root" >&2; exit 1; }
+if in_word_list --refresh "$arguments"; then
+  case "$arguments" in
+    --refresh) ;;
+    *) echo "--refresh takes no other arguments (got '${arguments}')" >&2; exit 1 ;;
+  esac
   [ "$MODE" = online ] || { echo "--refresh takes no mode flag" >&2; exit 1; }
-  # A system service has no HOME; curl and apt need one.
-  HOME="$(getent passwd root | cut -d: -f6)"
-  export HOME
+  REFRESH=1
   arguments=""
-  # shellcheck disable=SC2086
-  unset $SAVED_OPTION_NAMES
-  sudo() { "$@"; }
-  # No prompts; conffile questions keep the admin's file.
-  export DEBIAN_FRONTEND=noninteractive
-  apt-get() {
-    command apt-get -o DPkg::Lock::Timeout=900 \
-      -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold "$@"
-  }
-else
-  PLYMOUTH_THEME_GIVEN="${PLYMOUTH_THEME:+1}"
-  # Wait for an apt lock instead of failing.
-  sudo() {
-    if [ "${1:-}" = apt-get ]; then
-      shift
-      command sudo apt-get -o DPkg::Lock::Timeout=300 "$@"
-    else
-      command sudo "$@"
-    fi
-  }
 fi
+# Set when this run was given PLYMOUTH_THEME (not only a saved one).
+PLYMOUTH_THEME_GIVEN="${PLYMOUTH_THEME:+1}"
+# Wait for an apt lock instead of failing.
+sudo() {
+  if [ "${1:-}" = apt-get ]; then
+    shift
+    command sudo apt-get -o DPkg::Lock::Timeout=300 "$@"
+  else
+    command sudo "$@"
+  fi
+}
 load_saved_options
 
 # The bundle: --download builds it, --offline installs from it.
@@ -4160,17 +4555,26 @@ DISCARD_DIR="${PACKAGES_DIR}/.discard"
 # Debian's own builds of the look packages, for an uninstall without network.
 DEBIAN_DEBS_DIR="${PACKAGES_DIR}/debian"
 BUNDLE_DATE=""
-# --offline: the bundle as the only apt source, through a temporary list.
-LOCAL_LIST=""
+# --offline: the bundle as the only apt source, through a temporary file.
+LOCAL_SOURCES=""
 # Options for every apt call of the stages (the bundle's source, --offline).
 APT_OPTS=()
 # --download state, for _download_exit.
+# Where --download keeps the machine's Ubuntu source and pin while it runs.
+DOWNLOAD_SAVED="${SYS_DIR}/download-saved"
+# The .deb fetch_deb placed last.
+FETCHED_DEB=""
 BUNDLE_DIRTY=0
 FETCHED_NEW=()       # .debs this run added; removed if it does not finish
 FETCHED_ADDED=()     # of those, packages new to the bundle
 SUDO_KEEPALIVE_PID=""
 DOWNLOAD_DONE=0
-PREV_LIST_FILE=""    # the machine's Ubuntu source list and pin, to restore
+# --download on a machine without the look: no system records, and an
+# ubuntu-keyring it installs goes again.
+NO_SYSTEM_RECORDS=0
+KEYRING_FOR_BUILD=0
+STALE_BUILD_KEYRING=0
+PREV_SOURCES_FILE=""  # the machine's Ubuntu apt source and pin, to restore
 PREV_PIN_FILE=""
 BUILD_APT_OPTS=()    # the full pin, for the build's own apt calls only
 CLEAN_APT_OPTS=()
@@ -4194,6 +4598,11 @@ yaru-theme-gnome-shell yaru-theme-gtk yaru-theme-icon yaru-theme-sound"
 # Ubuntu release supplying the look; see resolve_ubuntu_codename().
 UBUNTU_CODENAME="${UBUNTU_CODENAME:-auto}"
 REQUESTED_CODENAME="$UBUNTU_CODENAME"
+# Checked before any network work; --offline takes the bundle's release.
+case "$MODE" in online|download)
+  [[ "$UBUNTU_CODENAME" =~ ^[a-z]+$ ]] \
+    || error "UBUNTU_CODENAME must be a codename in lower case letters, or auto." ;;
+esac
 
 # amd64 and i386 use archive.ubuntu.com, others ports.ubuntu.com.
 UBUNTU_ARCH="$(dpkg --print-architecture 2>/dev/null || echo amd64)"
@@ -4243,40 +4652,32 @@ PIN_VERSION="v22-2026-09-26"
 # The look's extensions, for the profile, enabling and verification.
 THEME_EXT_UUID="ubuntu-look-theme@ubuntu-look"
 SHELL_EXTENSIONS="ubuntu-appindicators@ubuntu.com ubuntu-dock@ubuntu.com ding@rastersoft.com tiling-assistant@ubuntu.com ${THEME_EXT_UUID}"
-# Earlier versions themed the shell through user-theme.
-USER_THEME_UUID="user-theme@gnome-shell-extensions.gcampax.github.com"
 
 # Ubuntu's defaults live in their own dconf database, read only by users of
-# the look: their session's DCONF_PROFILE adds it after the user database.
+# the look: their session's DCONF_PROFILE adds it after the system's databases.
 # The database name has no hyphen: dconf's change signal uses it in a D-Bus path.
 LOOK_PROFILE_NAME=ubuntu-look
 LOOK_DB_NAME=ubuntu_look
-LOOK_DB_DIR="/etc/dconf/db/${LOOK_DB_NAME}.d"
-LOOK_DB_FILE="${LOOK_DB_DIR}/10-ubuntu-look"
+LOOK_DB_FILE="/etc/dconf/db/${LOOK_DB_NAME}.d/10-ubuntu-look"
 LOOK_PROFILE="/etc/dconf/profile/${LOOK_PROFILE_NAME}"
-# The database name of earlier versions.
-OLD_LOOK_DB_NAME=ubuntu-look
 LOOK_ENV_REL=.config/environment.d/90-ubuntu-look.conf
 LOOK_ENV_FILE="${HOME:-}/${LOOK_ENV_REL}"
+# The one-shot entry that switches the extensions on at the next login.
+EXT_AUTOSTART_FILE="${HOME:-}/.config/autostart/ubuntu-look-enable-extensions.desktop"
+EXT_AUTOSTART_SCRIPT="${HOME:-}/.local/share/ubuntu-look/enable-extensions.sh"
 # Boot-time removal of the profile, left by an uninstall while it was in use.
 LOOK_CLEANUP_CONF=/etc/tmpfiles.d/ubuntu-look-cleanup.conf
+# Present when the installer created /etc/dconf/profile.
+DCONF_PROFILE_DIR_MADE="${SYS_RECORDS}/dconf-profile-dir-created"
 # session-migration (a Yaru dependency) would write color-scheme at login
 # because of the look database, so it is masked.
 SESSION_MIGRATION_MASK=/etc/systemd/user/session-migration.service
 # Present when the installer made the mask; the uninstall removes only that.
 SESSION_MIGRATION_MASKED="${SYS_RECORDS}/session-migration-masked"
 DCONF_USER_PROFILE=/etc/dconf/profile/user
-# Where earlier versions put the defaults, for every user.
-LEGACY_DB_FILE=/etc/dconf/db/local.d/10-ubuntu-look
 
 # Ubuntu's archive keys, from Debian's ubuntu-keyring package.
 UBUNTU_KEYRING=/usr/share/keyrings/ubuntu-archive-keyring.gpg
-# The keyring earlier versions fetched from a keyserver.
-LEGACY_UBUNTU_KEYRING=/etc/apt/keyrings/ubuntu-archive.gpg
-UBUNTU_LIST=/etc/apt/sources.list.d/ubuntu-themes.list
-UBUNTU_PIN=/etc/apt/preferences.d/ubuntu-themes
-# Left by offline installs of earlier versions.
-OFFLINE_LOCAL_LIST=/etc/apt/sources.list.d/ubuntu-look-offline-local.list
 
 # Per-run cache of "<codename> <version> <state> <mirror>".
 UBUNTU_RELEASE_CACHE="$(mktemp)"
@@ -4286,7 +4687,7 @@ declare -a STATUS_UPGRADED=()
 declare -a STATUS_ALREADY=()
 # Packages with a newer Ubuntu build this Debian cannot take (not a failure).
 declare -a STATUS_HELD=()
-# Every package the stages name, for log_final_state().
+# Every package the stages name, for log_final_state() and --refresh.
 ALL_STAGE_PACKAGES="$(printf '%s ' "${packages[@]}" | xargs -n1 | sort -u | xargs)"
 
 declare -a STATUS_CHANGES=()
@@ -4295,34 +4696,49 @@ declare -a STATUS_FAILED=()
 declare -a STATUS_EXT_FAILED=()
 # Builds ensure_package tried and turned down this run, as "pkg=version".
 REJECTED_BUILDS=""
+# Set by apt_install_checked: the removals that made it refuse.
+REMOVES=""
+# Packages align_look_packages kept at their build on purpose.
+ALIGN_KEPT=""
+# Set later in the run; empty until then, so _on_exit never acts on an
+# inherited value.
+PREV_UBUNTU_SOURCES=""
+RUN_STARTED=0
+PREPARE_UPGRADE=0
+NARROW_WITHOUT_ARCHIVE=0
+# Set by plymouth_put_back.
+PLY_WAS=""; PLY_CURRENT=""
+# Extensions enable_shell_extensions takes off, and turns on, in the same write.
+ENABLE_DROP=""
+ENABLE_ADD=""
+# Set once fit_fonts_to_release has run.
+FONTS_FITTED=0
+# Set by refresh_check: 1 when the Ubuntu release needs no new check.
+REFRESH_UNCHANGED=0
+# Set once rebuild_initramfs_recorded has run in this run.
+INITRAMFS_REBUILT=0
+APT_LISTS_FRESH=0
 # Set by ensure_package: the version it settled on.
 ENSURE_VERSION=""
-# apt failures this run; a refresh with any is retried rather than recorded.
-APT_ERRORS=0
 # Requested but absent from the bundle (--offline).
 declare -a STATUS_UNAVAIL=()
 GSETTINGS_UNCHANGED=0
-GSETTINGS_KEPT=0
 declare -a SETTINGS_KEPT=()
+# A reboot an interrupted run of this boot owes is still asked for.
 REBOOT_NEEDED=0
+[ -s "$REBOOT_OWED" ] \
+  && [ "$(cat "$REBOOT_OWED" 2>/dev/null)" = "$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)" ] \
+  && REBOOT_NEEDED=1
 RELOGIN_NEEDED=0
+# Set by the extension steps: Dash-to-Dock is switched at the next login;
+# an extension was recorded as switched on.
+DASH_TO_DOCK_PENDING=0
+EXT_RECORDED=0
 STEP=0
-
-RED="\e[31m"
-GREEN="\e[32m"
-YELLOW="\e[33m"
-ENDCOLOR="\e[0m"
-# No colours in the journal.
-[ "$REFRESH" = 1 ] && { RED=""; GREEN=""; YELLOW=""; ENDCOLOR=""; }
 
 # The look itself. Only these may replace an installed Debian build; the
 # uninstall restores the recorded version.
 LOOK_PACKAGES="yaru-theme-gnome-shell yaru-theme-gtk yaru-theme-icon yaru-theme-sound fonts-ubuntu ubuntu-wallpapers"
-
-# Every package the pin admits from the pinned release.
-UBUNTU_PINNED_PACKAGES="${LOOK_PACKAGES} gnome-shell-extension-ubuntu-dock"
-UBUNTU_PINNED_PACKAGES+=" gnome-shell-extension-ubuntu-tiling-assistant session-migration humanity-icon-theme"
-UBUNTU_PINNED_PACKAGES+=" gnome-shell-ubuntu-extensions"
 
 # One Ubuntu package that replaces the four below, used where offered.
 COMBINED_EXT_PKG="gnome-shell-ubuntu-extensions"
@@ -4334,9 +4750,18 @@ UBUNTU_SHELL_EXT_PKGS+=" ${COMBINED_EXT_PKG}"
 # Packages apt may remove this run: those the combined package replaces.
 ALLOWED_REMOVALS=""
 
+# Every package the pin admits from the pinned release.
+UBUNTU_PINNED_PACKAGES="${LOOK_PACKAGES} gnome-shell-extension-ubuntu-dock"
+UBUNTU_PINNED_PACKAGES+=" gnome-shell-extension-ubuntu-tiling-assistant session-migration humanity-icon-theme"
+UBUNTU_PINNED_PACKAGES+=" ${COMBINED_EXT_PKG}"
+
 # The copy of /etc/default/grub a failed update-grub left behind; the caller
 # reports it.
 GRUB_BACKUP_KEPT=""
+# GRUB_CMDLINE_LINUX_DEFAULT's line in /etc/default/grub.
+GRUB_KEY_RE='^[[:space:]]*(export[[:space:]]+)?GRUB_CMDLINE_LINUX_DEFAULT='
+# Set by strip_grub_words: the words this script added.
+GRUB_ADDED_WORDS=""
 
 # The extensions already switched on once for this user.
 EXTENSIONS_ON_RECORD="${BACKUP_DIR}/extensions-switched-on.txt"
@@ -4428,15 +4853,8 @@ WALLPAPER_KEYS=(
 # Ubuntu leaves the colour scheme at GNOME's default: the light style.
 COLOR_SCHEME_KEY="org/gnome/desktop/interface|color-scheme"
 
-# Written by earlier versions for unattended-upgrades; now only removed.
-UNATTENDED_ORIGINS=/etc/apt/apt.conf.d/52ubuntu-look-unattended-upgrades
-
-REFRESH_LIB_DIR=/usr/local/lib/ubuntu-look
-REFRESH_SCRIPT="${REFRESH_LIB_DIR}/ubuntu-look.sh"
-REFRESH_SERVICE=/etc/systemd/system/ubuntu-look-refresh.service
-REFRESH_TIMER=/etc/systemd/system/ubuntu-look-refresh.timer
-REFRESH_STATE="${SYS_DIR}/refresh-state"
-REFRESH_ATTEMPT="${SYS_DIR}/refresh-attempt"
+# What the last full run was resolved against, for later runs and --refresh.
+RELEASE_STATE="${SYS_DIR}/refresh-state"
 
 # The pinned release, set by unchanged_since_last_run() when nothing changed.
 KEPT_CODENAME=""
@@ -4455,9 +4873,6 @@ LOCAL_SHELL_DIRS_FILE="${SYS_RECORDS}/local-shell-dirs.txt"
 GDM_PROFILE_DIR="/etc/dconf/db/gdm.d"
 GDM_PROFILE_FILE="${GDM_PROFILE_DIR}/10-ubuntu-look"
 
-# 1 = user-theme still carries Yaru; the autostart turns it off at the next login.
-USER_THEME_RETIRE=0
-
 # Ubuntu's terminal colours (dark) go into a gnome-terminal profile named
 # Ubuntu, made the default. Other profiles are left as they are.
 TERMINAL_PROFILES="/org/gnome/terminal/legacy/profiles:"
@@ -4468,9 +4883,7 @@ TERMINAL_PALETTE="['#1B1B1B', '#CC1A12', '#4E9A06', '#C4A000', '#3667A6', '#7F59
 
 # The Debian logo on the Show Applications button, under Yaru only. The dock
 # asks for view-app-grid-<mode>-symbolic, and Yaru has none for "user".
-APP_GRID_ICON="$HOME/.local/share/icons/Yaru/scalable/actions/view-app-grid-user-symbolic.svg"
-# Earlier location; hicolor applies to every theme, including Adwaita.
-APP_GRID_ICON_OLD="$HOME/.local/share/icons/hicolor/scalable/actions/view-app-grid-user-symbolic.svg"
+APP_GRID_ICON="${HOME:-}/.local/share/icons/Yaru/scalable/actions/view-app-grid-user-symbolic.svg"
 
 # How much of the canvas the artwork covers; fuller than Ubuntu's 0.742 so
 # the button matches the icons beside it.
@@ -4481,17 +4894,9 @@ trap '_on_exit; print_summary' EXIT
 trap 'echo ""; message warn "interrupted — stopping here"; exit 130' INT
 trap 'exit 129' HUP; trap 'exit 143' TERM
 
-[ "$(id -u)" -eq 0 ] && [ "$REFRESH" != 1 ] \
-  && error "Do not run as root. Run as a normal user with sudo rights."
-
-# One run at a time, including the refresh timer. The lock lives in /run,
-# which only root can write, so no other user can replace it.
+# One run at a time. The lock lives in /run, which only root can write, so
+# no other user can replace it.
 UBUNTU_LOOK_LOCK=/run/ubuntu-look.lock
-
-# Where --download keeps the machine's Ubuntu source and pin while it runs.
-DOWNLOAD_SAVED="${SYS_DIR}/download-saved"
-# The .deb fetch_deb placed last.
-FETCHED_DEB=""
 
 ###############################################################################
 # 8. Uninstall (--uninstall)
@@ -4501,14 +4906,15 @@ FETCHED_DEB=""
 
 if [ "$MODE" = uninstall ]; then
 trap - INT TERM
-trap 'rm -f "${UBUNTU_RELEASE_CACHE:-}"' EXIT
+trap rm_release_cache EXIT
 [ -z "$arguments" ] || error "--uninstall takes no other arguments (got '${arguments}')"
 # A closed terminal must not stop the run between a purge and its cleanup.
 trap '' HUP
 
 # The records are read from $HOME, so it must be this user's home.
 _home="$(getent passwd "$RUN_USER" | cut -d: -f6)"
-[ -n "$_home" ] && [ "${HOME%/}" = "${_home%/}" ] \
+_h="${HOME:-}"
+[ -n "$_home" ] && [ "${_h%/}" = "${_home%/}" ] \
   || error "HOME is '${HOME:-}', but ${RUN_USER}'s home is '${_home}'. Run it from ${RUN_USER}'s own login."
 
 declare -a DONE=()
@@ -4520,17 +4926,20 @@ USER_PENDING=0
 SYSTEM_PENDING=0
 PURGE_FAILED=0
 PURGE_KEPT_CONFIG=""
+# Taken before the uninstall changes any package; "none" = not taken.
+UNUSED_BEFORE_PURGE=none
+INSTALLED_BEFORE_PURGE=""
+RESTORED_BEFORE_PURGE=""
+# The dependencies the uninstall purged, for the apt cache clean-up, also of
+# a later run.
+PURGED_DEPENDENCIES="${SYS_RECORDS}/purged-dependencies.txt"
 # Packages left on Ubuntu's build because Debian's would not install.
 RESTORE_FAILED=""
+# Set by install_debian_build.
+DEBIAN_BUILD=""
 
-# Copies of system records, for the settings steps and a later run.
-DCONF_PROFILE_COPY="${BACKUP_DIR}/dconf-system-profile.ini"
-MANIFEST_COPY="${BACKUP_DIR}/look-packages.txt"
-# user-theme: enabled by earlier versions.
-SHELL_EXTENSIONS="${SHELL_EXTENSIONS} ${USER_THEME_UUID}"
-
-# Ubuntu's archives also include each mirror in the source list.
-for _u in $(awk '/^deb /{ for (i = 2; i <= NF; i++) if ($i ~ /:\/\//) print $i }' "$UBUNTU_LIST" 2>/dev/null | sort -u); do
+# Ubuntu's archives also include each mirror in the apt source.
+for _u in $(ubuntu_source_entries | awk '{ print $1 }' | sort -u); do
   add_mirror_to_hosts_re "${_u%/}"
 done
 
@@ -4548,10 +4957,15 @@ must_sudo() {
 
 have_session() { [ -n "${DBUS_SESSION_BUS_ADDRESS:-}" ] && command -v dconf >/dev/null 2>&1; }
 
-# False without a desktop session; the step is then left for a later run.
+# False without a desktop session or dconf; the step is then left for a
+# later run.
 need_session() {
   have_session && return 0
-  SKIPPED+=("No desktop session — $1; run this again from your desktop")
+  if [ -n "${DBUS_SESSION_BUS_ADDRESS:-}" ]; then
+    SKIPPED+=("dconf-cli is missing — $1; sudo apt install dconf-cli, then run this again")
+  else
+    SKIPPED+=("No desktop session — $1; run this again from your desktop")
+  fi
   USER_PENDING=1
   return 1
 }
@@ -4559,14 +4973,6 @@ need_session() {
 # Removed, but its configuration files are still there.
 is_config_only() {
   dpkg-query -W -f='${Status}' "$1" 2>/dev/null | grep -q "deinstall ok config-files"
-}
-
-# Back to automatically installed, if it was before. One the user added
-# later keeps its mark.
-restore_auto_mark() {
-  if [ -f "$MANUAL_BEFORE" ] && predates_install "$1" && ! grep -qxF "$1" "$MANUAL_BEFORE"; then
-    sudo apt-mark auto "$1" >/dev/null 2>&1 || true
-  fi
 }
 
 # Other existing users of the look: the registry, plus homes with its files.
@@ -4580,13 +4986,14 @@ other_users() {
         '$3 >= lo && $3 <= hi { print $1 ":" $6 }' \
       | while IFS=: read -r u h; do
           [ "$u" = "$RUN_USER" ] && continue
-          # A backup alone counts only for installs from before the registry.
-          { sudo test -f "${h}/${LOOK_ENV_REL}" \
-            || { [ ! -f "$SYS_USERS" ] && sudo test -d "${h}/${BACKUP_REL}"; }; } 2>/dev/null && echo "$u"
+          sudo test -f "${h}/${LOOK_ENV_REL}" 2>/dev/null && echo "$u"
         done
   } | sed '/^$/d' | sort -u | grep -vxF "$RUN_USER" \
     | while read -r u; do getent passwd "$u" > /dev/null && echo "$u"; done | xargs
 }
+
+# The packages a purge of $@ would remove, from an apt simulation.
+purge_sim() { LC_ALL=C apt-get -s purge "$@" 2>/dev/null | awk '/^(Remv|Purg) /{print $2}'; }
 
 # Show what a purge of $1 takes, apt's extra removals included, then purge.
 # Returns 1 for an empty list. Declined or failed: recorded as unfinished.
@@ -4598,7 +5005,7 @@ purge_list() {
   # shellcheck disable=SC2086
   printf '   - %s\n' $1
   # shellcheck disable=SC2086
-  planned="$(apt-get -s purge $1 2>/dev/null | awk '/^(Remv|Purg) /{print $2}')"
+  planned="$(purge_sim $1)"
   for p in $planned; do
     in_word_list "$p" "$1" || extra="$extra $p"
   done
@@ -4644,35 +5051,13 @@ apt_or_pending() {
 # Settings helpers
 ###############################################################################
 
-# Keys only earlier versions wrote.
-EARLIER_LOOK_KEYS=(
-  "org/gnome/shell/extensions/user-theme|name"
-  "org/gnome/desktop/interface|gtk-enable-primary-paste"
-  "org/gnome/desktop/background|primary-color"
-  "org/gnome/desktop/background|secondary-color"
-  "org/gnome/desktop/screensaver|primary-color"
-  "org/gnome/desktop/screensaver|secondary-color"
-)
-
-# Every key the look writes or wrote, as "<path> <key>". The extension list and
-# the dock have their own steps.
-look_keys() {
-  local line path key
-  for line in "${GNOME_SETTINGS[@]}" "$COLOR_SCHEME_KEY" "${WALLPAPER_KEYS[@]}" "${EARLIER_LOOK_KEYS[@]}"; do
-    IFS='|' read -r path key _ <<< "$line"
-    case "$DCONF_ONLY_KEYS" in *" $key "*) continue ;; esac
-    [ "$path" = org/gnome/shell/extensions/dash-to-dock ] && continue
-    echo "$path $key"
-  done
-}
-
 # Pre-install value of key $2 in path $1; empty when it was at the default.
 snapshot_dconf_value() { ini_value "${BACKUP_ORIGINAL}/dconf-dump.ini" "$1" "$2"; }
 
 # The value the look set for the key, from its defaults database.
 our_dconf_value() {
   local f
-  for f in "$LOOK_DB_FILE" "$LEGACY_DB_FILE" "$DCONF_PROFILE_COPY"; do
+  for f in "$LOOK_DB_FILE" "$DCONF_PROFILE_COPY"; do
     [ -f "$f" ] && { ini_value "$f" "$1" "$2"; return; }
   done
 }
@@ -4681,8 +5066,8 @@ our_dconf_value() {
 ext_package() {
   case "$1" in
     ubuntu-dock@*|tiling-assistant@*|ubuntu-appindicators@*|ding@*)
-      if grep -qxF gnome-shell-ubuntu-extensions "$INSTALLED_MANIFEST" "$MANIFEST_COPY" 2>/dev/null; then
-        echo gnome-shell-ubuntu-extensions; return
+      if grep -qxF "$COMBINED_EXT_PKG" "$INSTALLED_MANIFEST" "$MANIFEST_COPY" 2>/dev/null; then
+        echo "$COMBINED_EXT_PKG"; return
       fi ;;
   esac
   case "$1" in
@@ -4690,9 +5075,11 @@ ext_package() {
     tiling-assistant@*)     echo gnome-shell-extension-ubuntu-tiling-assistant ;;
     ubuntu-appindicators@*) echo gnome-shell-extension-appindicator ;;
     ding@*)                 echo gnome-shell-extension-desktop-icons-ng ;;
-    user-theme@*)           echo gnome-shell-extension-user-theme ;;
   esac
 }
+
+# True when the look installed the package of extension $1.
+look_installed_ext() { grep -qxF "$(ext_package "$1")" "$INSTALLED_MANIFEST" "$MANIFEST_COPY" 2>/dev/null; }
 
 ###############################################################################
 # Per-user steps
@@ -4703,11 +5090,10 @@ step_extensions() {
   need_session "extensions not switched off" || return
   # A reinstall after an interrupted uninstall switches them on again.
   rm -f "$EXTENSIONS_ON_RECORD"
-  local have_snap=0 now snap_en snap_dis e new="" dis dtd_on=0 add=""
+  local have_snap=0 now snap_en e new="" dis dtd_on=0 dtd_back=0
   [ -f "${BACKUP_ORIGINAL}/dconf-dump.ini" ] && have_snap=1
   now="$(array_items "$(user_dconf_read /org/gnome/shell/enabled-extensions)")"
   snap_en="$(array_items "$(snapshot_dconf_value org/gnome/shell enabled-extensions)")"
-  snap_dis="$(array_items "$(snapshot_dconf_value org/gnome/shell disabled-extensions)")"
 
   # Drop the look's extensions, except those enabled before the install.
   for e in $now; do
@@ -4716,7 +5102,7 @@ step_extensions() {
       if [ "$have_snap" -eq 1 ]; then
         in_word_list "$e" "$snap_en" || continue
       else
-        grep -qxF "$(ext_package "$e")" "$INSTALLED_MANIFEST" "$MANIFEST_COPY" 2>/dev/null && continue
+        look_installed_ext "$e" && continue
       fi
     fi
     new="${new} ${e}"
@@ -4738,37 +5124,72 @@ step_extensions() {
     DONE+=("Switched off the look's extensions; your own stay on")
     [ "$dtd_on" -eq 1 ] && DONE+=("Dash-to-Dock turned back on")
   fi
+  # The install's entry leaves the disabled list, also where Dash-to-Dock is gone.
+  [ -f "$DASH_TO_DOCK_OFF" ] && dtd_back=1
   rm -f "$DASH_TO_DOCK_OFF"
 
-  # The disabled list: Dash-to-Dock leaves it, earlier entries come back.
-  dis="$(array_items "$(user_dconf_read /org/gnome/shell/disabled-extensions)")"
-  if [ "$dtd_on" -eq 1 ] && in_word_list "$DASH_TO_DOCK_UUID" "$dis"; then
-    dis="$(word_list_without "$dis" "$DASH_TO_DOCK_UUID" | xargs)"
-    if [ -n "$dis" ] || [ -n "$snap_dis" ]; then
-      dconf write /org/gnome/shell/disabled-extensions "$(gvariant_string_array "$dis")" || USER_PENDING=1
-    else
-      dconf reset /org/gnome/shell/disabled-extensions || USER_PENDING=1
-    fi
-  fi
-  # An empty list over an unset key goes back to unset.
-  if [ -z "$dis" ] && [ -z "$snap_dis" ] && [ -n "$(user_dconf_read /org/gnome/shell/disabled-extensions)" ]; then
-    dconf reset /org/gnome/shell/disabled-extensions || USER_PENDING=1
-  fi
-  for e in $snap_dis; do
-    in_word_list "$e" "$SHELL_EXTENSIONS" && ! in_word_list "$e" "$dis" && add="${add} ${e}"
+  # The disabled list: the look's extensions and a re-enabled Dash-to-Dock
+  # leave it, as on Debian; the user's other entries stay. Empty goes back to
+  # Debian's default (unset).
+  local stored_dis was_dis e2
+  stored_dis="$(user_dconf_read /org/gnome/shell/disabled-extensions)"
+  was_dis="$(array_items "$stored_dis")"
+  dis=""
+  for e2 in $was_dis; do
+    [ "$dtd_back" -eq 1 ] && [ "$e2" = "$DASH_TO_DOCK_UUID" ] && continue
+    in_word_list "$e2" "$SHELL_EXTENSIONS" && continue
+    dis="${dis} ${e2}"
   done
-  if [ -n "$add" ]; then
-    if dconf write /org/gnome/shell/disabled-extensions "$(gvariant_string_array "$dis $add")"; then
-      DONE+=("Put back extensions you had disabled:${add}")
+  dis="$(echo "$dis" | xargs)"
+  # A changed list, or an explicit empty one ("@as []"), which Debian leaves unset.
+  if [ "$dis" != "$(echo "$was_dis" | xargs)" ] \
+     || { [ -z "$dis" ] && [ -n "$stored_dis" ]; }; then
+    if [ -z "$dis" ]; then
+      dconf reset /org/gnome/shell/disabled-extensions
     else
-      USER_PENDING=1
+      dconf write /org/gnome/shell/disabled-extensions "$(gvariant_string_array "$dis")"
+    fi || { USER_PENDING=1; GUESSED+=("Could not write disabled-extensions"); }
+  fi
+  return 0
+}
+
+# What the look's own extensions stored beyond its table: Tiling Assistant's
+# and Desktop Icons' settings and Tiling Assistant's session file. Only when
+# the look installed the extension; Debian's default is none of it.
+step_clear_extension_state() {
+  step "Clearing what the look's extensions stored..."
+  local e dir cleared=0 left=0
+  for e in tiling-assistant@ubuntu.com ding@rastersoft.com; do
+    look_installed_ext "$e" || continue
+    # Debian's own desktop icons, which the combined package replaced and the
+    # uninstall puts back, keep their settings.
+    [ "$e" = ding@rastersoft.com ] && predates_install gnome-shell-extension-desktop-icons-ng && continue
+    dir="/org/gnome/shell/extensions/${e%%@*}/"
+    if [ -n "$(user_dconf list "$dir")" ]; then
+      need_session "the settings of ${e%%@*} not cleared" || { left=1; continue; }
+      if dconf reset -f "$dir" 2>/dev/null; then cleared=1; else USER_PENDING=1; GUESSED+=("Could not clear ${dir}"); fi
     fi
+    if [ "$e" = tiling-assistant@ubuntu.com ] && [ -d "$HOME/.config/tiling-assistant" ]; then
+      rm -f "$HOME/.config/tiling-assistant/tiledSessionRestore2.json"
+      rmdir "$HOME/.config/tiling-assistant" 2>/dev/null
+      cleared=1
+    fi
+  done
+  if [ "$cleared" -eq 1 ]; then
+    DONE+=("Cleared the settings and files the look's extensions stored")
+  elif [ "$left" -eq 0 ]; then
+    SKIPPED+=("Nothing stored by the look's extensions")
   fi
 }
 
 # Give back the keybindings the tiling assistant left empty.
 step_restore_tiling_keybindings() {
   step "Restoring the keybindings the tiling assistant takes over..."
+  # Only when the look installed it; otherwise it never touched them.
+  if ! look_installed_ext tiling-assistant@ubuntu.com; then
+    SKIPPED+=("Tiling keybindings left alone — the look did not install the tiling assistant")
+    return
+  fi
   need_session "tiling keybindings not checked" || return
   local entry path key now restored=0 active=0
   if in_word_list tiling-assistant@ubuntu.com \
@@ -4799,7 +5220,7 @@ step_restore_tiling_keybindings() {
       if dconf reset "/${path}/${key}" 2>/dev/null; then
         restored=$((restored + 1))
       else
-        USER_PENDING=1
+        USER_PENDING=1; GUESSED+=("Could not reset ${key}")
       fi
     done
   done
@@ -4810,18 +5231,9 @@ step_restore_tiling_keybindings() {
   fi
 }
 
-# Debian's desktop-base sets only picture-uri, so the dark style would show
-# GNOME's wallpaper; picture-uri-dark gets Debian's picture-uri as well.
-debian_dark_wallpaper() {
-  local light dark
-  command -v gsettings >/dev/null 2>&1 || return 0
-  light="$(GSETTINGS_BACKEND=memory gsettings get org.gnome.desktop.background picture-uri 2>/dev/null)"
-  dark="$(GSETTINGS_BACKEND=memory gsettings get org.gnome.desktop.background picture-uri-dark 2>/dev/null)"
-  case "$dark" in *"/backgrounds/gnome/"*) ;; *) return 0 ;; esac
-  case "$light" in ''|*"/backgrounds/gnome/"*) return 0 ;; esac
-  dconf write /org/gnome/desktop/background/picture-uri-dark "$light" 2>/dev/null && return 0
-  USER_PENDING=1
-  return 1
+# dconf $@ for step_restore_gnome_settings, counted in its reset or failed.
+count_dconf() {
+  if dconf "$@" 2>/dev/null; then reset=$((reset + 1)); else USER_PENDING=1; failed=1; fi
 }
 
 step_restore_gnome_settings() {
@@ -4833,25 +5245,42 @@ step_restore_gnome_settings() {
   local path key ours nudge=0 reset=0 failed=0
   # Only a session whose Ubuntu defaults are gone needs telling.
   [ "$LAST_USER" -eq 1 ] && session_on_look_profile && nudge=1
+  # Debian's desktop-base sets only picture-uri, so the dark style would show
+  # GNOME's wallpaper; picture-uri-dark then gets Debian's picture-uri.
+  local value bg light dark dark_target=""
+  bg="$(GSETTINGS_BACKEND=memory gsettings list-recursively org.gnome.desktop.background 2>/dev/null)"
+  light="$(sed -n 's/^org\.gnome\.desktop\.background picture-uri //p' <<< "$bg")"
+  dark="$(sed -n 's/^org\.gnome\.desktop\.background picture-uri-dark //p' <<< "$bg")"
+  case "$dark" in
+    *"/backgrounds/gnome/"*) case "$light" in ''|*"/backgrounds/gnome/"*) ;; *) dark_target="$light" ;; esac ;;
+  esac
   while read -r path key; do
-    if [ -n "$(user_dconf_read "/${path}/${key}")" ]; then
-      if dconf reset "/${path}/${key}" 2>/dev/null; then
-        reset=$((reset + 1))
-      else
-        USER_PENDING=1; failed=1
-      fi
+    value="$(user_dconf_read "/${path}/${key}")"
+    # One write, which also tells a running session.
+    if [ "$key" = picture-uri-dark ] && [ -n "$dark_target" ]; then
+      [ "$value" = "$dark_target" ] || count_dconf write "/${path}/${key}" "$dark_target"
+      continue
+    fi
+    if [ -n "$value" ]; then
+      count_dconf reset "/${path}/${key}"
     elif [ "$nudge" -eq 1 ]; then
+      # The look's extensions are already off.
+      case "$path" in org/gnome/shell/extensions/*) continue ;; esac
       # The running session was not told that Ubuntu's defaults went; a
       # write and a reset make it read Debian's value now.
       ours="$(our_dconf_value "$path" "$key")"
       [ -n "$ours" ] || continue
       dconf write "/${path}/${key}" "$ours" 2>/dev/null
-      dconf reset "/${path}/${key}" 2>/dev/null || USER_PENDING=1
+      count_dconf reset "/${path}/${key}"
     fi
   done < <(look_keys)
-  debian_dark_wallpaper || failed=1
+  # gedit's scheme, which the theme extension switches between the Yaru
+  # schemes; they go with the look.
+  case "$(user_dconf_read /org/gnome/gedit/preferences/editor/scheme)" in
+    "'Yaru'"|"'Yaru-dark'") count_dconf reset /org/gnome/gedit/preferences/editor/scheme ;;
+  esac
   if [ "$failed" -eq 0 ]; then
-    DONE+=("GNOME settings and wallpaper back to Debian's defaults (${reset} key(s) reset)")
+    DONE+=("GNOME settings and wallpaper back to Debian's defaults (${reset} setting(s) changed back)")
   else
     GUESSED+=("Some GNOME settings could not be reset")
   fi
@@ -4875,73 +5304,36 @@ step_restore_dock_settings() {
 
 step_disable_look_profile() {
   step "Switching your sessions back to the default dconf profile..."
-  [ -f "$LOOK_ENV_FILE" ] || return
   # Services started from now on no longer get it; running ones keep it.
-  systemctl --user unset-environment DCONF_PROFILE 2>/dev/null || true
+  # Also after an earlier run removed the file but could not reach systemd.
+  if systemctl --user show-environment 2>/dev/null | grep -qx "DCONF_PROFILE=${LOOK_PROFILE_NAME}"; then
+    systemctl --user unset-environment DCONF_PROFILE 2>/dev/null || USER_PENDING=1
+  fi
+  [ -f "$LOOK_ENV_FILE" ] || return
   rm -f "$LOOK_ENV_FILE"
-  rmdir "$(dirname "$LOOK_ENV_FILE")" 2>/dev/null || true
+  rmdir "${LOOK_ENV_FILE%/*}" 2>/dev/null || true
   DONE+=("Removed ${LOOK_ENV_FILE} — Ubuntu's defaults no longer apply to you from the next login")
 }
 
+# The autostart directory goes too, where now empty.
 step_remove_extension_autostart() {
   step "Removing the one-shot extension autostart..."
-  local d="$HOME/.config/autostart/ubuntu-look-enable-extensions.desktop"
-  local s="$HOME/.local/share/ubuntu-look/enable-extensions.sh"
-  if [ -f "$d" ] || [ -f "$s" ]; then
-    rm -f "$d" "$s"
+  if [ -f "$EXT_AUTOSTART_FILE" ] || [ -f "$EXT_AUTOSTART_SCRIPT" ]; then
     DONE+=("Removed the one-shot extension autostart")
   fi
-  rmdir "$HOME/.local/share/ubuntu-look" 2>/dev/null || true
+  remove_extension_autostart
+  rmdir "${EXT_AUTOSTART_FILE%/*}" 2>/dev/null || true
 }
 
+# The user icons directory goes too, where now empty.
 step_remove_app_grid_icon() {
   step "Removing the Show Applications button icon..."
-  local removed=0 f
-  # Yaru now; hicolor in earlier versions.
-  for f in "$APP_GRID_ICON" "$APP_GRID_ICON_OLD"; do
-    remove_user_icon "$f" && removed=1
-  done
-  if [ "$removed" -eq 1 ]; then
+  if remove_user_icon "$APP_GRID_ICON"; then
     DONE+=("Removed the Show Applications button icon")
   else
     SKIPPED+=("No Show Applications button icon to remove")
   fi
-}
-
-step_remove_theme_followers() {
-  step "Removing the shell theme follower..."
-  if remove_theme_followers; then
-    DONE+=("Removed the shell theme follower")
-  else
-    SKIPPED+=("No shell theme follower to remove")
-  fi
-}
-
-# True when file $1 carries a mark of what earlier versions wrote.
-written_by_us() {
-  grep -q "ubuntu-look\.sh" "$1" 2>/dev/null && return 0
-  grep -q "E95420" "$1" 2>/dev/null && grep -qE "accent_bg_color|selected_bg_color" "$1" 2>/dev/null
-}
-
-step_restore_gtk() {
-  step "Restoring GTK CSS / gtkrc-2.0..."
-  local pair name target
-  for pair in \
-    "gtk-3.0-gtk.css:$HOME/.config/gtk-3.0/gtk.css" \
-    "gtk-4.0-gtk.css:$HOME/.config/gtk-4.0/gtk.css" \
-    "gtkrc-2.0:$HOME/.gtkrc-2.0"
-  do
-    name="${pair%%:*}"; target="${pair#*:}"
-    [ -f "$target" ] && written_by_us "$target" || continue
-    if [ ! -f "${BACKUP_ORIGINAL}/${name}" ]; then
-      rm -f "$target"
-      DONE+=("Removed the $(basename "$target") an earlier version wrote")
-    elif cp "${BACKUP_ORIGINAL}/${name}" "$target"; then
-      DONE+=("Restored your own $(basename "$target") from the snapshot")
-    else
-      USER_PENDING=1; GUESSED+=("Could not restore ${target}")
-    fi
-  done
+  rmdir "$HOME/.local/share/icons" 2>/dev/null || true
 }
 
 step_terminal_profile() {
@@ -4953,10 +5345,7 @@ step_terminal_profile() {
     return
   fi
   # The recorded profile and any other marked as the look's.
-  uuids="$(sed -n 's/^uuid=//p' "$record" 2>/dev/null | tr -d '\r')"
-  for one in $(dconf list "${base}/" 2>/dev/null | sed -n 's#^:\(.*\)/$#\1#p'); do
-    [ "$(dconf read "${base}/:${one}/ubuntu-look-managed" 2>/dev/null)" = true ] && uuids="${uuids} ${one}"
-  done
+  uuids="$(sed -n 's/^uuid=//p' "$record" 2>/dev/null | tr -d '\r') $(marked_terminal_profiles)"
   uuids="$(echo "$uuids" | xargs -n1 2>/dev/null | sort -u | xargs)"
   if [ -z "$uuids" ]; then
     SKIPPED+=("No terminal profile was added by this script")
@@ -4997,37 +5386,9 @@ step_terminal_profile() {
   fi
 }
 
-step_restore_software_icon() {
-  step "Restoring the software store launcher..."
-  local target="$HOME/.local/share/applications/org.gnome.Software.desktop"
-  # Only the launcher copy earlier versions wrote.
-  [ -f "$target" ] && grep -q '^Icon=app-center$' "$target" 2>/dev/null || return 0
-  if [ -f "${BACKUP_ORIGINAL}/org.gnome.Software.desktop" ]; then
-    if cp "${BACKUP_ORIGINAL}/org.gnome.Software.desktop" "$target"; then
-      DONE+=("Restored your own org.gnome.Software.desktop")
-    else
-      USER_PENDING=1; GUESSED+=("Could not restore ${target}")
-    fi
-  else
-    rm -f "$target"
-    DONE+=("Removed the GNOME Software launcher copy an earlier version wrote")
-  fi
-  update-desktop-database "$HOME/.local/share/applications" 2>/dev/null || true
-}
-
 ###############################################################################
 # System steps (last user only)
 ###############################################################################
-
-step_remove_refresh_timer() {
-  step "Removing the daily refresh timer..."
-  remove_refresh_timer && DONE+=("Removed the daily refresh timer and its copy of the script")
-  if [ -f "$REFRESH_TIMER" ] || [ -d "$REFRESH_LIB_DIR" ]; then
-    SYSTEM_PENDING=1
-    GUESSED+=("The daily refresh timer could not be removed")
-  fi
-  return 0
-}
 
 # Compile Ubuntu's defaults empty, so the running session drops them now. A
 # copy of the keyfile stays as the reference for the settings steps.
@@ -5040,26 +5401,26 @@ step_empty_look_defaults() {
 
 step_remove_dconf_profile() {
   step "Removing Ubuntu's GNOME defaults..."
-  local f db found=""
+  local d="/etc/dconf/db/${LOOK_DB_NAME}"
   # Settings not restored yet: keep what a later run needs.
-  if [ "$USER_PENDING" -eq 1 ] && [ ! -f "$DCONF_PROFILE_COPY" ]; then
-    for f in "$LOOK_DB_FILE" "$LEGACY_DB_FILE"; do
-      [ -f "$f" ] && { mkdir -p "$BACKUP_DIR" && cp "$f" "$DCONF_PROFILE_COPY"; break; }
-    done
+  if [ "$USER_PENDING" -eq 1 ] && [ ! -f "$DCONF_PROFILE_COPY" ] && [ -f "$LOOK_DB_FILE" ]; then
+    mkdir -p "$BACKUP_DIR" && cp "$LOOK_DB_FILE" "$DCONF_PROFILE_COPY"
   fi
-  # Running sessions keep a deleted database open, so compile it empty first.
-  for db in "$LOOK_DB_NAME" "$OLD_LOOK_DB_NAME"; do
-    [ -d "/etc/dconf/db/${db}.d" ] || [ -f "/etc/dconf/db/${db}" ] || continue
-    must_sudo rm -rf "/etc/dconf/db/${db}.d" \
-      && must_sudo mkdir "/etc/dconf/db/${db}.d" && found="${found} ${db}"
-  done
-  if [ -n "$found" ]; then
-    must_sudo dconf update
-    for db in $found; do
-      must_sudo rm -rf "/etc/dconf/db/${db}.d" \
-        && must_sudo rm -f "/etc/dconf/db/${db}" \
-        && DONE+=("Removed Ubuntu's defaults (/etc/dconf/db/${db}.d)")
-    done
+  # Running sessions keep a deleted database open, so compile it empty first,
+  # unless it is compiled empty already.
+  if [ -d "${d}.d" ] || [ -f "$d" ]; then
+    local ready=0
+    if [ -d "${d}.d" ] && [ -z "$(ls -A "${d}.d" 2>/dev/null)" ] && ! dconf_db_stale "$LOOK_DB_NAME"; then
+      ready=1
+    elif must_sudo rm -rf "${d}.d" && must_sudo mkdir "${d}.d"; then
+      must_sudo dconf update
+      ready=1
+    fi
+    if [ "$ready" -eq 1 ]; then
+      must_sudo rm -rf "${d}.d" \
+        && must_sudo rm -f "$d" \
+        && DONE+=("Removed Ubuntu's defaults (${d}.d)")
+    fi
   fi
   if [ -f "$LOOK_PROFILE" ]; then
     if sudo grep -qas "DCONF_PROFILE=${LOOK_PROFILE_NAME}" /proc/[0-9]*/environ; then
@@ -5068,6 +5429,9 @@ step_remove_dconf_profile() {
       plain="$(mktemp)"; clean="$(mktemp)"
       look_profile_content | grep -vx "system-db:${LOOK_DB_NAME}" > "$plain"
       printf 'r %s\nr %s\n' "$LOOK_PROFILE" "$LOOK_CLEANUP_CONF" > "$clean"
+      # A repeat run keeps the directory line an earlier run added.
+      grep -qxF 'r /etc/dconf/profile' "$LOOK_CLEANUP_CONF" 2>/dev/null \
+        && echo 'r /etc/dconf/profile' >> "$clean"
       must_sudo install -m 0644 "$plain" "$LOOK_PROFILE" \
         && must_sudo install -D -m 0644 "$clean" "$LOOK_CLEANUP_CONF" \
         && DONE+=("${LOOK_PROFILE} now has no Ubuntu defaults; it is removed at the next boot")
@@ -5076,11 +5440,6 @@ step_remove_dconf_profile() {
       must_sudo rm -f "$LOOK_PROFILE" && DONE+=("Removed ${LOOK_PROFILE}")
     fi
   fi
-  retire_legacy_defaults
-  case $? in
-    0) DONE+=("Removed the machine-wide defaults of an earlier version") ;;
-    2) SYSTEM_PENDING=1; GUESSED+=("The machine-wide defaults of an earlier version could not all be removed") ;;
-  esac
   return 0
 }
 
@@ -5096,9 +5455,8 @@ step_remove_gdm_profile() {
   if [ -d "$GREETER_EXT_DIR" ]; then
     must_sudo rm -rf "$GREETER_EXT_DIR" && { changed=1; DONE+=("Removed ${GREETER_EXT_DIR}"); }
   fi
-  # Only the directories the installer made, when empty; older installs: both.
-  dirs="/usr/local/share/gnome-shell/extensions /usr/local/share/gnome-shell"
-  [ -f "$LOCAL_SHELL_DIRS_FILE" ] && dirs="$(cat "$LOCAL_SHELL_DIRS_FILE" 2>/dev/null)"
+  # Only the directories the installer made, when empty.
+  dirs="$(cat "$LOCAL_SHELL_DIRS_FILE" 2>/dev/null)"
   for d in $dirs; do
     case "$d" in /usr/local/share/gnome-shell|/usr/local/share/gnome-shell/extensions) ;; *) continue ;; esac
     sudo rmdir "$d" 2>/dev/null || true
@@ -5119,11 +5477,21 @@ step_remove_gdm_profile() {
     must_sudo rmdir "$GDM_PROFILE_DIR" && must_sudo rm -f /etc/dconf/db/gdm && changed=1
   fi
   [ -d "$GDM_PROFILE_DIR" ] || sudo rm -f "${SYS_RECORDS}/dconf-gdm-dir-created"
+  # The profile directory, where empty and owned by no package. Holding only
+  # the look profile still in use, it goes with it at the next boot, where the
+  # installer created it (systemd-tmpfiles reports a non-empty one as an error).
+  case "$(ls -A /etc/dconf/profile 2>/dev/null)" in
+    "") [ -d /etc/dconf/profile ] && ! dpkg -S /etc/dconf/profile > /dev/null 2>&1 \
+          && must_sudo rmdir /etc/dconf/profile ;;
+    "$LOOK_PROFILE_NAME")
+        [ -f "$DCONF_PROFILE_DIR_MADE" ] && [ -f "$LOOK_CLEANUP_CONF" ] \
+          && echo 'r /etc/dconf/profile' | must_sudo tee -a "$LOOK_CLEANUP_CONF" > /dev/null ;;
+  esac
   # Also recompiles after an earlier failed dconf update.
   if [ $changed -eq 1 ]; then
     must_sudo dconf update
-    REBOOT_NEEDED=1
-  elif [ -d "$GDM_PROFILE_DIR" ] && [ "$GDM_PROFILE_DIR" -nt /etc/dconf/db/gdm ]; then
+    need_reboot
+  elif dconf_db_stale gdm; then
     must_sudo dconf update && DONE+=("Login screen database compiled without the Ubuntu look")
   else
     [ "$ext" -eq 1 ] || SKIPPED+=("No login screen theme to remove")
@@ -5139,19 +5507,17 @@ step_restore_grub() {
   fi
   if [ ! -f /etc/default/grub ] || ! command -v update-grub >/dev/null 2>&1; then
     SKIPPED+=("GRUB is gone — the words this script added cannot be removed")
-    sudo rm -f "$GRUB_ADDED_FILE"
+    forget_grub_words
     return
   fi
-  local added
-  added="$(tr '\n' ' ' < "$GRUB_ADDED_FILE")"
   strip_grub_words
   case $? in
-    0) DONE+=("Removed '${added% }' from the kernel command line; the rest of /etc/default/grub is unchanged")
-       REBOOT_NEEDED=1 ;;
+    0) DONE+=("Removed '${GRUB_ADDED_WORDS}' from the kernel command line; the rest of /etc/default/grub is unchanged")
+       need_reboot ;;
     1) SKIPPED+=("/etc/default/grub no longer carries what ubuntu-look.sh added") ;;
-    2) SKIPPED+=("/etc/default/grub is not in a shape this script will edit — remove '${added% }' by hand")
+    2) SKIPPED+=("/etc/default/grub is not in a shape this script will edit — remove '${GRUB_ADDED_WORDS}' by hand")
        SYSTEM_PENDING=1 ;;
-    *) GUESSED+=("/etc/default/grub could not be updated — '${added% }' is still on the kernel command line")
+    *) GUESSED+=("/etc/default/grub could not be updated — '${GRUB_ADDED_WORDS}' is still on the kernel command line")
        [ -n "$GRUB_BACKUP_KEPT" ] && GUESSED+=("the file as it was before that attempt is at ${GRUB_BACKUP_KEPT}")
        SYSTEM_PENDING=1 ;;
   esac
@@ -5159,92 +5525,44 @@ step_restore_grub() {
 
 step_restore_plymouth() {
   step "Restoring the boot splash theme..."
-  if [ ! -f "$PLYMOUTH_BEFORE_FILE" ]; then
+  # A rebuild still owed (INITRAMFS_PENDING) is finished below even without
+  # the record.
+  if [ ! -f "$PLYMOUTH_BEFORE_FILE" ] && [ ! -f "$INITRAMFS_PENDING" ]; then
     SKIPPED+=("Boot splash theme left as it is — this script did not change it")
     return
   fi
   if ! command -v plymouth-set-default-theme >/dev/null 2>&1; then
     SKIPPED+=("Plymouth is gone — no theme to put back")
-    sudo rm -f "$PLYMOUTH_BEFORE_FILE"
+    drop_plymouth_records
     return
   fi
-  local current was ours pending="${SYS_RECORDS}/initramfs-pending"
-  # The theme the install set: its record, else the saved option.
-  ours="$(head -1 "${SYS_RECORDS}/plymouth-theme-set.txt" 2>/dev/null)"
-  ours="${ours:-$PLYMOUTH_THEME}"
-  current="$(plymouth_current_theme)"
-  was="$(cat "$PLYMOUTH_BEFORE_FILE" 2>/dev/null)"
-  if [ -z "$current" ]; then
-    GUESSED+=("Could not read the boot splash theme — not restored")
-    SYSTEM_PENDING=1
-    return
-  fi
-  if [ -z "$was" ] || [ "$was" = "$current" ]; then
-    # Set back by an earlier run whose initramfs rebuild failed.
-    if [ ! -f "$pending" ] && [ -z "$was" ]; then
-      SKIPPED+=("No earlier boot splash theme was recorded — left on '${current}'")
-    elif [ ! -f "$pending" ]; then
-      SKIPPED+=("Boot splash theme is already '${current}'")
-    elif rebuild_initramfs; then
-      sudo rm -f "$pending"
-      DONE+=("Boot splash theme '${current}' rebuilt into the initramfs")
-      REBOOT_NEEDED=1
-    else
-      GUESSED+=("The initramfs rebuild failed again — run: sudo update-initramfs -u")
-      SYSTEM_PENDING=1
-      return
-    fi
-  elif [ "$current" != "$ours" ]; then
-    SKIPPED+=("Boot splash theme left on '${current}', which you chose after the install")
-  elif ! sudo plymouth-set-default-theme "$was"; then
-    GUESSED+=("Boot splash theme is still '${current}' — '${was}' may no longer be installed")
-    SYSTEM_PENDING=1
-    return
-  elif rebuild_initramfs; then
-    DONE+=("Boot splash theme restored to '${was}'")
-    REBOOT_NEEDED=1
-  else
-    GUESSED+=("Boot splash theme set back, but the initramfs rebuild failed — run: sudo update-initramfs -u")
-    sudo touch "$pending"
-    SYSTEM_PENDING=1
-    return
-  fi
-  sudo rm -f "$PLYMOUTH_BEFORE_FILE"
+  plymouth_put_back
+  case $? in
+    0) DONE+=("Boot splash theme restored to '${PLY_WAS}'"); need_reboot ;;
+    1) if [ -z "$PLY_WAS" ]; then
+         SKIPPED+=("No earlier boot splash theme was recorded — left on '${PLY_CURRENT}'")
+       else
+         SKIPPED+=("Boot splash theme is already '${PLY_CURRENT}'")
+       fi ;;
+    2) SKIPPED+=("Boot splash theme left on '${PLY_CURRENT}', which you chose after the install") ;;
+    3) GUESSED+=("Could not read the boot splash theme — not restored"); SYSTEM_PENDING=1 ;;
+    4) GUESSED+=("Boot splash theme is still '${PLY_CURRENT}' — '${PLY_WAS}' may no longer be installed")
+       SYSTEM_PENDING=1 ;;
+    5) GUESSED+=("Boot splash theme set to '${PLY_WAS}', but the initramfs rebuild failed — run: sudo update-initramfs -u")
+       SYSTEM_PENDING=1 ;;
+    6) DONE+=("Boot splash theme '${PLY_CURRENT}' rebuilt into the initramfs"); need_reboot ;;
+  esac
 }
 
-step_restore_removed_packages() {
-  step "Putting back what an earlier version removed..."
-  local pkg
-  if [ ! -f "$REMOVED_RECORD" ]; then
-    SKIPPED+=("No package was removed by an earlier version")
-    return
-  fi
-  while read -r pkg; do
-    [ -n "$pkg" ] || continue
-    is_installed "$pkg" && continue
-    if ! apt-cache show "$pkg" >/dev/null 2>&1; then
-      SKIPPED+=("${pkg}, removed by an earlier version, is no longer offered by any repository")
-    elif installs_cleanly "$pkg" && sudo apt-get install -y "$pkg" < /dev/null; then
-      restore_auto_mark "$pkg"
-      DONE+=("Reinstalled ${pkg}")
-    else
-      GUESSED+=("Could not reinstall ${pkg}")
-      SYSTEM_PENDING=1
-    fi
-  done < "$REMOVED_RECORD"
-}
-
-# The newest version of $1 not served by Ubuntu, i.e. Debian's.
+# The newest version of $1 not served by Ubuntu, i.e. Debian's (madison
+# lists versions newest first, in apt's order).
 debian_version_of() {
-  LC_ALL=C apt-cache madison "$1" 2>/dev/null | awk -F'|' -v re="$UBUNTU_HOSTS_RE" '
-    { gsub(/^[ \t]+|[ \t]+$/, "", $2); gsub(/^[ \t]+|[ \t]+$/, "", $3)
-      if ($3 !~ re) print $2 }' | sort -V | tail -1
+  madison_rows "$1" | awk -F'|' -v re="$UBUNTU_HOSTS_RE" '$2 !~ re { print $1; exit }'
 }
 
 # True when apt offers version $2 of $1 from any source.
 version_available() {
-  LC_ALL=C apt-cache madison "$1" 2>/dev/null | awk -F'|' -v v="$2" '
-    { gsub(/^[ \t]+|[ \t]+$/, "", $2); if ($2 == v) f = 1 } END { exit !f }'
+  madison_rows "$1" | awk -F'|' -v v="$2" '$1 == v { f = 1 } END { exit !f }'
 }
 
 # A Debian build the offline installer cached: version $2, else the newest.
@@ -5260,6 +5578,22 @@ cached_debian_deb() {
   [ -n "$best" ] && echo "$best"
 }
 
+# Install $2 at Debian's version $3 from apt, else from the cached .deb $4;
+# $1 holds extra apt options, or is empty. Sets DEBIAN_BUILD to the version
+# tried last.
+install_debian_build() {
+  local opt="$1" pkg="$2" deb="$4"
+  DEBIAN_BUILD="$3"
+  # shellcheck disable=SC2086
+  if [ -n "$DEBIAN_BUILD" ] && installs_cleanly $opt "${pkg}=${DEBIAN_BUILD}" \
+     && sudo apt-get install -y $opt "${pkg}=${DEBIAN_BUILD}" < /dev/null; then
+    return 0
+  fi
+  [ -n "$deb" ] && DEBIAN_BUILD="$(dpkg-deb -f "$deb" Version)" || return 1
+  # shellcheck disable=SC2086
+  installs_cleanly $opt "$deb" && sudo apt-get install -y $opt "$deb" < /dev/null
+}
+
 # The packages Ubuntu's combined extensions package replaced, from Debian or
 # apt's cache.
 step_restore_replaced_by_combined() {
@@ -5270,7 +5604,9 @@ step_restore_replaced_by_combined() {
   fi
   if is_installed "$COMBINED_EXT_PKG"; then
     SKIPPED+=("The packages ${COMBINED_EXT_PKG} replaced stay replaced while it is installed")
-    SYSTEM_PENDING=1
+    # Unfinished only when its purge failed or was declined; kept on purpose
+    # (held, or it would take other packages) it is final.
+    [ "$PURGE_FAILED" -eq 1 ] && SYSTEM_PENDING=1
     return
   fi
   local pkg want deb
@@ -5279,10 +5615,7 @@ step_restore_replaced_by_combined() {
     is_installed "$pkg" && continue
     want="$(debian_version_of "$pkg")"
     deb="$(cached_debian_deb "$pkg" "${want:-none}")" || deb=""
-    if { [ -n "$want" ] && installs_cleanly "${pkg}=${want}" \
-         && sudo apt-get install -y "${pkg}=${want}" < /dev/null; } \
-       || { [ -n "$deb" ] && installs_cleanly "$deb" \
-            && sudo apt-get install -y "$deb" < /dev/null; }; then
+    if install_debian_build "" "$pkg" "$want" "$deb"; then
       restore_auto_mark "$pkg"
       DONE+=("Reinstalled ${pkg}, which Ubuntu's combined extensions package had replaced")
     else
@@ -5299,7 +5632,7 @@ step_restore_upgraded_packages() {
     SKIPPED+=("No package was replaced by an Ubuntu build")
     return
   fi
-  local pkg ver now want deb restored=0 failed=0
+  local pkg ver now want deb restored=0 failed=0 was_auto rc
   while read -r pkg ver; do
     [ -n "$pkg" ] && [ -n "$ver" ] || continue
     now="$(dpkg-query -W -f='${Version}' "$pkg" 2>/dev/null)"
@@ -5309,8 +5642,10 @@ step_restore_upgraded_packages() {
       now=""
     fi
     [ "$now" = "$ver" ] && continue
+    # A package the user holds is not moved.
+    if is_held "$pkg"; then SKIPPED+=("${pkg} kept at ${now} — held by you"); continue; fi
     # Keep a newer Debian build (a security update, say).
-    if [ -n "$now" ] && [ ! -e "$UBUNTU_LIST" ] && [ ! -e "$OFFLINE_LOCAL_LIST" ] \
+    if [ -n "$now" ] && [ ! -e "$UBUNTU_SOURCES" ] \
        && dpkg --compare-versions "$now" gt "$ver" && pkg_version_is_debian "$pkg" "$now"; then
       SKIPPED+=("${pkg} stays at ${now}, a newer Debian build than ${ver}")
       continue
@@ -5327,12 +5662,14 @@ step_restore_upgraded_packages() {
       failed=1
       continue
     fi
-    if { [ -n "$want" ] && installs_cleanly --allow-downgrades "${pkg}=${want}" \
-         && sudo apt-get install -y --allow-downgrades "${pkg}=${want}" < /dev/null; } \
-       || { [ -n "$deb" ] && want="$(dpkg-deb -f "$deb" Version)" \
-            && installs_cleanly --allow-downgrades "$deb" \
-            && sudo apt-get install -y --allow-downgrades "$deb" < /dev/null; }; then
+    # apt install marks the package manual; an automatic one stays automatic.
+    was_auto=0
+    apt-mark showauto "$pkg" 2>/dev/null | grep -qxF "$pkg" && was_auto=1
+    install_debian_build --allow-downgrades "$pkg" "$want" "$deb"; rc=$?
+    want="$DEBIAN_BUILD"
+    if [ "$rc" -eq 0 ]; then
       restore_auto_mark "$pkg"
+      [ "$was_auto" -eq 1 ] && sudo apt-mark auto "$pkg" >/dev/null 2>&1
       DONE+=("${pkg} back to ${want}${now:+ (was ${now})}")
       restored=$((restored + 1))
     else
@@ -5346,22 +5683,15 @@ step_restore_upgraded_packages() {
 }
 
 step_remove_ubuntu_repo() {
-  step "Removing the Ubuntu apt source, pin and keyring..."
+  step "Removing the Ubuntu apt source and pin..."
   local changed=0 f
-  for f in "$UBUNTU_LIST" "$UBUNTU_PIN" "$OFFLINE_LOCAL_LIST" "$UNATTENDED_ORIGINS"; do
+  for f in "$UBUNTU_SOURCES" "$UBUNTU_PIN"; do
     [ -f "$f" ] && must_sudo rm -f "$f" && changed=1
   done
-  # The keyring of earlier versions, unless another source uses it.
-  if [ -f "$LEGACY_UBUNTU_KEYRING" ]; then
-    if grep -rqsF "$LEGACY_UBUNTU_KEYRING" /etc/apt/sources.list /etc/apt/sources.list.d/; then
-      SKIPPED+=("${LEGACY_UBUNTU_KEYRING} kept — another apt source uses it")
-    else
-      must_sudo rm -f "$LEGACY_UBUNTU_KEYRING" && changed=1
-    fi
-  fi
-  [ $changed -eq 1 ] && DONE+=("Removed the Ubuntu apt source and pin")
   # The apt files a killed --download saved; the next run would put them back.
   sudo rm -rf "$DOWNLOAD_SAVED"
+  [ $changed -eq 1 ] || return 0
+  DONE+=("Removed the Ubuntu apt source and pin")
   # Drop the Ubuntu lists, so restores take Debian's builds.
   sudo apt-get update -qq < /dev/null 2>/dev/null || true
   return 0
@@ -5385,8 +5715,7 @@ step_unmask_session_migration() {
     sudo rm -f "$SESSION_MIGRATION_MASKED"
     return 0
   fi
-  [ -f "$SESSION_MIGRATION_MASKED" ] \
-    || grep -qxF session-migration "$INSTALLED_MANIFEST" 2>/dev/null || return 0
+  [ -f "$SESSION_MIGRATION_MASKED" ] || return 0
   if is_installed session-migration && ! predates_install session-migration; then
     # Not unfinished work: the mask simply stays with the package.
     SKIPPED+=("session-migration stays masked while it is installed")
@@ -5409,7 +5738,8 @@ step_remove_cached_debs() {
   fi
   # Every downloaded build of a removed package; for a package put back on
   # Debian's build, every build but the installed one.
-  for pkg in $(cat "$INSTALLED_MANIFEST" 2>/dev/null; awk '{ print $1 }' "$UPGRADED_MANIFEST" 2>/dev/null); do
+  for pkg in $(cat "$INSTALLED_MANIFEST" "$PURGED_DEPENDENCIES" 2>/dev/null
+               awk '{ print $1 }' "$UPGRADED_MANIFEST" 2>/dev/null); do
     have="$(pkg_installed_version "$pkg")"
     for f in /var/cache/apt/archives/"${pkg}"_*.deb; do
       [ -f "$f" ] || continue
@@ -5424,7 +5754,7 @@ step_remove_cached_debs() {
 
 step_remove_packages() {
   step "Removing packages..."
-  local list="" pkg keep="" dep extra cand changed=1
+  local list="" pkg keep="" dep extra cand takes changed=1
 
   # Keep replaced packages and, where their restore failed, their dependencies.
   [ -s "$UPGRADED_MANIFEST" ] && keep="$(awk '{print $1}' "$UPGRADED_MANIFEST" | xargs)"
@@ -5449,10 +5779,19 @@ step_remove_packages() {
   for pkg in $(sort -u "$INSTALLED_MANIFEST"); do
     predates_install "$pkg" && continue
     in_word_list "$pkg" "$keep" && continue
+    # apt refuses to purge a held package; the user's hold stands.
+    if is_held "$pkg"; then SKIPPED+=("${pkg} kept — held by you (apt-mark unhold ${pkg} to let it go)"); continue; fi
+    # Ubuntu's keys stay while an apt source the user added needs any of them.
+    if [ "$pkg" = ubuntu-keyring ] \
+       && dpkg -L ubuntu-keyring 2>/dev/null | grep '\.gpg$' \
+          | grep -rqsF -f - /etc/apt/sources.list /etc/apt/sources.list.d/; then
+      SKIPPED+=("ubuntu-keyring kept — another apt source uses its keys")
+      continue
+    fi
     if is_config_only "$pkg"; then
       grep -qxF "$pkg" "$CONFIG_FILES_BEFORE" 2>/dev/null && continue
       list="${list} ${pkg}"
-    elif is_installed "$pkg"; then
+    elif is_present "$pkg"; then
       list="${list} ${pkg}"
     fi
   done
@@ -5461,14 +5800,15 @@ step_remove_packages() {
   while [ -n "${list// /}" ] && [ "$changed" -eq 1 ]; do
     changed=0
     # shellcheck disable=SC2086
-    extra="$(LC_ALL=C apt-get -s purge $list 2>/dev/null | awk '/^(Remv|Purg) /{print $2}' \
-             | while read -r pkg; do in_word_list "$pkg" "$list" || echo "$pkg"; done | xargs)"
+    extra="$(purge_sim $list | while read -r pkg; do in_word_list "$pkg" "$list" || echo "$pkg"; done | xargs)"
     [ -n "$extra" ] || break
     for cand in $list; do
-      if LC_ALL=C apt-get -s purge "$cand" 2>/dev/null | awk '/^(Remv|Purg) /{print $2}' \
-           | grep -qxF -f <(printf '%s\n' $extra); then
-        list="$(printf '%s\n' $list | grep -vxF "$cand" | xargs)"
-        SKIPPED+=("${cand} kept — removing it would also remove: ${extra}")
+      # shellcheck disable=SC2086
+      takes="$(purge_sim "$cand" | grep -xF -f <(printf '%s\n' $extra) | xargs)"
+      if [ -n "$takes" ]; then
+        # The leading space stays, as the summary lines below expect.
+        list=" $(printf '%s\n' $list | grep -vxF "$cand" | xargs)"
+        SKIPPED+=("${cand} kept — removing it would also remove: ${takes}")
         changed=1
       fi
     done
@@ -5484,6 +5824,50 @@ step_remove_packages() {
       && DONE+=("Configuration files kept, as before the install:${PURGE_KEPT_CONFIG}")
   fi
   remove_stale_icon_caches
+}
+
+# Automatically installed packages nothing needs, as apt's autoremove sees
+# them; "none" when apt cannot tell.
+unused_packages() {
+  local sim
+  sim="$(LC_ALL=C apt-get -s autoremove 2>/dev/null)" || { echo none; return; }
+  printf '%s\n' "$sim" | awk '/^Remv /{print $2}' | xargs
+}
+
+# Purge the dependencies the removal left unused, so no autoremove is needed.
+# Runs after the restores, which may need some of them again. Packages unused
+# before the uninstall, and packages it put back, stay.
+step_remove_unused_dependencies() {
+  step "Removing dependencies the look's packages left unused..."
+  local pkg orphans="" now
+  now="$(unused_packages)"
+  if [ "$now" = none ]; then
+    GUESSED+=("apt could not list unused packages — no dependency removed; run --uninstall again once apt works")
+    SYSTEM_PENDING=1
+    return
+  fi
+  for pkg in $now; do
+    in_word_list "$pkg" "$UNUSED_BEFORE_PURGE" && continue
+    in_word_list "$pkg" "$INSTALLED_BEFORE_PURGE" || continue
+    in_word_list "$pkg" "$RESTORED_BEFORE_PURGE" && continue
+    predates_install "$pkg" && continue
+    orphans="${orphans} ${pkg}"
+  done
+  # The main purge's outcome; the snapshot stays until both are done.
+  local main_failed="$PURGE_FAILED"
+  PURGE_FAILED=0
+  if ! purge_list "$orphans"; then
+    SKIPPED+=("No dependency left unused")
+  elif [ $PURGE_FAILED -eq 1 ]; then
+    GUESSED+=("Not purged (declined, or apt failed) — dependencies left unused:${orphans}")
+  else
+    DONE+=("Removed the dependencies the look's packages left unused:${orphans}")
+    # shellcheck disable=SC2086
+    sys_record_append "$PURGED_DEPENDENCIES" "$(printf '%s\n' $orphans)"
+  fi
+  # Done with it: a later run for another pending step must not reuse it.
+  [ "$PURGE_FAILED" -eq 0 ] && [ "$main_failed" -eq 0 ] && sudo rm -f "$UNINSTALL_SNAPSHOT"
+  return 0
 }
 
 # The purge leaves each icon theme's generated icon-theme.cache behind; a
@@ -5511,27 +5895,24 @@ echo ""
 echo "This undoes only what ubuntu-look.sh did:"
 echo "  - for you: extensions, GNOME settings, wallpaper, terminal profile, helper files"
 echo "  - for the system, when you are the last user of the look: packages it"
-echo "    installed, apt source and pin, login screen, boot splash, refresh timer"
+echo "    installed, apt source and pin, login screen, boot splash and kernel"
+echo "    command line"
 echo "Every setting it made goes back to Debian's default. Your dash favourites, and"
 echo "the packages and apps you had before or installed later, are kept."
-[ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ] && [ ! -S "/run/user/$(id -u)/bus" ] \
+adopt_session_bus
+[ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ] \
   && message warn "No desktop session: your settings are reset on a later run from the desktop."
 echo ""
 confirm_continue
 
 sudo -v || error "sudo is required."
 
-adopt_session_bus
-
 # Wait for any run in progress; from here no other run can start.
-take_run_lock wait || error "Could not take the run lock ${UBUNTU_LOOK_LOCK}."
+take_run_lock
 
-migrate_home_records
 OTHERS="$(other_users)"
 LAST_USER=1
 [ -n "$OTHERS" ] && LAST_USER=0
-# Stop the timer now, so no refresh waits on the lock and runs after the uninstall.
-[ "$LAST_USER" -eq 1 ] && { sudo systemctl disable --now ubuntu-look-refresh.timer >/dev/null 2>&1 || true; }
 
 # A user who never installed the look keeps their settings as they are.
 if grep -qxF "$RUN_USER" "$SYS_USERS" 2>/dev/null || [ -d "$BACKUP_DIR" ] || [ -f "$LOOK_ENV_FILE" ]; then
@@ -5540,54 +5921,79 @@ if grep -qxF "$RUN_USER" "$SYS_USERS" 2>/dev/null || [ -d "$BACKUP_DIR" ] || [ -
   step_extensions
   step_restore_tiling_keybindings
   step_restore_gnome_settings
+  step_clear_extension_state
   step_restore_dock_settings
   step_remove_extension_autostart
   step_remove_app_grid_icon
-  step_remove_theme_followers
-  step_restore_gtk
   step_terminal_profile
-  step_restore_software_icon
-  remove_legacy_ding && DONE+=("Removed the desktop-icons copy an earlier version installed")
 
-  # session-migration's record, where the look brought session-migration in.
+  # session-migration's records (one per session type), where the look
+  # brought session-migration in.
   grep -qxF session-migration "$INSTALLED_MANIFEST" 2>/dev/null \
-    && rm -f "$HOME/.local/share/session_migration-gnome"
-
-  # Directories the installer created, where now empty.
-  for _d in "$HOME/.config/autostart" "$HOME/.config/systemd/user/graphical-session.target.wants" \
-            "$HOME/.config/systemd/user" "$HOME/.config/systemd" \
-            "$HOME/.local/bin" "$HOME/.local/share/icons"; do
-    rmdir "$_d" 2>/dev/null || true
-  done
+    && rm -f "${XDG_DATA_HOME:-$HOME/.local/share}"/session_migration-*
+  # The install may have created these; rmdir leaves any that hold files.
+  rmdir "$HOME/.local/share" "$HOME/.local" 2>/dev/null || true
 else
   SKIPPED+=("No settings of the look recorded for ${RUN_USER} — settings left unchanged")
 fi
 
-# This user no longer uses the look.
-if grep -qxF "$RUN_USER" "$SYS_USERS" 2>/dev/null; then
-  _users_tmp="$(mktemp)"
-  grep -vxF "$RUN_USER" "$SYS_USERS" > "$_users_tmp"
-  must_sudo install -m 0644 "$_users_tmp" "$SYS_USERS"
-  rm -f "$_users_tmp"
+# This user no longer uses the look, once their settings are reset; until
+# then the system part (dconf-cli included) stays for them. Their records go
+# now, so a run cut off in the system part does not repeat these steps.
+if [ "$USER_PENDING" -eq 0 ]; then
+  if grep -qxF "$RUN_USER" "$SYS_USERS" 2>/dev/null; then
+    _users_tmp="$(mktemp)"
+    grep -vxF "$RUN_USER" "$SYS_USERS" > "$_users_tmp"
+    must_sudo install -m 0644 "$_users_tmp" "$SYS_USERS"
+    rm -f "$_users_tmp"
+  fi
+  if [ -d "$BACKUP_DIR" ] && ! grep -qxF "$RUN_USER" "$SYS_USERS" 2>/dev/null; then
+    rm -rf "$BACKUP_DIR"
+    message "Removed ${BACKUP_DIR}"
+  fi
 fi
 
 if [ "$LAST_USER" -eq 1 ]; then
-  step_remove_refresh_timer
   step_remove_dconf_profile
   step_remove_gdm_profile
   step_restore_grub
+  # Before the purge: once the look's theme package is gone, Plymouth reports
+  # its fallback theme, not the one the install set.
   step_restore_plymouth
   # Without the Ubuntu source and pin, restores take Debian's builds.
   step_remove_ubuntu_repo
-  step_restore_removed_packages
-  # Before any purge: Ubuntu's yaru-theme-gtk depends on session-migration.
-  step_restore_upgraded_packages
-  step_remove_packages
-  step_restore_replaced_by_combined
-  # Also retries a repair that failed earlier.
-  repair_dashtodock
-  step_unmask_session_migration
-  step_remove_cached_debs
+  # What is unused, installed and replaced before any package changes; kept
+  # on record, so a run that is declined or cut off is finished by the next.
+  if [ ! -f "$UNINSTALL_SNAPSHOT" ]; then
+    _unused="$(unused_packages)"
+    if [ "$_unused" != none ]; then
+      sys_record_write "$UNINSTALL_SNAPSHOT" "unused: ${_unused}
+installed: $(installed_package_list | xargs)
+restored: $(awk '{print $1}' "$UPGRADED_MANIFEST" 2>/dev/null | xargs)"
+    fi
+  fi
+  if [ -f "$UNINSTALL_SNAPSHOT" ]; then
+    UNUSED_BEFORE_PURGE="$(sed -n 's/^unused: //p' "$UNINSTALL_SNAPSHOT")"
+    INSTALLED_BEFORE_PURGE="$(sed -n 's/^installed: //p' "$UNINSTALL_SNAPSHOT")"
+    RESTORED_BEFORE_PURGE="$(sed -n 's/^restored: //p' "$UNINSTALL_SNAPSHOT")"
+    _had_plymouth=0
+    is_installed plymouth && _had_plymouth=1
+    # Before any purge: Ubuntu's yaru-theme-gtk depends on session-migration.
+    step_restore_upgraded_packages
+    step_remove_packages
+    step_restore_replaced_by_combined
+    # Also retries a repair that failed earlier.
+    repair_dashtodock
+    step_remove_unused_dependencies
+    step_unmask_session_migration
+    step_remove_cached_debs
+    # Purging Plymouth rebuilt the initramfs.
+    [ "$_had_plymouth" -eq 1 ] && ! is_installed plymouth && need_reboot
+  else
+    # Without the snapshot the purge would leave its dependencies behind.
+    GUESSED+=("apt cannot tell which packages are unused (see 'sudo apt-get check') — no package was changed; run --uninstall again once apt works")
+    SYSTEM_PENDING=1
+  fi
 else
   SKIPPED+=("System changes kept — the look is still used by: ${OTHERS}")
 fi
@@ -5596,9 +6002,9 @@ echo ""
 echo -e "${GREEN}═════════════════════════════════════════════════════════${ENDCOLOR}"
 echo -e "${GREEN}                    UNINSTALL SUMMARY${ENDCOLOR}"
 echo -e "${GREEN}═════════════════════════════════════════════════════════${ENDCOLOR}"
-[ ${#DONE[@]} -gt 0 ] && { echo -e "${GREEN}Restored/removed:${ENDCOLOR}"; printf '   + %s\n' "${DONE[@]}"; }
-[ ${#GUESSED[@]} -gt 0 ] && { echo -e "${YELLOW}Could not finish:${ENDCOLOR}"; printf '   ? %s\n' "${GUESSED[@]}"; }
-[ ${#SKIPPED[@]} -gt 0 ] && { echo -e "${YELLOW}Skipped:${ENDCOLOR}"; printf '   - %s\n' "${SKIPPED[@]}"; }
+summary_block "$GREEN" "Restored/removed:" + "" "${DONE[@]}"
+summary_block "$YELLOW" "Could not finish:" "?" "" "${GUESSED[@]}"
+summary_block "$YELLOW" "Skipped:" - "" "${SKIPPED[@]}"
 echo ""
 
 # System records go once all system work is done.
@@ -5607,28 +6013,21 @@ if [ "$LAST_USER" -eq 1 ]; then
     # Settings still to restore need to know which extensions came with the look.
     if [ "$USER_PENDING" -eq 1 ] && [ -f "$INSTALLED_MANIFEST" ]; then
       mkdir -p "$BACKUP_DIR" && cp "$INSTALLED_MANIFEST" "$MANIFEST_COPY"
+      cp "$PACKAGES_BEFORE" "${BACKUP_DIR}/packages-before.txt" 2>/dev/null
     fi
     sudo rm -rf "$SYS_DIR"
-    # The lock of earlier versions goes. The current one (/run/ubuntu-look.lock)
-    # stays, as a waiting run may hold it; /run is cleared at boot.
-    sudo rm -f /run/lock/ubuntu-look.lock
   else
     message warn "Keeping ${SYS_DIR}: system work is unfinished. Run this again to finish it."
   fi
 fi
 
-# User records go once the settings are restored.
-if [ -d "$BACKUP_DIR" ]; then
-  if [ "$USER_PENDING" -eq 1 ]; then
-    message warn "Keeping ${BACKUP_DIR}: run 'bash ubuntu-look.sh --uninstall' again from your desktop to reset your settings."
-  else
-    rm -rf "$BACKUP_DIR"
-    message "Removed ${BACKUP_DIR}"
-  fi
-fi
+[ "$USER_PENDING" -eq 1 ] && [ -d "$BACKUP_DIR" ] \
+  && message warn "Keeping ${BACKUP_DIR}: run 'bash ubuntu-look.sh --uninstall' again from your desktop to reset your settings."
 
 if [ "$REBOOT_NEEDED" -eq 1 ]; then
   echo -e "${RED}⚠  REBOOT REQUIRED${ENDCOLOR} for the boot splash, kernel command line and login screen."
+  [ "$USER_PENDING" -eq 0 ] \
+    && echo -e "   The reboot also applies your restored settings; no separate log out is needed."
   echo -e "   Run: ${YELLOW}sudo reboot${ENDCOLOR}"
 else
   echo -e "${YELLOW}Log out and back in for all changes to take effect.${ENDCOLOR}"
@@ -5641,13 +6040,15 @@ fi
 # 9. Install
 ###############################################################################
 
-case "${arguments}" in
-  prepare-upgrade|--prepare-upgrade)
-    [ "$MODE" = online ] || error "--prepare-upgrade takes no mode flag."
-    prepare_debian_upgrade
-    exit 0
-    ;;
-esac
+if in_word_list --prepare-upgrade "$arguments"; then
+  [ "$MODE" = online ] || error "--prepare-upgrade takes no mode flag."
+  case "$arguments" in
+    --prepare-upgrade) ;;
+    *) error "--prepare-upgrade takes no other arguments (got '${arguments}')." ;;
+  esac
+  prepare_debian_upgrade
+  exit 0
+fi
 
 package_categories="$(echo "${arguments:-${!packages[*]}}" | xargs -n1 | sort -u | xargs)"
 for category in $package_categories; do
@@ -5655,21 +6056,30 @@ for category in $package_categories; do
   Valid stages: $(echo "${!packages[@]}" | xargs -n1 | sort | xargs)"
 done
 
-[ "$MODE" = download ] && download_mode
+if [ "$MODE" = download ]; then
+  [ -z "$arguments" ] || error "--download builds every stage and takes no stage names (got '${arguments}')."
+  download_mode
+fi
 # Check the bundle before changing anything.
 [ "$MODE" = offline ] && load_bundle
 
 if [ "$REFRESH" = 1 ]; then
-  take_run_lock; _lock_rc=$?
-  [ "$_lock_rc" -eq 2 ] && error "Could not create or open the run lock ${UBUNTU_LOOK_LOCK}."
-  [ "$_lock_rc" -eq 1 ] && { message "another ubuntu-look run is in progress — leaving it to that one"; REFRESH_NOOP=1; exit 0; }
-  message "unattended refresh"
-  # Only a finished install is kept current.
-  if [ ! -f "$PACKAGES_BEFORE" ] || ! grep -q '^# pin-version: ' "$UBUNTU_PIN" 2>/dev/null; then
-    message "the Ubuntu look is not installed here — nothing to refresh"
-    REFRESH_NOOP=1
-    exit 0
+  # Only a look this user installed has updates.
+  if [ ! -f "$PACKAGES_BEFORE" ] || [ ! -d "$BACKUP_ORIGINAL" ] \
+     || ! grep -qxF "$RUN_USER" "$SYS_USERS" 2>/dev/null; then
+    error "The Ubuntu look is not installed for ${RUN_USER}. Install it with: bash ubuntu-look.sh"
   fi
+  if ! grep -q '^# pin-version: ' "$UBUNTU_PIN" 2>/dev/null; then
+    error "The look is prepared for a Debian upgrade (or its pin is missing). Set it up again with: bash ubuntu-look.sh"
+  fi
+  [ -z "$(missing_packages "curl ca-certificates")" ] \
+    || error "curl is missing; run 'bash ubuntu-look.sh' to install it with the look."
+  message "Checking the Ubuntu look for updates. Nothing is changed without your yes."
+  sudo -v || error "User ${RUN_USER} cannot use sudo."
+  take_run_lock
+  discover_releases "$UBUNTU_CODENAME"
+  # Lists the updates and asks; returns only to apply them.
+  refresh_check
 else
   message "Welcome to ${GREEN}ubuntu-look${ENDCOLOR} — make Debian GNOME look like Ubuntu!"
   message ""
@@ -5685,50 +6095,38 @@ else
   message ""
   confirm_continue
   sudo -v || error "User ${RUN_USER} cannot use sudo."
-  take_run_lock wait || error "Could not take the run lock ${UBUNTU_LOOK_LOCK}."
+  take_run_lock
+fi
+# From here on a run changes the system, and the summary reports it.
+RUN_STARTED=1
+
+adopt_session_bus
+
+# Per-user snapshot, taken once.
+if [ ! -d "$BACKUP_ORIGINAL" ]; then
+  message "first run for ${RUN_USER} — saving your settings to ${BACKUP_ORIGINAL} (for the uninstall)"
+  mkdir -p "$BACKUP_ORIGINAL"
+  # Ubuntu's defaults are applied from a desktop session, now or on a later
+  # run; marked at once, so an interrupted run is not taken for a re-run.
+  : > "$DEFAULTS_PENDING"
+  # dconf reads the database file itself; no session is needed.
+  command -v dconf >/dev/null 2>&1 \
+    && user_dconf dump / > "${BACKUP_ORIGINAL}/dconf-dump.ini"
+  echo "ubuntu-look.sh pre-install snapshot — $(date -Iseconds)" > "${BACKUP_ORIGINAL}/INFO"
+  STATUS_CHANGES+=("Your pre-install settings saved → ${BACKUP_ORIGINAL}")
+else
+  STATUS_NOCHANGE+=("Your pre-install settings snapshot already exists")
 fi
 
-# A bundle source left by an older offline run.
-[ -f "$OFFLINE_LOCAL_LIST" ] && sudo rm -f "$OFFLINE_LOCAL_LIST"
+# System snapshot, taken once.
+record_packages_before
 
-if [ "$REFRESH" != 1 ]; then
-  migrate_home_records
-
-  adopt_session_bus
-
-  # Per-user snapshot, taken once.
-  FIRST_RUN_FOR_USER=0
-  if [ ! -d "$BACKUP_ORIGINAL" ]; then
-    FIRST_RUN_FOR_USER=1
-    message "first run for ${RUN_USER} — saving your settings to ${BACKUP_ORIGINAL} (for the uninstall)"
-    mkdir -p "$BACKUP_ORIGINAL"
-    while read -r _src _dst; do
-      [ -f "$HOME/$_src" ] && cp "$HOME/$_src" "${BACKUP_ORIGINAL}/$_dst" 2>/dev/null
-    done <<'EOF'
-.config/gtk-3.0/gtk.css gtk-3.0-gtk.css
-.config/gtk-4.0/gtk.css gtk-4.0-gtk.css
-.config/gtk-3.0/settings.ini gtk-3.0-settings.ini
-.config/gtk-4.0/settings.ini gtk-4.0-settings.ini
-.gtkrc-2.0 gtkrc-2.0
-.local/share/applications/org.gnome.Software.desktop org.gnome.Software.desktop
-EOF
-    # dconf reads the database file itself; no session is needed.
-    command -v dconf >/dev/null 2>&1 \
-      && user_dconf dump / > "${BACKUP_ORIGINAL}/dconf-dump.ini"
-    # Ubuntu's defaults are applied from a desktop session, now or on a later run.
-    : > "$DEFAULTS_PENDING"
-    echo "ubuntu-look.sh pre-install snapshot — $(date -Iseconds)" > "${BACKUP_ORIGINAL}/INFO"
-    STATUS_CHANGES+=("Your pre-install settings saved → ${BACKUP_ORIGINAL}")
-  else
-    STATUS_NOCHANGE+=("Your pre-install settings snapshot already exists")
-  fi
-
-  # System snapshot, taken once.
-  record_packages_before
-
-  # Users with the look; system changes are undone when the last one uninstalls.
-  grep -qxF "$RUN_USER" "$SYS_USERS" 2>/dev/null || sys_record_append "$SYS_USERS" "$RUN_USER"
-fi
+# Users with the look; system changes are undone when the last one uninstalls.
+grep -qxF "$RUN_USER" "$SYS_USERS" 2>/dev/null || sys_record_append "$SYS_USERS" "$RUN_USER"
+# An unfinished uninstall's snapshot and hand-over copy no longer fit once
+# the look is back.
+[ -e "$UNINSTALL_SNAPSHOT" ] && sudo rm -f "$UNINSTALL_SNAPSHOT"
+rm -f "${BACKUP_DIR}/packages-before.txt" "$MANIFEST_COPY" "$DCONF_PROFILE_COPY"
 
 if [ "$MODE" = offline ]; then
   prepare_offline
@@ -5736,57 +6134,21 @@ else
 
 step "Configure Ubuntu archive candidate sources"
 
-# curl reads the archive. Generic tools, not recorded; a refresh installs none.
-_missing_prereqs="$(missing_packages "curl ca-certificates")"
-if [ -n "$_missing_prereqs" ]; then
-  if [ "$REFRESH" = 1 ]; then
-    message warn "missing: ${_missing_prereqs} — run ubuntu-look.sh by hand to install them"
-    REFRESH_NOOP=1
-    exit 0
-  fi
-  sudo apt-get update -qq || message warn "apt update reported an error"
-  for prereq in $_missing_prereqs; do
-    installs_cleanly "$prereq" \
-      || error "Installing prerequisite ${prereq} would remove packages or cannot be done — install it by hand"
-    sudo apt-get install -y "$prereq" || error "Failed to install prerequisite: $prereq"
-    STATUS_CHANGES+=("Installed prerequisite: $prereq (kept on uninstall)")
-  done
-fi
+# curl reads the archive. Generic tools, not recorded.
+install_prereqs "$(missing_packages "curl ca-certificates")"
 
-# Read every run, so a new release is found at once.
-message "reading published Ubuntu releases from ${UBUNTU_MIRROR}..."
-UBUNTU_ALL_CODENAMES="$(discover_ubuntu_codenames)"
-if [ -z "$UBUNTU_ALL_CODENAMES" ] && [ "$REFRESH" = 1 ]; then
-  message warn "no Ubuntu release reachable — trying again at the next refresh"
-  REFRESH_NOOP=1
-  exit 0
-fi
-refresh_gate
-# A refresh blocks shutdown, so dpkg is never cut off.
-if [ "$REFRESH" = 1 ] && command -v systemd-inhibit >/dev/null 2>&1; then
-  systemd-inhibit --what=shutdown:sleep --who=ubuntu-look \
-    --why="Updating the Ubuntu look" sleep infinity 9<&- >/dev/null 2>&1 &
-  INHIBIT_PID=$!
-fi
-[ -z "$UBUNTU_ALL_CODENAMES" ] \
-  && error "No Ubuntu release reachable at ${UBUNTU_MIRROR} — check your internet connection."
-
-UBUNTU_CANDIDATE_CODENAMES="$(echo "$UBUNTU_ALL_CODENAMES" | tr ' ' '\n' \
-  | tail -n "$MAX_UBUNTU_CANDIDATES" | xargs)"
-
-# A forced UBUNTU_CODENAME is configured even outside that window.
-[[ "$UBUNTU_CODENAME" =~ ^[a-z]+$ ]] \
-  || error "UBUNTU_CODENAME must be a codename in lower case letters, or auto."
-if [ "$UBUNTU_CODENAME" != "auto" ] && ! in_word_list "$UBUNTU_CODENAME" "$UBUNTU_CANDIDATE_CODENAMES"; then
-  ubuntu_release_info "$UBUNTU_CODENAME" >/dev/null \
-    || error "UBUNTU_CODENAME=${UBUNTU_CODENAME} is not published on ${UBUNTU_MIRROR} or ${UBUNTU_OLD_MIRROR}"
-  UBUNTU_CANDIDATE_CODENAMES="$UBUNTU_CANDIDATE_CODENAMES $UBUNTU_CODENAME"
+# Read every run, so a new release is found at once (--refresh did already).
+if [ "$REFRESH" != 1 ]; then
+  # A forced UBUNTU_CODENAME is configured even outside that window.
+  discover_releases "$UBUNTU_CODENAME"
 fi
 message "Ubuntu releases in play (oldest to newest): ${GREEN}${UBUNTU_CANDIDATE_CODENAMES}${ENDCOLOR}"
 
 # Nothing changed since the last full run: the sources are not widened.
 KEEP_SOURCES=0
-if [ "$REFRESH" != 1 ] && [ "$UBUNTU_CODENAME" = auto ] && unchanged_since_last_run; then
+# --refresh has checked this already; its answer is reused.
+if [ "$UBUNTU_CODENAME" = auto ] \
+   && if [ "$REFRESH" = 1 ]; then [ "$REFRESH_UNCHANGED" = 1 ]; else unchanged_since_last_run; fi; then
   KEEP_SOURCES=1
   UBUNTU_CODENAME="$KEPT_CODENAME"
   # A looked-back release stays in the list's header.
@@ -5794,102 +6156,77 @@ if [ "$REFRESH" != 1 ] && [ "$UBUNTU_CODENAME" = auto ] && unchanged_since_last_
     || UBUNTU_CANDIDATE_CODENAMES="$UBUNTU_CODENAME $UBUNTU_CANDIDATE_CODENAMES"
   message "no new Ubuntu release, no Debian or gnome-shell change — keeping ${GREEN}${UBUNTU_CODENAME}${ENDCOLOR} without fetching the other releases"
 fi
+# A fixed release is configured alone; auto chooses among the candidates.
+UBUNTU_SOURCE_LIST="$UBUNTU_CANDIDATE_CODENAMES"
+[ "$UBUNTU_CODENAME" = auto ] || UBUNTU_SOURCE_LIST="$UBUNTU_CODENAME"
 
-# Ubuntu's archive keys, from Debian's own package.
-if ! is_installed ubuntu-keyring; then
-  [ "$REFRESH" = 1 ] && error "ubuntu-keyring is not installed — run ubuntu-look.sh by hand."
-  sudo apt-get update -qq || message warn "apt update reported an error"
-  installs_cleanly ubuntu-keyring && apt_install_recorded ubuntu-keyring >/dev/null \
-    || error "Could not install Debian's ubuntu-keyring package (Ubuntu's archive keys)."
-  STATUS_CHANGES+=("Installed ubuntu-keyring (Ubuntu's archive keys, from Debian)")
-fi
-[ -s "$UBUNTU_KEYRING" ] || error "${UBUNTU_KEYRING} is missing — reinstall ubuntu-keyring."
+ensure_ubuntu_keyring
 
 # Block every Ubuntu package until the full pin is written.
-write_provisional_pin \
-  && message "Ubuntu packages blocked by default until the theme pin is resolved"
+PROVISIONAL_PIN_NEW=0
+write_provisional_pin
+case $? in
+  0) PROVISIONAL_PIN_NEW=1
+     message "Ubuntu packages blocked by default until the theme pin is resolved" ;;
+  2) error "Could not write ${UBUNTU_PIN}; the apt source was not changed." ;;
+esac
 
-# Saved so a failing source list can be put back.
-PREV_UBUNTU_LIST="$(mktemp)"
-cp "$UBUNTU_LIST" "$PREV_UBUNTU_LIST" 2>/dev/null || : > "$PREV_UBUNTU_LIST"
+# Saved so a failing apt source can be put back.
+PREV_UBUNTU_SOURCES="$(mktemp)"
+cp "$UBUNTU_SOURCES" "$PREV_UBUNTU_SOURCES" 2>/dev/null || : > "$PREV_UBUNTU_SOURCES"
 # Only a net change of the list is reported.
-INITIAL_UBUNTU_LIST="$(cat "$UBUNTU_LIST" 2>/dev/null)"
+INITIAL_UBUNTU_SOURCES="$(cat "$UBUNTU_SOURCES" 2>/dev/null)"
 PINNED_BEFORE="$(pinned_codename)"
 
+# 1 = the apt source is as it was.
+_src_rc=1
 if [ "$KEEP_SOURCES" = 1 ]; then
   message "Ubuntu sources not widened: $(configured_codenames | xargs)"
 else
-  write_ubuntu_sources
-  case $? in
-    0) message "configuring Ubuntu archive candidates: ${UBUNTU_CANDIDATE_CODENAMES}" ;;
+  # shellcheck disable=SC2086
+  write_ubuntu_sources $UBUNTU_SOURCE_LIST
+  _src_rc=$?
+  case $_src_rc in
+    0) message "configuring Ubuntu archive sources: ${UBUNTU_SOURCE_LIST}" ;;
     1) message "Ubuntu candidate sources already current" ;;
-    *) message warn "no Ubuntu archive answered — the source list is left as it was" ;;
+    2) message warn "no Ubuntu archive answered — the apt source is left as it was" ;;
+    *) message warn "could not write ${UBUNTU_SOURCES} — the apt source is left as it was" ;;
   esac
 fi
 
 step "Refresh package lists"
-# A failing Ubuntu source would break every apt update.
-if ! apt_update; then
-  restore_prev_ubuntu_list
-  error "apt update failed for the Ubuntu sources — they were put back as they were."
+# A failing Ubuntu source would break every apt update. --refresh has just
+# refreshed them; with the sources unchanged that stands.
+if [ "$REFRESH" = 1 ] && [ "$_src_rc" -eq 1 ] && [ "$APT_LISTS_FRESH" = 1 ]; then
+  message "package lists refreshed a moment ago"
+  _upd=0
+else
+  apt_update
+  _upd=$?
 fi
-# An unserved architecture yields an empty Ubuntu index.
-if ! LC_ALL=C apt-cache madison gnome-shell-extension-ubuntu-dock yaru-theme-icon 2>/dev/null \
-     | awk -F'|' -v re="$UBUNTU_HOSTS_RE" '{ gsub(/^[ \t]+|[ \t]+$/, "", $3); if ($3 ~ re) f = 1 } END { exit !f }'; then
-  restore_prev_ubuntu_list
+case $_upd in
+  0) ;;
+  3) restore_prev_ubuntu_sources
+     error "apt is in use by another program — the sources were put back as they were; try again later." ;;
+  *) restore_prev_ubuntu_sources
+     error "apt update failed for the Ubuntu sources — they were put back as they were." ;;
+esac
+if ! ubuntu_index_has_packages; then
+  restore_prev_ubuntu_sources
   error "${UBUNTU_MIRROR} serves no Ubuntu packages for ${UBUNTU_ARCH} — the sources were put back as they were."
 fi
-rm -f "$PREV_UBUNTU_LIST"
-
-# The keyring earlier versions wrote.
-remove_legacy_keyring
+rm -f "$PREV_UBUNTU_SOURCES"
 
 step "Resolve Ubuntu theme codename"
 
-if [ "$UBUNTU_CODENAME" = "auto" ]; then
-  UBUNTU_CODENAME="$(resolve_ubuntu_codename)"
-  _newest="$(echo "$UBUNTU_CANDIDATE_CODENAMES" | awk '{print $NF}')"
-  _debian_shell="$(shell_major)"
-  _newest_shell="$(ubuntu_shell_major "$_newest")"
-
-  if [ -z "$UBUNTU_CODENAME" ] && [ -n "$_debian_shell" ] && [ -n "$_newest_shell" ] \
-     && [ "$_debian_shell" -gt "$_newest_shell" ]; then
-    # gnome-shell is newer than every Ubuntu release.
-    UBUNTU_CODENAME="$_newest"
-    message warn "gnome-shell ${_debian_shell} is newer than any Ubuntu release — pinning the newest, ${UBUNTU_CODENAME}"
-  elif [ -z "$UBUNTU_CODENAME" ]; then
-    message warn "no Ubuntu release in the current window has a theme this gnome-shell can load"
-    # The pinned release first, then older listed releases, then retired ones.
-    if [ -n "$PINNED_BEFORE" ] && ! in_word_list "$PINNED_BEFORE" "$UBUNTU_CANDIDATE_CODENAMES"; then
-      try_older_releases "$PINNED_BEFORE"
-    fi
-    if [ -z "$UBUNTU_CODENAME" ]; then
-      _older="$(echo "$UBUNTU_ALL_CODENAMES" | tr ' ' '\n' \
-        | head -n -"$MAX_UBUNTU_CANDIDATES" | tail -n "$MAX_UBUNTU_LOOKBACK" | xargs)"
-      [ -n "$_older" ] && try_older_releases "$_older"
-    fi
-    if [ -z "$UBUNTU_CODENAME" ]; then
-      _older="$(discover_retired_codenames)"
-      [ -n "$_older" ] && try_older_releases "$_older"
-    fi
-  fi
-
-  # Still nothing: pin the oldest candidate; the theme and dock are reported.
-  if [ -z "$UBUNTU_CODENAME" ]; then
-    UBUNTU_CODENAME="$(echo "$UBUNTU_CANDIDATE_CODENAMES" | awk '{print $1}')"
-    message warn "no Ubuntu release ships a shell theme for this gnome-shell — pinning ${UBUNTU_CODENAME}"
-  elif ! { [ "$UBUNTU_CODENAME" = "$_newest" ] && [ -n "${_newest_shell:-}" ] \
-           && [ "${_debian_shell:-0}" -gt "$_newest_shell" ]; }; then
-    message "auto-detected Ubuntu codename ${GREEN}${UBUNTU_CODENAME}${ENDCOLOR} ($(gnome-shell --version 2>/dev/null || echo 'gnome-shell not installed')) — verified via simulated install"
-  fi
-fi
+[ "$UBUNTU_CODENAME" = "auto" ] && resolve_release "$PINNED_BEFORE"
 
 # Rewrite a missing, provisional, outdated or other-release pin.
 NEED_PIN_REWRITE=1
 if [ ! -f "$UBUNTU_PIN" ] || grep -q '^# provisional' "$UBUNTU_PIN"; then
   :
 elif ! grep -q "# pin-version: ${PIN_VERSION}" "$UBUNTU_PIN"; then
-  message warn "Ubuntu theme pin is from an older script version — rewriting"
+  message warn "Ubuntu theme pin is out of date — rewriting"
 elif ! grep -q "n=${UBUNTU_CODENAME}\$" "$UBUNTU_PIN"; then
   message warn "Ubuntu release changed to ${UBUNTU_CODENAME} — rewriting theme pin"
 else
@@ -5897,6 +6234,7 @@ else
 fi
 if [ "$NEED_PIN_REWRITE" = 1 ]; then
   write_ubuntu_pin
+  [ $? -eq 2 ] && error "Could not write ${UBUNTU_PIN}; Ubuntu packages stay blocked. Run this again."
   STATUS_CHANGES+=("Ubuntu theme pin applied (${UBUNTU_CODENAME})")
 else
   message "Ubuntu theme pin already current (${UBUNTU_CODENAME})"
@@ -5950,8 +6288,7 @@ for category in $package_categories; do
     fi
   done
 
-  # Split into installs and upgrades. A refresh installs nothing new: a missing
-  # package may have been removed on purpose.
+  # Split into installs and upgrades.
   declare -A PKG_BEFORE=()
   to_install=""
   to_upgrade=""
@@ -5960,7 +6297,9 @@ for category in $package_categories; do
     _cand="$(pkg_candidate_version "$p")"
     PKG_BEFORE[$p]="$_have"
     if [ -z "$_have" ]; then
-      [ "$REFRESH" = 1 ] || to_install="$to_install $p"
+      to_install="$to_install $p"
+    elif is_held "$p"; then
+      STATUS_ALREADY+=("$p (${_have}, held by you)")
     elif [ -n "$_cand" ] && dpkg --compare-versions "$_cand" gt "$_have" \
          && { ! predates_install "$p" || in_word_list "$p" "$LOOK_PACKAGES"; }; then
       to_upgrade="$to_upgrade $p"
@@ -5981,22 +6320,18 @@ for category in $package_categories; do
     # Record replaced builds before apt runs.
     for p in $to_upgrade; do record_upgraded_pkg "$p" "${PKG_BEFORE[$p]:-}"; done
 
-    # Simulate first; a batch that would remove something is never run.
-    _batch_ok=1
+    # Simulated first; a batch that would remove something is never run.
     # shellcheck disable=SC2086
-    _batch_sim="$(LC_ALL=C apt-get -s install "${APT_OPTS[@]}" $to_change 2>&1)" || _batch_ok=0
-    _batch_removes="$(unexpected_removals "$_batch_sim")"
-    [ "$_batch_ok" = 1 ] \
-      || message warn "apt cannot resolve this stage as one batch — going package by package"
-    if [ -n "$_batch_removes" ]; then
-      message warn "installing this stage as one batch would REMOVE: ${_batch_removes}"
-      message warn "not doing that — falling back to one package at a time"
-    elif [ "$_batch_ok" = 1 ]; then
-      record_planned_installs "$_batch_sim"
-      # shellcheck disable=SC2086
-      sudo apt-get install -y "${APT_OPTS[@]}" $to_change \
-        || message warn "batch install failed — retrying one package at a time"
-    fi
+    apt_install_checked $to_change
+    case $? in
+      1) if [ -n "$REMOVES" ]; then
+           message warn "installing this stage as one batch would REMOVE: ${REMOVES}"
+           message warn "not doing that — falling back to one package at a time"
+         else
+           message warn "apt cannot resolve this stage as one batch — going package by package"
+         fi ;;
+      2) message warn "batch install failed — retrying one package at a time" ;;
+    esac
 
     # Whatever the batch did not change gets the newest version that installs
     # without removals.
@@ -6025,19 +6360,16 @@ for category in $package_categories; do
       _installed_any=1
     done
     [ $_installed_any -eq 1 ] && RELOGIN_NEEDED=1
-    prune_installed_manifest
   fi
 
   case $category in
     0-base)
-      # A refresh never touches the bootloader.
-      [ "$REFRESH" = 1 ] && continue
       if ! has_boot_splash_tools; then
         STATUS_NOCHANGE+=("No GRUB or update-initramfs on this system — boot splash left alone")
       elif [ "$UBUNTU_BOOT_SPLASH" = "0" ]; then
-        revert_boot_splash
+        boot_splash unset
       else
-        apply_boot_splash
+        boot_splash set
       fi
       ;;
 
@@ -6051,30 +6383,34 @@ for category in $package_categories; do
       write_dconf_profile "$WP_LIGHT" "$WP_DARK"
       install_theme_extension
 
-      # A refresh leaves the user's session and home alone.
-      if [ "$REFRESH" = 1 ]; then
-        write_gdm_profile "$WP_LIGHT" "$WP_DARK"
-        continue
-      fi
-
       # From the next login on; only with the profile in place, or dconf has no database.
       if [ -f "$LOOK_PROFILE" ]; then
         enable_look_for_user
-        case $? in
+        _env_rc=$?
+        case $_env_rc in
           0) STATUS_CHANGES+=("The look is enabled for ${RUN_USER} → ${LOOK_ENV_FILE} (from the next login)")
              RELOGIN_NEEDED=1 ;;
           2) STATUS_FAILED+=("${LOOK_ENV_FILE} could not be written — your sessions keep Debian's defaults") ;;
         esac
         export DCONF_PROFILE="$LOOK_PROFILE_NAME"
+        # environment.d is read only when the user manager starts; a quick
+        # log out and in keeps the manager, so it is told as well.
+        [ "$_env_rc" -ne 2 ] \
+          && { systemctl --user set-environment DCONF_PROFILE="$LOOK_PROFILE_NAME" 2>/dev/null || true; }
       fi
 
+      _fresh_defaults=0
       if [ -n "${DBUS_SESSION_BUS_ADDRESS:-}" ]; then
-        message "live session detected — extensions and shell theme set now; the rest from the next login"
+        message "live session detected — settings written now; new extensions and the shell theme load at the next login"
 
         # Fresh install: Ubuntu's defaults. Later runs keep the user's own values
         # and hand the rest back to the profile once the session reads it.
+        # A first run without dconf-cli takes the snapshot once the stages brought it.
+        [ -f "$DEFAULTS_PENDING" ] && [ ! -f "${BACKUP_ORIGINAL}/dconf-dump.ini" ] \
+          && command -v dconf >/dev/null 2>&1 \
+          && user_dconf dump / > "${BACKUP_ORIGINAL}/dconf-dump.ini"
         if [ -f "$DEFAULTS_PENDING" ]; then
-          apply_ubuntu_defaults
+          apply_ubuntu_defaults && _fresh_defaults=1
         elif [ -f "${BACKUP_ORIGINAL}/dconf-dump.ini" ]; then
           if session_on_look_profile; then
             reclaim_live_settings
@@ -6088,21 +6424,25 @@ for category in $package_categories; do
         # Restart the tiling assistant when mutter's own tiling came back on beside it.
         if extension_active tiling-assistant@ubuntu.com \
            && [ "$(gsettings get org.gnome.mutter edge-tiling 2>/dev/null)" = true ]; then
+          _en="$(user_dconf_read /org/gnome/shell/enabled-extensions)"
+          _dis="$(user_dconf_read /org/gnome/shell/disabled-extensions)"
           gnome-extensions disable tiling-assistant@ubuntu.com 2>/dev/null \
             && gnome-extensions enable tiling-assistant@ubuntu.com 2>/dev/null \
             && STATUS_CHANGES+=("Tiling assistant restarted — mutter's own tiling had come back on beside it")
+          # The restart rewrote both lists; they are put back as they were.
+          for _k in enabled-extensions:"$_en" disabled-extensions:"$_dis"; do
+            if [ -n "${_k#*:}" ]; then dconf write "/org/gnome/shell/${_k%%:*}" "${_k#*:}" 2>/dev/null
+            else dconf reset "/org/gnome/shell/${_k%%:*}" 2>/dev/null; fi
+          done
         fi
 
-        # Only extensions not switched on for this user before: the running shell
-        # first, for an immediate effect, then the user database.
-        seed_extensions_record
+        # Only extensions not switched on for this user before, in one write to
+        # the user database, which the running shell follows.
         EXT_TODO="$(extensions_to_switch_on all)"
         EXT_ON_BEFORE="$(user_dconf_read /org/gnome/shell/enabled-extensions)"
-        for ext in $EXT_TODO; do
-          gnome-extensions enable "$ext" 2>/dev/null
-        done
         # shellcheck disable=SC2086
         enable_shell_extensions $EXT_TODO
+        dash_to_dock_status $?
 
         # Verify in the user database; the shell lists new packages only after re-login.
         ENABLED_NOW="$(user_dconf_read /org/gnome/shell/enabled-extensions)"
@@ -6127,9 +6467,6 @@ for category in $package_categories; do
         elif [ "$EXT_RECORDED" = 1 ] && [ "$EXT_FAILED_NOW" = 0 ]; then
           STATUS_NOCHANGE+=("The look's extensions are on — any you turn off later stay off")
         fi
-
-        # The theme extension carries the shell theme now.
-        retire_user_theme
       else
         message warn "No D-Bus session detected — your settings apply from the next login."
         [ -f "$DEFAULTS_PENDING" ] \
@@ -6137,37 +6474,17 @@ for category in $package_categories; do
         turn_off_dash_to_dock
       fi
 
-      # Forced-dark GTK settings.
-      for f in "$HOME/.config/gtk-3.0/settings.ini" "$HOME/.config/gtk-4.0/settings.ini"; do
-        grep -qs '^gtk-application-prefer-dark-theme=1$' "$f" || continue
-        sed -i '/^gtk-application-prefer-dark-theme=1$/d' "$f"
-        [ -z "$(grep -v '^\[Settings\]$' "$f" | tr -d '[:space:]')" ] && rm -f "$f"
-        STATUS_CHANGES+=("Removed legacy gtk-application-prefer-dark-theme=1 from $(basename "$(dirname "$f")")")
-        RELOGIN_NEEDED=1
-      done
-
-      # The user-local desktop-icons copy and the shell theme follower.
-      remove_legacy_ding \
-        && STATUS_CHANGES+=("Removed the desktop-icons copy an earlier version installed — Debian's is used")
-      remove_theme_followers \
-        && STATUS_CHANGES+=("Removed the shell theme follower of earlier versions — the theme extension follows light and dark")
-
-      restore_dock_favourites
-
-      # Debian packages an earlier version removed, reinstalled if nothing else goes.
-      if [ -f "$REMOVED_RECORD" ]; then
-        _restored_all=1
-        while read -r _rpkg; do
-          [ -n "$_rpkg" ] || continue
-          is_installed "$_rpkg" && continue
-          if installs_cleanly "$_rpkg" && sudo apt-get install -y "${APT_OPTS[@]}" "$_rpkg" < /dev/null; then
-            STATUS_CHANGES+=("Reinstalled ${_rpkg}, which an earlier version had removed")
-          else
-            _restored_all=0
-            STATUS_FAILED+=("${_rpkg}, removed by an earlier version, could not be reinstalled")
-          fi
-        done < "$REMOVED_RECORD"
-        [ $_restored_all -eq 1 ] && sudo rm -f "$REMOVED_RECORD"
+      # Forced-dark GTK settings: cleared with Ubuntu's defaults on a fresh
+      # install; a later one is the user's.
+      if [ "$_fresh_defaults" -eq 1 ]; then
+        for f in "$HOME/.config/gtk-3.0/settings.ini" "$HOME/.config/gtk-4.0/settings.ini"; do
+          grep -qs '^gtk-application-prefer-dark-theme=1$' "$f" || continue
+          sed -i --follow-symlinks '/^gtk-application-prefer-dark-theme=1$/d' "$f"
+          # A symlink (a dotfiles repository, say) stays even when empty.
+          [ -z "$(grep -v '^\[Settings\]$' "$f" | tr -d '[:space:]')" ] && { [ -L "$f" ] || rm -f "$f"; }
+          STATUS_CHANGES+=("Removed gtk-application-prefer-dark-theme=1 from $(basename "$(dirname "$f")") — Ubuntu's default is light")
+          RELOGIN_NEEDED=1
+        done
       fi
 
       message "applying Ubuntu's terminal colours"
@@ -6178,61 +6495,22 @@ for category in $package_categories; do
 
       message "theming the login screen"
       write_gdm_profile "$WP_LIGHT" "$WP_DARK"
-
-      # Ubuntu writes no user GTK files: undo what earlier versions wrote there,
-      # restoring the user's own gtk-3.0/gtk.css from the snapshot.
-      _gtk3_css="$HOME/.config/gtk-3.0/gtk.css"
-      if [ -f "$_gtk3_css" ] && grep -q "ubuntu-look\.sh" "$_gtk3_css" 2>/dev/null; then
-        if [ -f "${BACKUP_ORIGINAL}/gtk-3.0-gtk.css" ]; then
-          cp "${BACKUP_ORIGINAL}/gtk-3.0-gtk.css" "$_gtk3_css"
-          STATUS_CHANGES+=("Restored your own gtk-3.0/gtk.css; this script writes none")
-        else
-          rm -f "$_gtk3_css"
-          STATUS_CHANGES+=("Removed the gtk-3.0/gtk.css an earlier version wrote; Ubuntu writes none")
-        fi
-        RELOGIN_NEEDED=1
-      fi
-
-      _gtk4_css="$HOME/.config/gtk-4.0/gtk.css"
-      if [ -f "$_gtk4_css" ] && grep -q "E95420" "$_gtk4_css" 2>/dev/null \
-         && grep -q "accent_bg_color" "$_gtk4_css" 2>/dev/null; then
-        rm -f "$_gtk4_css"
-        STATUS_CHANGES+=("Removed the gtk-4.0/gtk.css accent override an earlier version wrote")
-        RELOGIN_NEEDED=1
-      fi
-
-      GTKRC2="$HOME/.gtkrc-2.0"
-      if [ -f "$GTKRC2" ] && grep -q "selected_bg_color:#E95420" "$GTKRC2" 2>/dev/null; then
-        sed -i '/selected_bg_color:#E95420/d' "$GTKRC2"
-        [ -s "$GTKRC2" ] || rm -f "$GTKRC2"
-        STATUS_CHANGES+=("Removed the ~/.gtkrc-2.0 accent line an earlier version wrote")
-        RELOGIN_NEEDED=1
-      else
-        STATUS_NOCHANGE+=("Your ~/.gtkrc-2.0 left alone, as on Ubuntu")
-      fi
-
-      # The GNOME Software launcher copy.
-      SOFTWARE_DESKTOP_USER="$HOME/.local/share/applications/org.gnome.Software.desktop"
-      if [ -f "$SOFTWARE_DESKTOP_USER" ] \
-         && grep -q '^Icon=app-center$' "$SOFTWARE_DESKTOP_USER" 2>/dev/null; then
-        rm -f "$SOFTWARE_DESKTOP_USER"
-        update-desktop-database "$HOME/.local/share/applications" 2>/dev/null
-        STATUS_CHANGES+=("Removed the GNOME Software launcher copy an earlier version wrote")
-        RELOGIN_NEEDED=1
-      fi
       ;;
   esac
 done
 
 # Only the stage that adds the per-user switch turns extensions on.
 case " $package_categories " in
-  *" 2-desktop-gnome "*) [ "$REFRESH" = 1 ] || install_extension_autostart ;;
+  *" 2-desktop-gnome "*) install_extension_autostart ;;
 esac
 
 # Every look package onto the pinned release.
 align_look_packages
-prune_installed_manifest
-prune_replaced_by_combined
+remove_unused_wallpaper_packs
+# Failed installs leave the manifest; replaced packages installed again leave
+# their record.
+prune_record "$INSTALLED_MANIFEST" is_present
+prune_record "$REPLACED_BY_COMBINED" not_installed
 if [ "$MODE" = offline ]; then
   cache_replaced_debs
   narrow_without_archive
@@ -6241,32 +6519,12 @@ fi
 # Report anything that no longer matches the running gnome-shell.
 check_shell_coupling_drift
 
-# A full run records its options for the refresh timer. A refresh with apt
-# errors records nothing, so the change is retried.
-if [ "$REFRESH" = 1 ]; then
-  if [ "$APT_ERRORS" -gt 0 ]; then
-    message warn "apt reported ${APT_ERRORS} error(s) — this change is retried in a week"
-    exit 1
-  fi
-  save_refresh_state
-elif [ -z "$arguments" ]; then
+# A full run records its options and what it was resolved against.
+if [ -z "$arguments" ]; then
   # Packages prepare-upgrade removed and this run could not restore stay recorded.
-  if [ -f "$REMOVED_FOR_UPGRADE" ]; then
-    _left=""
-    while read -r _p; do
-      [ -n "$_p" ] && ! is_installed "$_p" && _left="${_left}${_p}"$'\n'
-    done < "$REMOVED_FOR_UPGRADE"
-    if [ -n "$_left" ]; then
-      printf '%s' "$_left" | sudo tee "$REMOVED_FOR_UPGRADE" > /dev/null
-    else
-      sudo rm -f "$REMOVED_FOR_UPGRADE"
-    fi
-  fi
+  prune_record "$REMOVED_FOR_UPGRADE" not_restored
   save_options
-  if [ "$MODE" = online ]; then
-    install_refresh_timer
-    save_refresh_state
-  fi
+  [ "$MODE" = online ] && save_release_state
 fi
 
 message "${GREEN}All steps finished. See SUMMARY below.${ENDCOLOR}"
