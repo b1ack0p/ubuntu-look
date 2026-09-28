@@ -1,335 +1,342 @@
 # ubuntu-look
 
-Gives Debian GNOME the look of Ubuntu: Yaru themes, Ubuntu fonts and wallpapers,
-Ubuntu Dock, the tiling assistant, app indicators, desktop icons, Ubuntu's terminal
-colours, a Yaru login screen and Ubuntu's boot splash. No applications are installed.
+Makes Debian GNOME look and behave like the newest Ubuntu release that
+works with your GNOME Shell (the desktop itself), without breaking Debian.
+It brings Yaru themes, Ubuntu fonts and wallpapers, Ubuntu Dock, the tiling
+assistant, tray icons, desktop icons, Ubuntu's terminal colours, a Yaru
+login screen, Ubuntu's boot splash and Ubuntu's desktop settings. No
+applications are installed.
 
-The Ubuntu packages come from one release: the newest official Ubuntu release whose
-Yaru and Ubuntu Dock work with your GNOME Shell. For example, Debian 13 (GNOME 48) gets
-Ubuntu 25.04. The release is found each time the script runs.
+The script finds that release each time it runs. For example, Debian 13
+with GNOME 48 gets Ubuntu 25.04.
 
-> **Debian's advice.** Debian's [DontBreakDebian](https://wiki.debian.org/DontBreakDebian)
-> page advises against Ubuntu repositories on Debian. This script is a deliberate, limited
-> exception, with these safeguards:
->
-> - An apt pin blocks every Ubuntu package except the look's own (listed under
->   [Packages](#packages)). No library or core package comes from Ubuntu.
-> - apt simulates each Ubuntu package first. One that would remove another package, or
->   does not fit Debian's GNOME Shell, is not installed.
-> - apt changes happen only when you run the script. Nothing runs in the background.
-> - The uninstall purges everything the script installed and puts back Debian's builds.
->   Kept: `curl` and `ca-certificates`, which the script needs, packages you hold,
->   `ubuntu-keyring` while another apt source uses it, `dconf-cli` while your
->   settings still need resetting, and any package whose removal would also remove
->   another package.
->
-> What remains: the Ubuntu packages get no support from Debian's security team, and Ubuntu
-> may no longer support the chosen release either. `session-migration` contains a
-> compiled program; the script keeps it switched off.
+Where it differs from Ubuntu:
 
-| Light | Dark |
-| :---: | :---: |
-| ![Debian GNOME with the Ubuntu look, light](screenshot/scr1.png) | ![Debian GNOME with the Ubuntu look, dark](screenshot/scr3.png) |
-| ![Files and the terminal, light](screenshot/scr2.png) | ![Files and the terminal, dark](screenshot/scr4.png) |
+- Ubuntu's own builds of GNOME Shell and Settings do not install on
+  Debian. The Ubuntu Desktop page in Settings is therefore missing; the
+  dock has its own settings window (see
+  [Changing a setting](#changing-a-setting)). A few shades also differ,
+  as Ubuntu's patched libadwaita and GNOME Shell use Yaru's exact accent
+  shades. A small extension reproduces Ubuntu's dark style switch and
+  accent themes.
+- Left out on purpose: the Ubuntu logo on the login screen, Ubuntu's
+  session name, and Canonical's web search and key server defaults.
+- The boot menu is not hidden. Ubuntu hides it; on Debian that could
+  leave a failed boot without a menu.
+
+![Debian GNOME with the Ubuntu look, light style](screenshot/scr1.png)
+![Debian GNOME with the Ubuntu look, dark style](screenshot/scr3.png)
+![Files and the terminal, light style](screenshot/scr2.png)
+![Files and the terminal, dark style](screenshot/scr4.png)
+
+## Quick start
+
+1. Download `ubuntu-look.sh` (or clone this repository).
+2. Open a terminal in its folder, inside your desktop session, and run:
+
+   ```bash
+   bash ubuntu-look.sh
+   ```
+
+3. Read what it will do, type `y` and press Enter, then enter your
+   password when asked. The script asks at the terminal, so answers piped
+   into it (`yes | bash ubuntu-look.sh`) are not used; without a terminal
+   every question counts as no.
+4. At the end, reboot (or log out and back in, if the script says that
+   is enough).
+
+Running it again is safe. To undo it, see [Uninstall](#uninstall).
 
 ## Requirements
 
-- Debian with GNOME, on an architecture Ubuntu builds for (amd64, arm64, …)
-- a user with sudo rights (not root)
-- internet access, except for an offline install
-- GNOME Shell 45 or later for the shell theme and the login screen extension
+- Debian with GNOME, on a processor type Ubuntu supports (amd64, arm64
+  and others).
+- A normal user account with sudo rights (administrator rights). Do not
+  run it as root.
+- Internet access, except for an [offline install](#offline-install).
+- GNOME Shell 45 or later for the Yaru shell theme, style switching and
+  the Yaru login screen; 47 or later for the accent colour.
 
 ## Usage
 
 ```bash
-bash ubuntu-look.sh                    # install or update
-bash ubuntu-look.sh --refresh          # list updates, then ask
-bash ubuntu-look.sh --uninstall        # undo everything
-bash ubuntu-look.sh --prepare-upgrade  # before a Debian upgrade
-bash ubuntu-look.sh --download         # build packages/
-bash ubuntu-look.sh --offline          # install from packages/
-bash ubuntu-look.sh 2-desktop-gnome    # only the named stages
-bash ubuntu-look.sh --help             # all commands and options
+bash ubuntu-look.sh                   # install or update
+bash ubuntu-look.sh --refresh         # list updates, then ask
+bash ubuntu-look.sh --uninstall       # undo the look
+bash ubuntu-look.sh --prepare-upgrade # before a Debian upgrade
+bash ubuntu-look.sh --download        # fill packages/ (offline)
+bash ubuntu-look.sh --offline         # install from packages/
+bash ubuntu-look.sh --help            # commands and options
 ```
 
-Run it from your desktop session. Confirm with `y` and enter your sudo password. At the
-end, the script says whether to reboot or to log out and back in; a reboot covers both.
-Running it again is safe.
-
-The look applies to the user who runs the script. Other users keep Debian's look until
-they run it themselves. The login screen and boot splash are shared by all users.
+Run the script from your desktop session. The look applies to the user who
+runs it; other users keep Debian's look until they run it themselves. The
+login screen and the boot splash are shared by all users.
 
 ## Options
 
-Options are environment variables. Put them in front of the command:
+Options are settings placed in front of the command, for example:
 
 ```bash
 UBUNTU_BOOT_SPLASH=0 bash ubuntu-look.sh
 ```
 
-Several at once:
+Several can be given at once, separated by spaces.
+
+### Remembered options
+
+The script remembers these five and uses them again on later runs until
+you give a new value. An offline install remembers only the two boot
+splash options.
+
+- **`UBUNTU_CODENAME`**: use a specific Ubuntu release, named by its code
+  name. Default: `auto`, the newest release that fits your GNOME Shell.
+
+  ```bash
+  UBUNTU_CODENAME=noble bash ubuntu-look.sh
+  UBUNTU_CODENAME=auto bash ubuntu-look.sh   # back to automatic
+  ```
+
+  A release made for another GNOME Shell may leave out the dock or the
+  shell theme; the summary says which. `devel` is not accepted; use
+  `UBUNTU_INCLUDE_DEVEL=1` instead.
+
+- **`UBUNTU_INCLUDE_DEVEL`**: `1` also considers the Ubuntu release still
+  in development; `0` does not. Default: `0`, released versions only.
+
+  ```bash
+  UBUNTU_INCLUDE_DEVEL=1 bash ubuntu-look.sh
+  ```
+
+- **`UBUNTU_MIRROR`**: download the Ubuntu packages from another server,
+  given as one `http://` or `https://` address. Default:
+  `http://archive.ubuntu.com/ubuntu` on amd64 and i386,
+  `http://ports.ubuntu.com/ubuntu-ports` on other processor types.
+
+  ```bash
+  UBUNTU_MIRROR=http://de.archive.ubuntu.com/ubuntu \
+    bash ubuntu-look.sh
+  ```
+
+- **`UBUNTU_BOOT_SPLASH`**: `1` adds the boot splash (the logo shown
+  while the computer starts); `0` leaves it out and removes one added
+  earlier. Default: `1`.
+
+  ```bash
+  UBUNTU_BOOT_SPLASH=0 bash ubuntu-look.sh
+  ```
+
+- **`PLYMOUTH_THEME`**: the boot splash theme. Default: `bgrt`, Ubuntu's
+  splash with the computer maker's logo. To list the installed themes:
+  `/usr/sbin/plymouth-set-default-theme -l`.
+
+  ```bash
+  PLYMOUTH_THEME=spinner bash ubuntu-look.sh
+  ```
+
+### One-run options
+
+These apply only to the run they are given to.
+
+- **`UBUNTU_LOOK_ANIMATIONS`**: `0` turns animation effects off, `1` turns
+  them on. Default: not set; animations stay as they are. See
+  [Animations](#animations).
+
+- **`UBUNTU_LOOK_SYSTEM_UPGRADE`**: `1` also upgrades the rest of the
+  system, as `apt upgrade` does. Default: off; only the look's packages
+  are upgraded.
+
+  ```bash
+  UBUNTU_LOOK_SYSTEM_UPGRADE=1 bash ubuntu-look.sh
+  ```
+
+- **`UBUNTU_LOOK_FORCE_BUNDLE`**: `1` lets `--offline` accept packages
+  downloaded on a different Debian release or GNOME Shell version.
+  Default: off; such packages are refused.
+
+  ```bash
+  UBUNTU_LOOK_FORCE_BUNDLE=1 bash ubuntu-look.sh --offline
+  ```
+
+- **`UBUNTU_LOOK_LOG`**: `0` writes no log file. Default: a log in your
+  home folder.
+
+  ```bash
+  UBUNTU_LOOK_LOG=0 bash ubuntu-look.sh
+  ```
+
+## Animations
+
+Animation effects are on by default in both Ubuntu and Debian, and the
+look does not change that. They cover:
+
+- opening, closing, minimising and maximising windows;
+- switching workspaces;
+- the Activities overview and the app grid;
+- Ubuntu Dock showing, hiding and its icon effects;
+- the tiling assistant's tile and untile movement;
+- transitions inside GTK apps.
+
+One setting turns all of them off or on. It is the same switch as
+Settings → Accessibility → Seeing → Reduce Animation.
 
 ```bash
-UBUNTU_CODENAME=noble UBUNTU_BOOT_SPLASH=0 \
-  bash ubuntu-look.sh
+UBUNTU_LOOK_ANIMATIONS=0 bash ubuntu-look.sh   # off
+UBUNTU_LOOK_ANIMATIONS=1 bash ubuntu-look.sh   # on
 ```
 
-**Saved options.** These five are remembered by each full run (one without stage
-names) and reused by later runs, until you give them again. `--offline` saves
-only the two boot splash options.
+The option also works with the uninstall:
 
-- `UBUNTU_CODENAME=<name>`
-  - Use this Ubuntu release, for example `noble`.
-  - Default: `auto`, the newest release that fits your GNOME Shell.
-  - Back to automatic: `UBUNTU_CODENAME=auto`.
-- `UBUNTU_INCLUDE_DEVEL=1`
-  - Also consider the Ubuntu release still in development.
-  - Default: `0`, released versions only.
-- `UBUNTU_MIRROR=<url>`
-  - Get the Ubuntu packages from this mirror.
-  - Default: `http://archive.ubuntu.com/ubuntu`, or
-    `http://ports.ubuntu.com/ubuntu-ports` on architectures other than amd64
-    and i386.
-- `UBUNTU_BOOT_SPLASH=0`
-  - Leave the boot splash out, and remove one added earlier.
-  - Default: `1`, boot splash on.
-- `PLYMOUTH_THEME=<name>`
-  - Boot splash theme. `/usr/sbin/plymouth-set-default-theme -l` lists the
-    installed ones.
-  - Default: `bgrt`, the Ubuntu-style splash with the computer maker's logo.
+```bash
+UBUNTU_LOOK_ANIMATIONS=0 bash ubuntu-look.sh --uninstall
+```
 
-**One-run options.** These apply only to the run they are given to.
+It applies to your user only. Without the option nothing is changed:
+later runs and the uninstall keep your choice.
 
-- `UBUNTU_LOOK_SYSTEM_UPGRADE=1`
-  - Also upgrade the rest of the system, as `apt upgrade` does.
-  - Default: off; the script upgrades only the look's packages.
-- `UBUNTU_LOOK_FORCE_BUNDLE=1`
-  - `--offline` only: accept a bundle built for another Debian release or GNOME
-    Shell version.
-  - Default: off; such a bundle is refused.
-- `UBUNTU_LOOK_LOG=0`
-  - Write no log file.
-  - Default: a log in your home directory.
-
-## What it changes
+## What changes
 
 ### Packages
 
-From the chosen Ubuntu release (the only packages the pin allows):
+From the chosen Ubuntu release:
 
-- **Yaru:** `yaru-theme-gtk`, `yaru-theme-icon`, `yaru-theme-sound` and
-  `yaru-theme-gnome-shell`, for apps, icons, sounds and the shell.
+- **Yaru themes** for apps, icons, sounds and the desktop shell
+  (`yaru-theme-gtk`, `yaru-theme-icon`, `yaru-theme-sound`,
+  `yaru-theme-gnome-shell`), with `humanity-icon-theme`, which Yaru
+  builds on.
 - **Fonts:** `fonts-ubuntu`.
-- **Wallpapers:** `ubuntu-wallpapers` and the release's own set,
-  `ubuntu-wallpapers-<release>`.
+- **Wallpapers:** `ubuntu-wallpapers` and the release's own set.
 - **Ubuntu Dock:** `gnome-shell-extension-ubuntu-dock`.
 - **Window tiling:** `gnome-shell-extension-ubuntu-tiling-assistant`.
-- **Fallback icons:** `humanity-icon-theme`, which Yaru builds on.
-- **session-migration:** needed by Yaru; kept switched off by a user-unit mask,
-  `/etc/systemd/user/session-migration.service`.
+- **`session-migration`:** required by Yaru.
+- **LibreOffice style:** `libreoffice-style-yaru`, only when LibreOffice
+  is installed.
 
-From Debian (Debian's own builds, not Ubuntu's):
+From Debian:
 
-- **Tray icons in the top bar:** `gnome-shell-extension-appindicator`, with
-  `gir1.2-dbusmenu-gtk3-0.4` for their menus.
-- **Files and folders on the desktop:** `gnome-shell-extension-desktop-icons-ng`.
+- **Tray icons in the top bar:** `gnome-shell-extension-appindicator`,
+  with `gir1.2-dbusmenu-gtk3-0.4` for their menus.
+- **Files and folders on the desktop:**
+  `gnome-shell-extension-desktop-icons-ng`.
+- **Login sound:** `gnome-session-canberra`, which plays Yaru's login
+  sound, as on Ubuntu.
 - **Boot splash:** `plymouth` and `plymouth-themes`.
 - **Settings tool:** `dconf-cli`.
-- **Ubuntu's archive keys:** `ubuntu-keyring`, used by apt to verify the Ubuntu packages.
+- **Ubuntu's signing keys:** `ubuntu-keyring`, which apt uses to check
+  the Ubuntu packages.
+- **Download tools:** `curl` and `ca-certificates`, if missing. The
+  uninstall keeps them.
 
-Some Ubuntu releases ship their shell extensions as one package,
-`gnome-shell-ubuntu-extensions`, which contains Ubuntu Dock, the tiling assistant, app
-indicators and desktop icons together. When the chosen release has that package, the
-script installs it instead of the separate extension packages. If Debian's
-`gnome-shell-extension-desktop-icons-ng` or `gnome-shell-extension-appindicator` was
-installed, it is replaced, and the uninstall puts it back.
+Some Ubuntu releases ship Ubuntu Dock, the tiling assistant, tray icons and
+desktop icons as one package, `gnome-shell-ubuntu-extensions`. When the
+chosen release has it, the script installs it instead of the four
+separate packages. When the package carries Ubuntu's web search provider
+extension, that is switched on too, as on Ubuntu. The uninstall puts back
+the Debian packages it replaced.
 
-Debian's own builds of Yaru, the Ubuntu fonts and wallpapers, if installed, are
-replaced by Ubuntu's and put back on uninstall.
+### Desktop
 
-### System
+- **Settings:** Ubuntu's desktop settings, listed below. The first
+  install replaces your theme, style, wallpaper, fonts, dock and similar
+  settings with Ubuntu's; your dock favourites stay. Settings you change
+  afterwards are kept by later runs.
+- **Dock:** if Dash-to-Dock is on, it is turned off for you; Ubuntu Dock
+  takes its place.
+- **Terminal:** a gnome-terminal profile named Ubuntu, with Yaru's
+  #300A24 background and GNOME's standard colours, as on Ubuntu. It
+  becomes the default when it is new or no default is set.
+- **Ctrl+Alt+T:** opens the terminal, as on Ubuntu. It is added to your
+  own keyboard shortcuts unless one of your custom shortcuts already
+  uses it; if you remove it, it stays removed.
+- **Font smoothing:** subpixel in all apps, as Ubuntu's font settings
+  do, through a small rule in your own font settings.
+- **Show Applications button:** shows the Debian logo in Ubuntu Dock.
+- **Shell icons:** the top bar and menus use Yaru's own symbolic icons,
+  as on Ubuntu.
+- **Accent colour:** as on Ubuntu, choosing an accent colour in Settings
+  switches the theme and icons to the matching Yaru colour.
+- **Login screen:** Yaru theme and sounds, Ubuntu fonts and wallpaper.
+- **Donation reminder:** off with GNOME 49 and later, as on Ubuntu.
+- **Boot (with GRUB only):** `quiet splash` is added to the start-up
+  options in `/etc/default/grub` where missing, and the boot splash theme
+  is set. Other GRUB settings are not touched. Where a file in
+  `/etc/default/grub.d/` sets the start-up options, `/etc/default/grub` is
+  left alone and the summary says so. Without GRUB the boot is left alone.
 
-- **apt:** an Ubuntu source (`/etc/apt/sources.list.d/ubuntu-themes.sources`) and a pin
-  (`/etc/apt/preferences.d/ubuntu-themes`) that allows only the Ubuntu packages above.
-- **Login screen:** Yaru on the GDM login screen (`/etc/dconf/db/gdm.d/10-ubuntu-look`
-  and a login screen extension). The dconf profiles `/etc/dconf/profile/gdm` and
-  `/etc/dconf/profile/Debian-gdm` are created where missing.
-- **Ubuntu's defaults:** `/etc/dconf/db/ubuntu_look.d/`, read through the dconf profile
-  `/etc/dconf/profile/ubuntu-look`, and a shell theme extension in
-  `/usr/local/share/gnome-shell/extensions/`.
-- **Boot:** `quiet splash`, whichever is missing, added to the kernel command line in
-  `/etc/default/grub`, and the
-  Plymouth boot splash theme set (default `bgrt`). The rest of your GRUB settings are
-  not touched.
+### Ubuntu's settings compared with Debian's
 
-### Your session
+Each line gives Ubuntu's value (the look), then Debian's.
 
-- **Settings:** Ubuntu's GNOME defaults, as Ubuntu's `ubuntu-settings` sets them,
-  apply to users who installed the look. The first install replaces your theme, light or
-  dark style, wallpaper, fonts, dock and other look settings with Ubuntu's; your dock
-  favourites stay. Settings you change afterwards are kept by later runs. The main
-  Ubuntu defaults:
-  - Theme, icons, cursor and sounds: Yaru, light style, orange accent.
-  - Fonts: Ubuntu Sans 11, Ubuntu Sans Mono 13.
-  - Window buttons: minimize, maximize and close, on the right.
-  - Dock: on the left, full height, always shown, icons up to 48 pixels.
-  - Desktop icons: from the bottom right, without trash or drives.
-  - Hot corner: off. Touchpad: tap to click.
-  - Keyboard: Alt+Tab switches windows, Super+Tab switches applications.
-  - Power button: asks what to do. No automatic sleep on mains power.
-- **Dock:** Dash-to-Dock, if enabled, is turned off for you; Ubuntu Dock replaces it.
-- **Terminal:** a gnome-terminal profile named Ubuntu, made the default when the look
-  creates it or you have none, and the dark terminal theme variant.
-- **Show Applications button:** the Debian logo, in the Ubuntu Dock only
-  (`~/.local/share/icons/Yaru/`).
-- **Extensions at the next login:** a one-shot autostart entry,
-  `~/.config/autostart/ubuntu-look-enable-extensions.desktop`, and its script in
-  `~/.local/share/ubuntu-look/`, which switch the look's extensions on and then
-  remove themselves. If an extension cannot be switched on, they stay for one more
-  login.
-- **Records:** `/var/lib/ubuntu-look/`, `~/.ubuntu-look-backup/` and
-  `~/.config/environment.d/90-ubuntu-look.conf`, which switches the look on for you.
+Keyboard and windows:
 
-## Staying up to date
+- Alt+Tab: switches windows; Debian: switches apps.
+- Super+Tab: switches apps; Debian: the same.
+- Super+D (also Ctrl+Super+D, Ctrl+Alt+D): shows the desktop; Debian:
+  nothing.
+- Ctrl+Alt+T: opens the terminal; Debian: nothing.
+- Window buttons: minimise, maximise, close on the right; Debian: close
+  only.
+- Middle-click on a title bar: lowers the window; Debian: nothing.
+- Hot corner (top left): off; Debian: on.
 
-- Updates within the chosen Ubuntu release arrive with your own `apt upgrade`.
-- `bash ubuntu-look.sh --refresh` checks for updates to the look and lists them:
-  - a newer Ubuntu release, or a Debian or GNOME Shell change, that moves the
-    look to another release;
-  - newer builds of the look's packages;
-  - a look package that no longer supports your GNOME Shell;
-  - an option given now that differs from the last full run's.
+Power:
 
-  If it finds any, it asks before applying them, then ends with a reboot or log
-  out notice when one is needed. If there are none, it says the look is up to
-  date and changes nothing. It refreshes apt's package lists first.
-- `bash ubuntu-look.sh` applies the same updates without listing them first.
+- Power button: asks what to do; Debian: suspend.
+- Sleep on mains power: never; Debian: after 15 minutes idle.
+- Log Out in the system menu: always shown; Debian: with several users.
 
-## Upgrading Debian
+Touchpad and sound:
 
-1. `bash ubuntu-look.sh --prepare-upgrade` first lists what it will remove, then asks:
-   - the packages tied to the current GNOME Shell: Ubuntu Dock, the tiling
-     assistant and Yaru's shell theme (with Ubuntu's combined extensions package,
-     also the app indicators and desktop icons it contains), plus anything apt
-     would remove with them;
-   - the Ubuntu apt source and pin.
+- Tap to click: on; Debian: on (off in older GNOME versions).
+- Right click: by area or two fingers, as the touchpad supports; Debian:
+  two fingers.
+- Sound theme: Yaru; Debian: freedesktop.
+- Sounds on input: on; Debian: off.
 
-   Yaru's app, icon and sound themes, the fonts, the wallpapers and `ubuntu-keyring`
-   stay, so the desktop keeps most of its look during the upgrade.
-2. Upgrade Debian and reboot.
-3. `bash ubuntu-look.sh` installs the look for the new GNOME Shell.
+Appearance:
 
-## Offline install
+- Style: light; Debian: light.
+- Accent colour: orange; Debian: blue.
+- Theme, icons and cursor: Yaru; Debian: Adwaita.
+- Interface font: Ubuntu Sans 11; Debian: Cantarell 11.
+- Document font: Sans 11; Debian: Cantarell 11.
+- Monospace font: Ubuntu Sans Mono 13, or 11 with GNOME 49 and later
+  (as on Ubuntu 25.10 and later); Debian: Monospace 11.
+- Window title font: Ubuntu Sans Bold 11; Debian: the interface font.
+- Font smoothing: subpixel for all apps; Debian: greyscale.
+- Terminal style: dark; Debian: follows the desktop style.
+- Dock: Ubuntu Dock on the left, full height, always shown; Debian: none
+  (the dash in the Activities overview).
+- Desktop icons: shown, from the bottom right, without trash or drives;
+  Debian: none.
 
-1. On an online machine with the same Debian release, architecture and GNOME Shell
-   version, run `bash ubuntu-look.sh --download`. This fills `packages/` and leaves that
-   machine's apt setup as it was. On a machine without the look it keeps no records,
-   and removes `ubuntu-keyring` again if it had to install it.
-2. Copy `ubuntu-look.sh` and `packages/` to the offline machine.
-3. There, run `bash ubuntu-look.sh --offline`.
+Files and file dialogs:
 
-An offline install adds no Ubuntu apt source; a later online run adds it.
+- Icon size in Files: small; Debian: medium.
+- Open a folder when dragging over it: off; Debian: on.
+- Folders first in GTK 3 file dialogs: on; Debian: off.
+- GTK 3 file dialogs start in: the current folder; Debian: recent files.
 
-## Uninstall
+Apps (used once you install them):
 
-```bash
-bash ubuntu-look.sh --uninstall
-```
-
-Run it from your desktop session. It lists the packages before removing them and asks
-for confirmation. At the end, it says whether to reboot or to log out and back in.
-
-For you:
-
-- Every setting the look writes returns to Debian's default, including any you changed
-  while it was installed: appearance, wallpaper, fonts, dock, power, keybindings and
-  touchpad. The wallpaper is Debian's in both light and dark style, and a Yaru colour
-  scheme in gedit returns to gedit's default.
-- Dash-to-Dock is turned back on, with its default settings, if the install turned it off.
-- The Ubuntu terminal profile and the look's helper files (the Show Applications icon,
-  the one-shot autostart) are removed; your own terminal profiles and default stay.
-- Your dock favourites and your other settings stay.
-
-When the last user of the look uninstalls:
-
-- The packages the script installed are purged, and their downloaded files are removed
-  from apt's cache.
-- Dependencies that only those packages used are purged too, after a second
-  confirmation, so no `apt autoremove` is needed afterwards.
-- Debian's builds of replaced packages are put back.
-- Packages you had before or installed later, and apt sources you added, are never
-  removed.
-- The Ubuntu source and the pin are removed.
-- The login screen returns to Debian's. The words the script added (`quiet`, `splash`)
-  leave the kernel command line, and the
-  boot splash theme returns to the one used before the install.
-
-If a step cannot finish, run `--uninstall` again later to complete it.
-
-## Settings: Ubuntu's defaults and Debian's
-
-The look applies Ubuntu's defaults, for how the desktop looks and how it
-behaves. The tables compare them with Debian's. Your own value always overrides
-the look's, later runs keep it, and the uninstall returns every one of these to
-Debian's default.
-
-### Keyboard and windows
-
-| Setting | Ubuntu (the look) | Debian |
-|---|---|---|
-| Alt+Tab | switches windows | switches apps |
-| Super+Tab | switches apps | switches apps |
-| Super+D | shows the desktop | nothing |
-| Window buttons | minimize, maximize, close (right) | close only |
-| Middle-click on title bar | lowers the window | nothing |
-| Hot corner (top left) | off | on |
-
-### Power
-
-| Setting | Ubuntu (the look) | Debian |
-|---|---|---|
-| Power button | asks (Power Off dialog) | suspend |
-| Sleep on mains power | never | after 15 min idle |
-| Log Out in the menu | always shown | with several users |
-
-### Touchpad and sound
-
-| Setting | Ubuntu (the look) | Debian |
-|---|---|---|
-| Tap to click | on | on (off in older GNOME) |
-| Right click | area or two fingers (as the touchpad) | two fingers |
-| Sound theme | Yaru | freedesktop |
-| Input feedback sounds | on | off |
-
-### Appearance
-
-| Setting | Ubuntu (the look) | Debian |
-|---|---|---|
-| Style | light | light |
-| Accent colour | orange | blue |
-| Theme, icons, cursor | Yaru | Adwaita |
-| Interface font | Ubuntu Sans 11 | Cantarell 11 |
-| Monospace font | Ubuntu Sans Mono 13 | Monospace 11 |
-| Dock | Ubuntu Dock, left | none (Dash in overview) |
-| Desktop icons | shown, from bottom right | none |
-
-As on Ubuntu, a new accent colour applies to the whole desktop: the
-theme and icons move to the matching Yaru colour, for example
-Yaru-purple or Yaru-purple-dark. Orange returns plain Yaru.
-
-### Files and file dialogs
-
-| Setting | Ubuntu (the look) | Debian |
-|---|---|---|
-| Icon size in Files | small | medium |
-| Open folder on drag hover | off | on |
-| Folders first in dialogs (GTK 3) | on | off |
-| Dialogs start in | current folder | recent files |
+- Image Viewer (eog): sidebar hidden; Debian: shown.
+- Rhythmbox: watches the music library, uses the alternative toolbar
+  (`rhythmbox-plugin-alternative-toolbar`); Debian: neither.
+- Onboard keyboard: Nightshade theme, docked, kept on top, Ubuntu Sans
+  labels; Debian: Classic Onboard theme, floating.
+- Software: no forced metadata refresh on its first start; Debian:
+  forced.
 
 ### Changing a setting
 
-Set your own value with `gsettings set`. To go back to Ubuntu's value, use
-`gsettings reset` with the same schema and key.
+Most settings are in GNOME Settings. The others can be changed in a
+terminal with `gsettings set`. To return to Ubuntu's value, use
+`gsettings reset` with the same two names:
+
+```bash
+gsettings reset org.gnome.settings-daemon.plugins.power \
+  power-button-action
+```
 
 Keyboard and windows:
 
@@ -347,7 +354,7 @@ gsettings set org.gnome.desktop.wm.keybindings \
 # window buttons on the left
 gsettings set org.gnome.desktop.wm.preferences \
   button-layout 'close,minimize,maximize:'
-# middle-click on title bar, e.g. none, lower, minimize
+# middle-click on a title bar, e.g. none, lower, minimize
 gsettings set org.gnome.desktop.wm.preferences \
   action-middle-click-titlebar none
 # hot corner on
@@ -389,7 +396,7 @@ gsettings set org.gnome.desktop.interface \
   accent-color purple
 ```
 
-Dock (Ubuntu Dock):
+Ubuntu Dock:
 
 ```bash
 # position: LEFT (Ubuntu), RIGHT, BOTTOM or TOP
@@ -408,35 +415,184 @@ gsettings set org.gnome.shell.extensions.dash-to-dock \
 gnome-extensions prefs ubuntu-dock@ubuntu.com
 ```
 
-Back to Ubuntu's value, for example the power button:
+## Staying up to date
+
+- Updates within the chosen Ubuntu release arrive with your usual
+  `apt upgrade`.
+- `bash ubuntu-look.sh --refresh` checks for updates to the look and
+  lists them before changing anything:
+  - a newer Ubuntu release, or a Debian or GNOME Shell change, that may
+    move the look to another release (checked when you apply);
+  - newer builds of the look's packages, and any that are missing;
+  - look packages that no longer support your GNOME Shell;
+  - an option given now that differs from the remembered one.
+
+  If there are updates, it asks before applying them. If there are none,
+  it says so and changes nothing except apt's package lists.
+  `--refresh` works only after the look is installed for your user.
+- `bash ubuntu-look.sh` applies the same updates without listing them
+  first.
+
+## Upgrading Debian
+
+1. Run `bash ubuntu-look.sh --prepare-upgrade`. It lists what it will
+   remove and asks first:
+   - the Ubuntu packages tied to the current GNOME Shell: Ubuntu Dock,
+     the tiling assistant and Yaru's shell theme (with the combined
+     package, also the tray and desktop icons), and anything apt would
+     remove with them;
+   - the Ubuntu package source and its rules.
+
+   Yaru's app, icon and sound themes, the fonts, the wallpapers and
+   `ubuntu-keyring` stay, so the desktop keeps most of its look.
+   Packages you hold (`apt-mark hold`) stay too; the list names them
+   as blocking the upgrade.
+2. Upgrade Debian as usual and reboot.
+3. Run the command the script names at the end of step 1: usually
+   `bash ubuntu-look.sh`, or `UBUNTU_CODENAME=auto bash ubuntu-look.sh`
+   when a release was fixed with `UBUNTU_CODENAME`.
+
+## Uninstall
 
 ```bash
-gsettings reset org.gnome.settings-daemon.plugins.power \
-  power-button-action
+bash ubuntu-look.sh --uninstall
 ```
 
-## How the script is organised
+It lists the packages before removing them and asks first. At the end,
+it says whether to reboot or to log out and back in. If a step cannot
+finish, run `--uninstall` again later.
 
-`ubuntu-look.sh` is one file in nine numbered sections, listed at its top:
+For your user:
 
-| Section | Contents |
-|---|---|
-| 1. Helpers | messages, records, options, dconf values |
-| 2. Packages | apt, the Ubuntu release, sources and pin |
-| 3. Desktop | Ubuntu's settings, extensions, terminal, login screen |
-| 4. Boot | GRUB command line and boot splash |
-| 5. Records | `--refresh`, summary |
-| 6. Offline | `--download`, `--offline`, `--prepare-upgrade` |
-| 7. Setup | help, run log, mode, options, variables |
-| 8. Uninstall | `--uninstall` |
-| 9. Install | the install itself |
+- The look's extensions are switched off; those you had on before the
+  install stay on.
+- Every setting the look writes returns to Debian's default, including
+  any you changed meanwhile: appearance, wallpaper, fonts, dock, power,
+  keyboard shortcuts and touchpad. A Yaru
+  colour scheme in gedit returns to gedit's default.
+- Dash-to-Dock is turned back on, with its default settings, if the
+  install turned it off.
+- The Ubuntu terminal profile and the look's helper files are removed,
+  as are the Ctrl+Alt+T shortcut and the font smoothing rule the look
+  added. Your own terminal profiles, your dock favourites and your other
+  settings stay.
 
-## Logs
+When the last user of the look uninstalls:
 
-Each run writes a log to your home directory: `~/ubuntu-look-<date>.log`, or
-`~/uninstall-<date>.log` for `--uninstall`.
+- The packages the script installed are removed, with their downloaded
+  files.
+- Dependencies that only those packages used are removed too, after a
+  second confirmation, so no `apt autoremove` is needed.
+- Debian's builds of replaced packages are put back.
+- The Ubuntu package source and its rules are removed.
+- The login helper for the look's extensions is removed.
+- The login screen returns to Debian's. `quiet` and `splash`, where the
+  script added them, are removed from the start-up options, and the boot
+  splash theme returns to the one used before.
 
-## Credits
+Never removed: packages you had before or installed later, package
+sources you added, packages you hold (`apt-mark hold`), `curl` and
+`ca-certificates`, and any package whose removal would also remove
+another one. `ubuntu-keyring` stays while another package source uses it.
+
+## Offline install
+
+1. On a computer with internet access and the same Debian release,
+   processor type and GNOME Shell version, run:
+
+   ```bash
+   bash ubuntu-look.sh --download
+   ```
+
+   This fills the `packages/` folder next to the script. That computer's
+   Ubuntu package source and pin are put back afterwards; only `curl` and
+   `ca-certificates` are installed there, if missing. On a computer
+   without the look, `ubuntu-keyring` is installed for the download only
+   and removed again.
+2. Copy `ubuntu-look.sh` and `packages/` to the offline computer.
+3. There, run:
+
+   ```bash
+   bash ubuntu-look.sh --offline
+   ```
+
+An offline install adds no Ubuntu package source; a later online run adds
+it.
+
+## Troubleshooting
+
+- **Log files.** Each run writes a log to your home folder:
+  `ubuntu-look-<date>-<time>.log` (for example
+  `ubuntu-look-20260928-151900.log`), or `uninstall-<date>-<time>.log`
+  for `--uninstall`.
+- **"No D-Bus session detected".** The script found no session bus for
+  your user, as on a system without systemd's user session. The look
+  applies from your next login; run it again from the desktop for
+  Ubuntu's defaults and the terminal profile. An uninstall run there
+  resets your settings only when run again from the desktop. Over SSH or
+  on a text console the script normally finds your user's session bus
+  and applies everything as it would from the desktop.
+- **apt is in use.** Another program is installing software. Wait for it
+  to finish, then run the script again.
+- **`apt update` says the Ubuntu release "no longer has a Release file".**
+  The release the look uses reached its end of life and moved to Ubuntu's
+  old-releases archive. Run `bash ubuntu-look.sh --refresh` (or the script
+  itself): it points the source at old-releases or moves to a newer release.
+  Nothing checks this in the background.
+- **A package is skipped.** It does not fit this system, or it would
+  remove another package. The summary names it and the reason; the rest
+  of the look is installed.
+- **Ubuntu Dock does not appear.** Log out and back in, or reboot. New
+  extensions start only at the next login.
+- **The dock and the Ubuntu theme are gone after a crash.** GNOME turns
+  all extensions off after the shell crashes; on Ubuntu its own extensions
+  are exempt, here they are not. Turn them back on in the Extensions app,
+  or run `gsettings set org.gnome.shell disable-user-extensions false`.
+- **Something looks half done.** Run the same command again; every step
+  is safe to repeat.
+
+## How it works
+
+- **Package source and pin.** The script adds an Ubuntu package source,
+  `/etc/apt/sources.list.d/ubuntu-themes.sources`, and a pin (a rule for
+  apt), `/etc/apt/preferences.d/ubuntu-themes`. The pin blocks every Ubuntu
+  package except the look's own, all from one release. No library or core
+  package comes from Ubuntu.
+- **Checked installs.** apt simulates each install first. A package that
+  would remove another one, or does not fit your GNOME Shell, is not
+  installed. The one exception: the combined package replaces the
+  separate extension packages. apt changes happen only when you run
+  the script; nothing runs in the background.
+- **Settings.** Ubuntu's defaults are stored in a system settings
+  database, `/etc/dconf/db/ubuntu_look.d/`. Only users of the look read it,
+  through `~/.config/environment.d/90-ubuntu-look.conf`. A small shell
+  theme extension in `/usr/local/share/gnome-shell/extensions/` follows the
+  light or dark style and the accent colour, as on Ubuntu.
+- **Login screen.** Yaru settings in `/etc/dconf/db/gdm.d/10-ubuntu-look`
+  and a login screen extension.
+- **Extensions.** New extensions are switched on at the next login by a
+  one-time autostart entry,
+  `~/.config/autostart/ubuntu-look-enable-extensions.desktop`, which
+  removes itself. For every user of the look, a login helper,
+  `/etc/xdg/autostart/ubuntu-look-extensions.desktop`, switches on once
+  an extension a newer release adds, as Ubuntu's defaults do; one you
+  turned off stays off.
+- **Records.** What the script changed is kept in `/var/lib/ubuntu-look/`
+  and `~/.ubuntu-look-backup/`, so the uninstall can undo it.
+- **The script.** `ubuntu-look.sh` is one file in nine numbered sections,
+  listed at its top: helpers, packages, desktop, boot, records, offline,
+  setup, uninstall and install.
+
+Debian's [DontBreakDebian](https://wiki.debian.org/DontBreakDebian) page
+advises against Ubuntu package sources on Debian. This script is a
+deliberate, limited exception with the safeguards above. The Ubuntu
+packages get no support from Debian's security team, and Ubuntu may no
+longer support the chosen release. `session-migration` contains a
+compiled program; the script keeps it switched off.
+
+## Credits and licence
 
 Based on **make-debian-look-like-ubuntu** by DeltaLima
 (https://github.com/DeltaLima/make-debian-look-like-ubuntu).
+
+MIT licence; see [LICENSE](LICENSE).
