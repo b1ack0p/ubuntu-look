@@ -115,6 +115,8 @@ you give a new value.
 
 - **`UBUNTU_INCLUDE_DEVEL`**: `1` also considers the Ubuntu release still
   in development; `0` does not. Default: `0`, released versions only.
+  The release in development is the one the archive's `devel` link names,
+  checked against Ubuntu's own list of releases.
 
   ```bash
   UBUNTU_INCLUDE_DEVEL=1 bash ubuntu-look.sh
@@ -496,7 +498,8 @@ bash ubuntu-look.sh --uninstall
 It lists the packages before removing them and asks first. At the end,
 it reboots after a 60 second countdown (Enter reboots at once, Ctrl-C
 cancels). If a step cannot finish, it does not reboot; run `--uninstall`
-again later.
+again later. Stopped half-way (Ctrl-C), it lists what it did so far and
+keeps its records, so the next `--uninstall` finishes it.
 
 For everyone:
 
@@ -589,8 +592,11 @@ another one. `ubuntu-keyring` stays while another package source uses it.
 - **apt hook.** `/etc/apt/apt.conf.d/99ubuntu-look` runs a short check
   after each apt change. If Yaru's shell theme is removed, or a Debian
   upgrade brings a new GNOME Shell, it removes the Ubuntu session, so
-  the login screen offers Debian's GNOME session. After a new GNOME Shell it also
-  says to run `bash ubuntu-look.sh --refresh`. It never stops apt.
+  the login screen offers Debian's GNOME session. It notes who logged in
+  to the Ubuntu session then, and the next run of the script chooses it
+  for them again; whoever had picked GNOME keeps GNOME. After a new GNOME
+  Shell it also says to run `bash ubuntu-look.sh --refresh`. It never
+  stops apt.
 - **Login screen.** Yaru settings in `/etc/dconf/db/gdm.d/10-ubuntu-look`
   and a login screen extension.
 - **Extensions.** The session mode lists the look's installed
@@ -603,16 +609,26 @@ another one. `ubuntu-keyring` stays while another package source uses it.
 - **Records.** What the script changed is kept in `/var/lib/ubuntu-look/`
   and `~/.ubuntu-look-backup/`, so the uninstall can undo it.
 - **The script.** `ubuntu-look.sh` is one file in ten numbered sections,
-  listed at its top: constants, helpers, packages, desktop, boot, records,
+  listed at its top: constants, helpers, packages, desktop, boot, report,
   setup, uninstall, install and main. Everything above `main` only defines;
   `main`, at the bottom, reads the command line and runs one action.
+  A function that changes something reports the outcome by name, with the
+  same meaning everywhere: `RC_CHANGED`, `RC_UNCHANGED`, `RC_FAILED`,
+  `RC_REFUSED`, `RC_NO_RECORD` or `RC_BUSY`, all declared in section 1.
 - **Tests.** `bash tests/run-tests.sh` checks the argument parser, the
   helpers that only compute (option values, saved options, dconf values, the
   kernel command line), and the decisions of the functions that install
   packages and change the boot splash, run against stand-ins for apt, sudo
-  and the boot tools. It also runs `tests/lint-scope.py`, which fails when
-  a function sets a variable it does not declare `local`, or run state that
-  section 1 does not declare. It sources the script and changes nothing.
+  and the boot tools. It also checks how the release in development is
+  told apart, what the two summaries say about a run that stopped, and the
+  apt hook, run for real against a stand-in system. The files the script
+  writes in other languages are checked too: the hook parses as `sh`, the
+  extensions and the session-end script as JavaScript (`tests/parse-js.js`,
+  which needs `gjs`), the icon script as Python, the font rule as XML and
+  the session mode as JSON. It also runs `tests/lint-scope.py`, which fails
+  when a function sets a variable it does not declare `local`, or run state
+  that section 1 does not declare. It sources the script, with unset
+  variables treated as errors as in a real run, and changes nothing.
 - **Real-run test.** `bash tests/vm-test.sh` runs the script for real in a
   Debian 13 virtual machine: install, repeat run, `--refresh`, `--uninstall`
   and a second install, with the VM rebooting where the script reboots. It

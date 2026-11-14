@@ -10,6 +10,8 @@
 cd "$(dirname -- "${BASH_SOURCE[0]}")/.." || exit 1
 # shellcheck disable=SC1091
 . ./ubuntu-look.sh
+# As a real run: main switches it on first.
+set -u
 
 PASS=0
 FAIL=0
@@ -136,18 +138,18 @@ checked() {  # checked <simulation> <simulation status> <records status> <apt st
 is "apt_install_checked: installs, with no removal allowed" \
   "0 removes= apt=[install -y --no-remove pkg]" "$(checked "Inst pkg (1)" 0 0 0)"
 is "apt_install_checked: apt cannot resolve it" \
-  "1 removes= apt=" "$(checked "E: broken" 100 0 0)"
+  "${RC_REFUSED} removes= apt=" "$(checked "E: broken" 100 0 0)"
 is "apt_install_checked: refuses a removal, and names it" \
-  "1 removes=other apt=" "$(checked "Remv other [1]"$'\n'"Inst pkg (1)" 0 0 0)"
+  "${RC_REFUSED} removes=other apt=" "$(checked "Remv other [1]"$'\n'"Inst pkg (1)" 0 0 0)"
 is "apt_install_checked: an allowed removal goes through" \
   "0 removes= apt=[install -y pkg]" "$(checked "Remv other [1]"$'\n'"Inst pkg (1)" 0 0 0 other)"
 is "apt_install_checked: no records, no install" \
-  "3 removes= apt=" "$(checked "Inst pkg (1)" 0 1 0)"
+  "${RC_NO_RECORD} removes= apt=" "$(checked "Inst pkg (1)" 0 1 0)"
 is "apt_install_checked: apt fails" \
-  "2 removes= apt=[install -y --no-remove pkg]" "$(checked "Inst pkg (1)" 0 0 100)"
+  "${RC_FAILED} removes= apt=[install -y --no-remove pkg]" "$(checked "Inst pkg (1)" 0 0 100)"
 
 # ensure_package: the newest build that installs; hands back ENSURE_VERSION.
-ensured() {  # ensured <installed version> <versions on offer> <"version=status" of failing builds> [rejected before]
+ensured() {  # ensured <installed version> <versions on offer> <"version=refused|failed|busy|no-record" of failing builds> [rejected before]
   (
     pkg_installed_version() { echo "$HAVE"; }
     pkg_allowed_versions_desc() { printf '%s\n' $OFFER; }
@@ -156,8 +158,12 @@ ensured() {  # ensured <installed version> <versions on offer> <"version=status"
       TRIED="${TRIED:+${TRIED} }${1#*=}"
       for f in $FAILS; do
         [ "${f%%=*}" = "${1#*=}" ] || continue
-        [ "${f#*=}" = busy ] && { echo "E: Could not get lock /var/lib/dpkg/lock"; return 2; }
-        return "${f#*=}"
+        case "${f#*=}" in
+          busy)      echo "E: Could not get lock /var/lib/dpkg/lock"; return "$RC_FAILED" ;;
+          refused)   return "$RC_REFUSED" ;;
+          no-record) return "$RC_NO_RECORD" ;;
+          *)         return "$RC_FAILED" ;;
+        esac
       done
       return 0
     }
@@ -169,24 +175,24 @@ ensured() {  # ensured <installed version> <versions on offer> <"version=status"
 is "ensure_package: installs the newest build" \
   "0 version=3 tried=3 rejected=" "$(ensured "" "3 2 1" "")"
 is "ensure_package: falls back to an older build" \
-  "0 version=2 tried=3 2 rejected=pkg=3" "$(ensured "" "3 2 1" "3=1")"
+  "0 version=2 tried=3 2 rejected=pkg=3" "$(ensured "" "3 2 1" "3=refused")"
 is "ensure_package: a failed install tries the next build too" \
-  "0 version=2 tried=3 2 rejected=pkg=3" "$(ensured "" "3 2 1" "3=2")"
+  "0 version=2 tried=3 2 rejected=pkg=3" "$(ensured "" "3 2 1" "3=failed")"
 is "ensure_package: never below the installed build" \
-  "2 version=2 tried=3 rejected=pkg=3" "$(ensured 2 "3 2 1" "3=1")"
+  "${RC_UNCHANGED} version=2 tried=3 rejected=pkg=3" "$(ensured 2 "3 2 1" "3=refused")"
 is "ensure_package: already at the newest" \
-  "2 version=3 tried= rejected=" "$(ensured 3 "3 2 1" "")"
+  "${RC_UNCHANGED} version=3 tried= rejected=" "$(ensured 3 "3 2 1" "")"
 is "ensure_package: nothing on offer" \
-  "1 version= tried= rejected=" "$(ensured "" "" "")"
+  "${RC_FAILED} version= tried= rejected=" "$(ensured "" "" "")"
 is "ensure_package: nothing on offer installs" \
-  "1 version= tried=2 1 rejected=pkg=2 pkg=1" "$(ensured "" "2 1" "2=1 1=1")"
+  "${RC_FAILED} version= tried=2 1 rejected=pkg=2 pkg=1" "$(ensured "" "2 1" "2=refused 1=refused")"
 is "ensure_package: a build turned down earlier is not tried twice" \
   "0 version=2 tried=2 rejected=pkg=3" "$(ensured "" "3 2" "" "pkg=3")"
 # These two stop the run: the subshell ends before it prints.
 is "ensure_package: a busy apt stops the run"      "" "$(ensured "" "3 2" "3=busy")"
-is "ensure_package: unwritable records stop the run" "" "$(ensured "" "3 2" "3=3")"
+is "ensure_package: unwritable records stop the run" "" "$(ensured "" "3 2" "3=no-record")"
 
-# plymouth_put_back: hands back PLY_WAS and PLY_CURRENT.
+# plymouth_put_back: hands back PLY_WAS, PLY_CURRENT and the outcome's name.
 put_back() {  # put_back <current theme> <theme before> <theme set> <owed: 0|1> <put status> <rebuild status> [owe status]
   (
     plymouth_current_theme() { echo "$CUR"; }
@@ -196,39 +202,39 @@ put_back() {  # put_back <current theme> <theme before> <theme set> <owed: 0|1> 
     drop_plymouth_records() { DROPPED=1; }
     PLYMOUTH_BEFORE_FILE="$T/ply-before" PLYMOUTH_SET_FILE="$T/ply-set" INITRAMFS_PENDING="$T/ply-pending"
     rm -f "$PLYMOUTH_BEFORE_FILE" "$PLYMOUTH_SET_FILE" "$INITRAMFS_PENDING"
-    CUR="$1" PUT_RC="$5" REBUILD_RC="$6" OWE_RC="${7:-0}" PUT="" REBUILT=0 DROPPED=0 PLYMOUTH_THEME=bgrt
+    CUR="$1" PUT_RC="$5" REBUILD_RC="$6" OWE_RC="${7:-0}" PUT="" REBUILT=0 DROPPED=0 PLYMOUTH_THEME=bgrt PLY_OUTCOME=""
     [ -z "$2" ] || echo "$2" > "$PLYMOUTH_BEFORE_FILE"
     [ -z "$3" ] || echo "$3" > "$PLYMOUTH_SET_FILE"
     [ "$4" = 0 ] || : > "$INITRAMFS_PENDING"
     plymouth_put_back > /dev/null 2>&1; rc=$?
     [ -f "$INITRAMFS_PENDING" ] && owed=1 || owed=0
-    echo "${rc} was=${PLY_WAS} current=${PLY_CURRENT} put=${PUT} rebuilt=${REBUILT} dropped=${DROPPED} owed=${owed}"
+    echo "${rc} ${PLY_OUTCOME} was=${PLY_WAS} current=${PLY_CURRENT} put=${PUT} rebuilt=${REBUILT} dropped=${DROPPED} owed=${owed}"
   )
 }
 is "plymouth_put_back: restores the earlier theme" \
-  "0 was=spinner current=bgrt put=spinner rebuilt=1 dropped=1 owed=1" "$(put_back bgrt spinner bgrt 0 0 0)"
+  "${RC_CHANGED} restored was=spinner current=bgrt put=spinner rebuilt=1 dropped=1 owed=1" "$(put_back bgrt spinner bgrt 0 0 0)"
 is "plymouth_put_back: nothing recorded" \
-  "1 was= current=bgrt put= rebuilt=0 dropped=1 owed=0" "$(put_back bgrt "" "" 0 0 0)"
+  "${RC_UNCHANGED} none was= current=bgrt put= rebuilt=0 dropped=1 owed=0" "$(put_back bgrt "" "" 0 0 0)"
 is "plymouth_put_back: already on the earlier theme" \
-  "1 was=bgrt current=bgrt put= rebuilt=0 dropped=1 owed=0" "$(put_back bgrt bgrt bgrt 0 0 0)"
+  "${RC_UNCHANGED} none was=bgrt current=bgrt put= rebuilt=0 dropped=1 owed=0" "$(put_back bgrt bgrt bgrt 0 0 0)"
 is "plymouth_put_back: the user's own theme stays" \
-  "2 was=spinner current=solar put= rebuilt=0 dropped=1 owed=0" "$(put_back solar spinner bgrt 0 0 0)"
+  "${RC_UNCHANGED} kept was=spinner current=solar put= rebuilt=0 dropped=1 owed=0" "$(put_back solar spinner bgrt 0 0 0)"
 is "plymouth_put_back: the set theme defaults to PLYMOUTH_THEME" \
-  "0 was=spinner current=bgrt put=spinner rebuilt=1 dropped=1 owed=1" "$(put_back bgrt spinner "" 0 0 0)"
+  "${RC_CHANGED} restored was=spinner current=bgrt put=spinner rebuilt=1 dropped=1 owed=1" "$(put_back bgrt spinner "" 0 0 0)"
 is "plymouth_put_back: theme unreadable, records kept" \
-  "3 was=spinner current= put= rebuilt=0 dropped=0 owed=0" "$(put_back "" spinner bgrt 0 0 0)"
+  "${RC_FAILED} unread was=spinner current= put= rebuilt=0 dropped=0 owed=0" "$(put_back "" spinner bgrt 0 0 0)"
 is "plymouth_put_back: put-back fails, records kept, nothing owed" \
-  "4 was=spinner current=bgrt put=spinner rebuilt=0 dropped=0 owed=0" "$(put_back bgrt spinner bgrt 0 1 0)"
+  "${RC_FAILED} put-back was=spinner current=bgrt put=spinner rebuilt=0 dropped=0 owed=0" "$(put_back bgrt spinner bgrt 0 1 0)"
 is "plymouth_put_back: put-back fails, an older debt stays" \
-  "4 was=spinner current=bgrt put=spinner rebuilt=0 dropped=0 owed=1" "$(put_back bgrt spinner bgrt 1 1 0)"
+  "${RC_FAILED} put-back was=spinner current=bgrt put=spinner rebuilt=0 dropped=0 owed=1" "$(put_back bgrt spinner bgrt 1 1 0)"
 is "plymouth_put_back: rebuild fails after the put-back" \
-  "5 was=spinner current=bgrt put=spinner rebuilt=1 dropped=0 owed=1" "$(put_back bgrt spinner bgrt 0 0 1)"
+  "${RC_FAILED} rebuild was=spinner current=bgrt put=spinner rebuilt=1 dropped=0 owed=1" "$(put_back bgrt spinner bgrt 0 0 1)"
 is "plymouth_put_back: an owed rebuild is finished" \
-  "6 was= current=bgrt put= rebuilt=1 dropped=1 owed=1" "$(put_back bgrt "" "" 1 0 0)"
+  "${RC_CHANGED} rebuilt was= current=bgrt put= rebuilt=1 dropped=1 owed=1" "$(put_back bgrt "" "" 1 0 0)"
 is "plymouth_put_back: an owed rebuild fails" \
-  "7 was= current=bgrt put= rebuilt=1 dropped=0 owed=1" "$(put_back bgrt "" "" 1 0 1)"
+  "${RC_FAILED} owed was= current=bgrt put= rebuilt=1 dropped=0 owed=1" "$(put_back bgrt "" "" 1 0 1)"
 is "plymouth_put_back: the debt cannot be recorded" \
-  "8 was=spinner current=bgrt put= rebuilt=0 dropped=0 owed=0" "$(put_back bgrt spinner bgrt 0 0 0 1)"
+  "${RC_NO_RECORD} no-record was=spinner current=bgrt put= rebuilt=0 dropped=0 owed=0" "$(put_back bgrt spinner bgrt 0 0 0 1)"
 
 # strip_grub_words: hands back GRUB_ADDED_WORDS and GRUB_CMDLINE_NEW.
 stripped() {  # stripped <"state value" of the command line> <pending: 0|1> <line added: 0|1> <write status> [update-grub status]
@@ -258,15 +264,15 @@ is "strip_grub_words: a line the look added goes whole" \
 is "strip_grub_words: an emptied line of the user's stays" \
   "0 words=quiet splash did=write: forgot=1 pending=0" "$(stripped "active quiet splash" 0 0 0)"
 is "strip_grub_words: words already gone" \
-  "1 words=quiet splash did= forgot=1 pending=0" "$(stripped "active ro" 0 0 0)"
+  "${RC_UNCHANGED} words=quiet splash did= forgot=1 pending=0" "$(stripped "active ro" 0 0 0)"
 is "strip_grub_words: the file is not in a shape to edit" \
-  "2 words=quiet splash did= forgot=0 pending=0" "$(stripped "unparsable " 0 0 0)"
+  "${RC_REFUSED} words=quiet splash did= forgot=0 pending=0" "$(stripped "unparsable " 0 0 0)"
 is "strip_grub_words: the write fails, the note goes" \
-  "3 words=quiet splash did=write:ro forgot=0 pending=0" "$(stripped "active ro quiet splash" 0 0 1)"
+  "${RC_FAILED} words=quiet splash did=write:ro forgot=0 pending=0" "$(stripped "active ro quiet splash" 0 0 1)"
 is "strip_grub_words: finishes an interrupted update-grub" \
   "0 words=quiet splash did=update-grub forgot=1 pending=0" "$(stripped "active ro" 1 0 0)"
 is "strip_grub_words: the interrupted update-grub fails again" \
-  "3 words=quiet splash did=update-grub forgot=0 pending=1" "$(stripped "active ro" 1 0 0 1)"
+  "${RC_FAILED} words=quiet splash did=update-grub forgot=0 pending=1" "$(stripped "active ro" 1 0 0 1)"
 
 # set_boot_splash: no theme change without a settled kernel command line.
 splash() {  # splash <"state value" of the command line>
@@ -340,6 +346,199 @@ is "dconf_or_pending: success leaves nothing pending" "0 0" \
   "$( dconf() { return 0; }; USER_PENDING=0; dconf_or_pending reset /a/b; echo "$? $USER_PENDING" )"
 is "dconf_or_pending: a failure marks the user's settings pending" "1 1" \
   "$( dconf() { return 1; }; USER_PENDING=0; dconf_or_pending reset /a/b; echo "$? $USER_PENDING" )"
+
+### Versions
+is "version_major: a release"            "49" "$(version_major 49.1-2)"
+is "version_major: an epoch"             "49" "$(version_major 1:49.1-2)"
+is "version_major: a pre-release"        "49" "$(version_major 49~rc-1)"
+is "version_major: no version"           "" "$(version_major "")"
+
+### The series in development
+# A stand-in for curl: the archive's devel link, Ubuntu's development list and
+# a release's own Release file. The script asks for "<body>\n<HTTP code>".
+fake_curl() {
+  local url="${!#}" e
+  case "$url" in
+    */dists/devel/Release)
+      case "$LINK" in
+        unread) printf '\n000'; return 7 ;;
+        none)   printf 'Not Found\n404' ;;
+        *)      printf 'Origin: Ubuntu\nCodename: %s\n\n200' "$LINK" ;;
+      esac ;;
+    *meta-release-development)
+      [ "$LIST" != unread ] || return 22
+      for e in $LIST; do printf 'Dist: %s\nVersion: 1\nSupported: %s\n\n' "${e%%:*}" "${e#*:}"; done ;;
+    # A release is on the main archive, or with RETIRED=1 on the retired one.
+    "${UBUNTU_OLD_MIRROR}"/dists/*/Release)
+      if [ "$RETIRED" = 1 ]; then printf 'Origin: Ubuntu\nVersion: 27.04\n\n200'; else printf 'Not Found\n404'; fi ;;
+    */dists/*/Release)
+      if [ "$RETIRED" = 1 ]; then printf 'Not Found\n404'; else printf 'Origin: Ubuntu\nVersion: 27.04\n\n200'; fi ;;
+  esac
+}
+devel() {  # devel <devel link: a codename, none or unread> <development list: "codename:supported"..., or unread>
+  (
+    curl() { fake_curl "$@"; }
+    LINK="$1" LIST="$2" UBUNTU_MIRROR=http://m.example/ubuntu UBUNTU_DEFAULT_MIRROR=http://m.example/ubuntu
+    UBUNTU_RELEASE_CACHE="" RETIRED=0
+    cn="$(ubuntu_devel_codename)"; echo "$? ${cn}"
+  )
+}
+is "devel series: the archive's link names it" \
+  "0 tenacious" "$(devel tenacious "stonking:1 tenacious:0")"
+is "devel series: the link alone is enough" \
+  "0 tenacious" "$(devel tenacious unread)"
+is "devel series: a link left on a published release names none" \
+  "0 " "$(devel stonking "resolute:1 stonking:1")"
+is "devel series: a stale link gives way to the list" \
+  "0 tenacious" "$(devel stonking "stonking:1 tenacious:0")"
+is "devel series: without a link the list's last entry" \
+  "0 tenacious" "$(devel none "stonking:1 tenacious:0")"
+is "devel series: without a link, every listed release published" \
+  "0 " "$(devel none "resolute:1 stonking:1")"
+is "devel series: nothing readable" \
+  "2 " "$(devel unread unread)"
+release_state() {  # release_state <codename> <devel link> [retired: 0|1]
+  (
+    curl() { fake_curl "$@"; }
+    LINK="$2" LIST=unread UBUNTU_MIRROR=http://m.example/ubuntu UBUNTU_DEFAULT_MIRROR=http://m.example/ubuntu
+    UBUNTU_RELEASE_CACHE="" RETIRED="${3:-0}"
+    info="$(ubuntu_release_info "$1")"; echo "$? ${info}"
+  )
+}
+is "release info: the series in development is marked" \
+  "0 27.04 devel http://m.example/ubuntu" "$(release_state tenacious tenacious)"
+is "release info: any other release is stable" \
+  "0 27.04 stable http://m.example/ubuntu" "$(release_state stonking tenacious)"
+is "release info: a retired release is never in development" \
+  "0 27.04 stable ${UBUNTU_OLD_MIRROR}" "$(release_state tenacious tenacious 1)"
+is "release info: an unknown devel series counts as unread" \
+  "2 " "$(release_state tenacious unread)"
+
+### The summaries
+summary_end() {  # summary_end <exit status> <finished: 0|1> [failed item]
+  (
+    log_final_state() { :; }
+    RUN_STARTED=1 RUN_FINISHED="$2" UBUNTU_RELEASE_CACHE="" REBOOT_NEEDED=0 RELOGIN_NEEDED=0
+    STATUS_CHANGES=("a change") STATUS_FAILED=()
+    [ -z "${3:-}" ] || STATUS_FAILED=("$3")
+    trap '_on_exit; print_summary' EXIT
+    exit "$1"
+  ) 2>&1 | sed -r 's/\x1b\[[0-9;]*m//g' | grep -E '^(✗|✓|⚠)'
+}
+is "summary: a run that stopped says so" \
+  "✗  Script stopped (rc=1). See the ERROR or WARN lines above." "$(summary_end 1 0)"
+is "summary: an interrupted run says so" \
+  "✗  Script stopped (rc=130). See the ERROR or WARN lines above." "$(summary_end 130 0)"
+is "summary: a finished run is done" \
+  "✓  Done — no reboot needed." "$(summary_end 0 1)"
+is "summary: a finished run with an item not done is no stop" \
+  "⚠  Done, except the items listed above as not done — each gives its reason." "$(summary_end 1 1 "an item")"
+reported() {  # reported <action> <kind>
+  (
+    ACTION="$1" STATUS_CHANGES=() STATUS_NOCHANGE=() STATUS_FAILED=() DONE=() SKIPPED=() GUESSED=() SYSTEM_PENDING=0
+    report "$2" "text"
+    echo "${#STATUS_CHANGES[@]}${#STATUS_NOCHANGE[@]}${#STATUS_FAILED[@]} ${#DONE[@]}${#SKIPPED[@]}${#GUESSED[@]} pending=${SYSTEM_PENDING}"
+  )
+}
+is "report: install, changed"            "100 000 pending=0" "$(reported install changed)"
+is "report: install, unchanged"          "010 000 pending=0" "$(reported install unchanged)"
+is "report: install, left to the user"   "010 000 pending=0" "$(reported install manual)"
+is "report: install, failed"             "001 000 pending=0" "$(reported install failed)"
+is "report: uninstall, changed"          "000 100 pending=0" "$(reported uninstall changed)"
+is "report: uninstall, unchanged"        "000 010 pending=0" "$(reported uninstall unchanged)"
+is "report: uninstall, left to the user" "000 010 pending=1" "$(reported uninstall manual)"
+is "report: uninstall, failed"           "000 001 pending=1" "$(reported uninstall failed)"
+stopped_uninstall() {  # stopped_uninstall <started: 0|1> <finished: 0|1>
+  (
+    RUN_STARTED="$1" RUN_FINISHED="$2" UBUNTU_RELEASE_CACHE="" INITRAMFS_PARTIAL=0
+    DONE=("one thing") SKIPPED=() GUESSED=()
+    trap _on_uninstall_exit EXIT
+    exit 130
+  ) 2>&1 | sed -r 's/\x1b\[[0-9;]*m//g' | grep -cE 'UNINSTALL STOPPED|one thing|stopped before it finished'
+}
+is "uninstall: a stopped run lists what it did"   "3" "$(stopped_uninstall 1 0)"
+is "uninstall: a finished run adds nothing"       "0" "$(stopped_uninstall 1 1)"
+is "uninstall: a run stopped before it began adds nothing" "0" "$(stopped_uninstall 0 0)"
+
+### The session's record of users
+forgot() {  # forgot <users on record> <user>
+  (
+    sys_record_write() { printf '%s\n' "$2" > "$1"; }
+    SESSION_USERS_RECORD="$T/session-users" RUN_USER="$2"
+    printf '%s\n' $1 > "$SESSION_USERS_RECORD"
+    forget_session_user
+    [ -f "$SESSION_USERS_RECORD" ] && xargs < "$SESSION_USERS_RECORD" || echo "no record"
+  )
+}
+is "forget_session_user: the others stay on record" "bob" "$(forgot "alice bob alice" alice)"
+is "forget_session_user: the last one takes the record" "no record" "$(forgot "alice" alice)"
+
+### The apt hook, run for real against a stand-in system
+hook() {  # hook <gnome-shell package version> <major the look was set up for> <Yaru's shell theme: 0|1>
+  (
+    d="$T/hook"; rm -rf "$d"; mkdir -p "$d/bin" "$d/records" "$d/ext" "$d/accounts"
+    SHELL_MODE_FILE="$d/ubuntu.json" SESSION_ENTRIES="$d/ubuntu.desktop $d/ubuntu-xorg.desktop"
+    SYS_RECORDS="$d/records" SESSION_USERS_RECORD="$d/records/session-users.txt"
+    THEME_EXT_DIR="$d/ext" YARU_SHELL_THEME="$d/yaru" ACCOUNTS_USERS_DIR="$d/accounts"
+    : > "$SHELL_MODE_FILE"; : > "$d/ubuntu.desktop"; : > "$d/ubuntu-xorg.desktop"
+    printf '{\n  "shell-version": ["%s"],\n}\n' "$2" > "$d/ext/metadata.json"
+    [ "$3" = 0 ] || : > "$YARU_SHELL_THEME"
+    printf 'Session=ubuntu\n' > "$d/accounts/alice"
+    printf 'XSession=ubuntu-xorg\n' > "$d/accounts/bob"
+    printf 'Session=gnome\n' > "$d/accounts/carol"
+    printf '#!/bin/sh\nprintf %%s "%s"\n' "$1" > "$d/bin/dpkg-query"; chmod +x "$d/bin/dpkg-query"
+    apt_hook_content > "$d/hook.sh"
+    PATH="$d/bin:$PATH" sh "$d/hook.sh" 2> /dev/null; rc=$?
+    [ -e "$SHELL_MODE_FILE" ] || [ -e "$d/ubuntu.desktop" ] || [ -e "$d/ubuntu-xorg.desktop" ] && s=kept || s=gone
+    echo "${rc} session=${s} users=$({ xargs < "$SESSION_USERS_RECORD"; } 2> /dev/null)"
+  )
+}
+is "apt hook: the same GNOME Shell keeps the session" \
+  "0 session=kept users=" "$(hook 48.4-1~deb13u1 48 1)"
+is "apt hook: a pre-release of the same major keeps it" \
+  "0 session=kept users=" "$(hook 49~rc-1 49 1)"
+is "apt hook: an epoch is not the major" \
+  "0 session=kept users=" "$(hook 1:48.4-1 48 1)"
+is "apt hook: a new major drops the session and notes its users" \
+  "0 session=gone users=alice bob" "$(hook 49.1-1 48 1)"
+is "apt hook: without Yaru's shell theme the session goes" \
+  "0 session=gone users=alice bob" "$(hook 48.4-1 48 0)"
+
+### The files the script writes in other languages: each one parses
+embedded="$T/embedded"; mkdir -p "$embedded"
+(
+  SESSION_ENTRIES="/usr/local/share/xsessions/ubuntu.desktop"
+  write_local_extension() { cat > "${embedded}/$1.js"; }
+  write_greeter_extension; write_theme_extension
+  session_end_content > "${embedded}/session-end.js"
+  apt_hook_content > "${embedded}/hook.sh"
+  session_fonts_content > "${embedded}/fonts.conf"
+  session_mode_content > "${embedded}/mode.json"
+  session_manager_dropin_content > "${embedded}/dropin.conf"
+  python3() { cat; }
+  normalise_app_grid_icon a b > "${embedded}/icon.py"
+)
+is "embedded: the three scripts were written" "3" "$(find "$embedded" -name '*.js' -size +0 | wc -l)"
+is "embedded: the apt hook parses as sh"      "" "$(sh -n "${embedded}/hook.sh" 2>&1)"
+is "embedded: the drop-in clears the session's variables" \
+  "ExecStopPost=-/usr/bin/systemctl --user unset-environment GNOME_SHELL_SESSION_MODE DCONF_PROFILE FONTCONFIG_FILE" \
+  "$(grep unset-environment "${embedded}/dropin.conf")"
+if command -v python3 > /dev/null 2>&1; then
+  is "embedded: the icon script parses as Python" "" \
+    "$(python3 -c 'import ast, sys; ast.parse(open(sys.argv[1]).read())' "${embedded}/icon.py" 2>&1)"
+  is "embedded: the font rule parses as XML" "" \
+    "$(python3 -c 'import sys, xml.dom.minidom as m; m.parse(sys.argv[1])' "${embedded}/fonts.conf" 2>&1)"
+  is "embedded: the session mode parses as JSON" "" \
+    "$(python3 -c 'import json, sys; json.load(open(sys.argv[1]))' "${embedded}/mode.json" 2>&1)"
+else
+  echo "SKIP Python, XML and JSON checks: python3 is missing"
+fi
+if command -v gjs > /dev/null 2>&1; then
+  is "embedded: the extensions and the session-end script parse as JavaScript" "" \
+    "$(gjs tests/parse-js.js "${embedded}"/*.js 2>&1)"
+else
+  echo "SKIP JavaScript check: gjs is missing"
+fi
 
 echo "${PASS} passed, ${FAIL} failed"
 [ "$FAIL" -eq 0 ]
