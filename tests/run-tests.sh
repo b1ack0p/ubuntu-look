@@ -100,9 +100,12 @@ is "grub_without_words leaves * alone"   "a=* b" "$(grub_without_words "a=* spla
 is "no arguments: an install"            "install 0"    "$(parsed)"
 is "--refresh"                           "refresh 1"    "$(parsed --refresh)"
 is "--uninstall"                         "uninstall 0"  "$(parsed --uninstall)"
+is "--reset"                             "reset 0"      "$(parsed --reset)"
 is "a flag may repeat"                   "uninstall 0"  "$(parsed --uninstall --uninstall)"
 is "two actions" \
-  "rc=1 [ERROR] Give only one of --refresh and --uninstall." "$(parsed --refresh --uninstall)"
+  "rc=1 [ERROR] Give only one of --refresh, --reset and --uninstall." "$(parsed --refresh --uninstall)"
+is "--reset beside another action" \
+  "rc=1 [ERROR] Give only one of --refresh, --reset and --uninstall." "$(parsed --reset --uninstall)"
 is "unknown argument" \
   "rc=1 [ERROR] Unknown argument '--bogus'. See: bash ubuntu-look.sh --help" "$(parsed --bogus)"
 is "unknown arguments beside an action" \
@@ -459,6 +462,67 @@ stopped_uninstall() {  # stopped_uninstall <started: 0|1> <finished: 0|1>
 is "uninstall: a stopped run lists what it did"   "3" "$(stopped_uninstall 1 0)"
 is "uninstall: a finished run adds nothing"       "0" "$(stopped_uninstall 1 1)"
 is "uninstall: a run stopped before it began adds nothing" "0" "$(stopped_uninstall 0 0)"
+
+### --reset: the user's own values of the look's settings, and nothing else
+# A stand-in settings database: "<key>=<value>" lines in $T/reset/db.
+reset_run() {  # reset_run <"key=value" lines of the user's own settings> [dconf status]
+  (
+    d="$T/reset"; rm -rf "$d"; mkdir -p "$d/home/Documents"
+    printf '%s\n' $1 > "$d/db"; echo "mine" > "$d/home/Documents/notes.txt"
+    user_dconf() {
+      case "$1" in
+        dump) cat "$d/db" ;;
+        read) sed -n "s|^${2}=||p" "$d/db" ;;
+        list) sed -n "s|^${2}\([^=/]*/\{0,1\}\).*|\1|p" "$d/db" | sort -u ;;
+      esac
+    }
+    dconf() {
+      [ "$DCONF_RC" -eq 0 ] || return 1
+      case "$1 $2" in
+        "reset -f") # A directory (ending in /) with all below it, or one key.
+                    case "$3" in */) grep -v "^${3}" "$d/db" ;; *) grep -v "^${3}=" "$d/db" ;; esac > "$d/db.new"
+                    mv "$d/db.new" "$d/db" ;;
+        reset\ *)   grep -v "^${2}=" "$d/db" > "$d/db.new"; mv "$d/db.new" "$d/db" ;;
+      esac
+    }
+    look_installed_ext() { [ "$1" != ubuntu-appindicators@ubuntu.com ]; }
+    # The look's own values: Yaru as the GTK theme, nothing else.
+    our_dconf_value() { [ "$1/$2" != org/gnome/desktop/interface/gtk-theme ] || echo "'Yaru'"; }
+    message() { :; }
+    HOME="$d/home" BACKUP_DIR="$d/home/.ubuntu-look-backup" TERMINAL_SHORTCUT_RECORD="$d/home/.ubuntu-look-backup/terminal-shortcut-added"
+    DCONF_RC="${2:-0}" STATUS_CHANGES=() STATUS_NOCHANGE=() STATUS_FAILED=()
+    reset_user_settings > /dev/null 2>&1
+    saved="$(find "$BACKUP_DIR" -name 'settings-before-reset-*.ini' | wc -l)"
+    echo "left=$(tr '\n' ' ' < "$d/db" | sed 's/ *$//') changes=${#STATUS_CHANGES[@]} failed=${#STATUS_FAILED[@]} saved=${saved} file=$(cat "$d/home/Documents/notes.txt")"
+  )
+}
+is "reset: the look's keys go, every other setting stays" \
+  "left=/org/gnome/shell/favorite-apps=['a'] /org/gnome/desktop/input-sources/sources=x changes=1 failed=0 saved=1 file=mine" \
+  "$(reset_run "/org/gnome/desktop/interface/gtk-theme='Adwaita' /org/gnome/desktop/wm/preferences/button-layout='close:' /org/gnome/shell/favorite-apps=['a'] /org/gnome/desktop/input-sources/sources=x")"
+is "reset: the settings of the look's extensions go" \
+  "left= changes=1 failed=0 saved=1 file=mine" \
+  "$(reset_run "/org/gnome/shell/extensions/dash-to-dock/dock-position='LEFT' /org/gnome/shell/extensions/tiling-assistant/x=1")"
+is "reset: the tiling assistant keeps its note of the shortcuts it took over" \
+  "left=/org/gnome/shell/extensions/tiling-assistant/overridden-settings={} changes=1 failed=0 saved=1 file=mine" \
+  "$(reset_run "/org/gnome/shell/extensions/tiling-assistant/overridden-settings={} /org/gnome/shell/extensions/tiling-assistant/gaps/window=8 /org/gnome/shell/extensions/tiling-assistant/x=1")"
+is "reset: what the extensions store by themselves stays" \
+  "left=/org/gnome/shell/extensions/tiling-assistant/last-version-installed=51 /org/gnome/shell/extensions/tiling-assistant/focus-hint-color='rgb(237,91,0)' /org/gnome/shell/extensions/ding/check-x11wayland=true changes=0 failed=0 saved=0 file=mine" \
+  "$(reset_run "/org/gnome/shell/extensions/tiling-assistant/last-version-installed=51 /org/gnome/shell/extensions/tiling-assistant/focus-hint-color='rgb(237,91,0)' /org/gnome/shell/extensions/ding/check-x11wayland=true")"
+is "reset: a value that is the look's own is left" \
+  "left=/org/gnome/desktop/interface/gtk-theme='Yaru' changes=0 failed=0 saved=0 file=mine" \
+  "$(reset_run "/org/gnome/desktop/interface/gtk-theme='Yaru'")"
+is "reset: an extension the user had before keeps its settings" \
+  "left=/org/gnome/shell/extensions/appindicator/icon-size=5 changes=0 failed=0 saved=0 file=mine" \
+  "$(reset_run "/org/gnome/shell/extensions/appindicator/icon-size=5")"
+is "reset: the look's extensions leave the disabled list" \
+  "left=/org/gnome/shell/favorite-apps=['a'] changes=1 failed=0 saved=1 file=mine" \
+  "$(reset_run "/org/gnome/shell/disabled-extensions=['ubuntu-dock@ubuntu.com'] /org/gnome/shell/favorite-apps=['a']")"
+is "reset: nothing of the user's own, nothing changed" \
+  "left=/org/gnome/shell/favorite-apps=['a'] changes=0 failed=0 saved=0 file=mine" \
+  "$(reset_run "/org/gnome/shell/favorite-apps=['a']")"
+is "reset: a reset that fails is reported, and nothing is changed" \
+  "left=/org/gnome/desktop/interface/gtk-theme='Adwaita' changes=0 failed=1 saved=0 file=mine" \
+  "$(reset_run "/org/gnome/desktop/interface/gtk-theme='Adwaita'" 1)"
 
 ### The session's record of users
 forgot() {  # forgot <users on record> <user>

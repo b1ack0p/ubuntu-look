@@ -12,12 +12,16 @@
 # Original    : DeltaLima
 #               https://github.com/DeltaLima/make-debian-look-like-ubuntu
 #
-# Usage       : bash ubuntu-look.sh                   install or update
+# Usage       : bash ubuntu-look.sh                   install or update, and reset your
+#                                                     settings to the look's defaults
 #               bash ubuntu-look.sh --refresh         list available updates, then ask
 #                                                     to apply them
+#               bash ubuntu-look.sh --reset           the same for an installed look, from
+#                                                     your desktop session
 #               bash ubuntu-look.sh --uninstall       undo it, from your desktop session
 #               bash ubuntu-look.sh --help            this text
-#               Safe to re-run.
+#               Safe to re-run: each run saves your settings before it
+#               resets them.
 #
 # Options     : UBUNTU_CODENAME=<name>        use this Ubuntu release
 #               UBUNTU_INCLUDE_DEVEL=1        allow the unreleased series
@@ -46,6 +50,15 @@
 #               release, a Debian or GNOME Shell change, newer builds of the
 #               look's packages. It asks before applying anything.
 #
+# Reset       : A plain run and --reset put the look back as after its first
+#               install: your own values of the look's settings are reset,
+#               so the Ubuntu session shows Ubuntu's defaults, and the look's
+#               system files are written again where they differ. Your
+#               values are saved first; your files, folders, installed apps
+#               and other settings are not touched. --reset does it for a
+#               look already installed; --refresh only updates and resets
+#               nothing.
+#
 # Undo        : bash ubuntu-look.sh --uninstall removes the session and the
 #               system changes, and resets the settings of the user running it.
 #
@@ -59,7 +72,7 @@
 #   3. Packages     apt, the Ubuntu release, sources and pin
 #   4. Desktop      Ubuntu's settings, extensions, terminal, login screen
 #   5. Boot         GRUB command line and boot splash
-#   6. Report       --refresh, the saved release state, summary, reboot
+#   6. Report       --refresh, --reset, the saved release state, summary, reboot
 #   7. Setup        arguments, help, run log, options
 #   8. Uninstall    --uninstall
 #   9. Install      the install itself
@@ -317,8 +330,8 @@ RUN_FINISHED=0
 # GNOME Shell's major version; filled once by init_run.
 SHELL_MAJOR_CACHE=""
 
-# What this run does, set by parse_args: install, refresh or uninstall; and 1
-# for --refresh.
+# What this run does, set by parse_args: install, refresh, reset or uninstall;
+# and 1 for --refresh.
 ACTION=install
 REFRESH=0
 
@@ -500,6 +513,15 @@ APP_GRID_ICON="/usr/local/share/icons/Yaru/scalable/actions/view-app-grid-${SHEL
 # the button matches the icons beside it.
 APP_GRID_INK_FRACTION=0.98
 
+# What the look's extensions store by themselves when they start, not the
+# user: the tiling assistant's note of the shortcuts it took over (it gives
+# them back from it when the session ends), its version and its hint colour,
+# and the desktop icons' display check. A reset leaves these.
+EXTENSION_OWN_KEYS="/org/gnome/shell/extensions/tiling-assistant/overridden-settings"
+EXTENSION_OWN_KEYS+=" /org/gnome/shell/extensions/tiling-assistant/last-version-installed"
+EXTENSION_OWN_KEYS+=" /org/gnome/shell/extensions/tiling-assistant/focus-hint-color"
+EXTENSION_OWN_KEYS+=" /org/gnome/shell/extensions/ding/check-x11wayland"
+
 # One run at a time. The lock lives in /run, which only root can write, so
 # no other user can replace it.
 UBUNTU_LOOK_LOCK=/run/ubuntu-look.lock
@@ -627,6 +649,11 @@ report() {
     esac
   fi
 }
+
+# True when this run puts the look back as after its first install, the
+# user's own settings included: a plain run and --reset. --refresh only
+# updates.
+resets_settings() { [ "$ACTION" = install ] || [ "$ACTION" = reset ]; }
 
 # Returns 1 unless the answer is yes.
 ask_yes() {
@@ -3703,6 +3730,9 @@ add_grub_splash_words() {
     sudo rm -f "$GRUB_STRIP_PENDING"
   fi
   before="$(tr '\n' ' ' 2>/dev/null < "$GRUB_ADDED_FILE")"
+  # A run that resets puts back the words the look added and the user took
+  # off since; one that was off before the first install stays off.
+  ! resets_settings || before=""
   # The first run records which words were already there, so one the user
   # takes off later is not put back either.
   if [ ! -f "$GRUB_SEEN_FILE" ]; then
@@ -3784,10 +3814,11 @@ set_plymouth_theme() {
     [ -f "$PLYMOUTH_SET_FILE" ] \
       || sys_record_write "$PLYMOUTH_SET_FILE" "$current"
     STATUS_NOCHANGE+=("Boot splash theme already '${PLYMOUTH_THEME}'")
-  elif [ -f "$PLYMOUTH_SET_FILE" ] && [ -z "$PLYMOUTH_THEME_GIVEN" ]; then
+  elif [ -f "$PLYMOUTH_SET_FILE" ] && [ -z "$PLYMOUTH_THEME_GIVEN" ] && ! resets_settings; then
     # Set by the look and changed by the user since (the record of the
     # earlier theme alone may be from a run cut off before setting it); a
-    # PLYMOUTH_THEME given to this run overrides.
+    # PLYMOUTH_THEME given to this run overrides, and a run that resets
+    # sets the look's theme again.
     STATUS_NOCHANGE+=("Boot splash theme left as you set it ('${current}')")
   elif ! plymouth_theme_installed "$PLYMOUTH_THEME"; then
     # A theme the user asked for is a failure; the default one missing is not.
@@ -3931,7 +3962,7 @@ unset_boot_splash() {
 }
 
 ###############################################################################
-# 6. Report: --refresh, the saved release state, summary, reboot
+# 6. Report: --refresh, --reset, the saved release state, summary, reboot
 ###############################################################################
 
 # What a run is resolved against: Debian, gnome-shell, architecture, the
@@ -4135,6 +4166,62 @@ refresh_list_unsupported() {
   done
 }
 
+# --reset: this user's own values of the look's settings go, so the Ubuntu
+# session shows Ubuntu's defaults again, as after the first install: every key
+# the look sets where the user's value differs from the look's, and the
+# settings of the extensions the look brought (EXTENSION_OWN_KEYS apart). The
+# values are saved first, the newest ten copies kept. Nothing else of the
+# user's is touched: no file, folder or app, and no other setting. Without
+# the saved copy nothing is reset.
+reset_user_settings() {
+  local saved path key own ours e dir hit n=0 failed=0 st
+  message "resetting your own values of the look's settings"
+  saved="${BACKUP_DIR}/settings-before-reset-$(date +%Y%m%d-%H%M%S).ini"
+  if ! { mkdir -p "$BACKUP_DIR" && user_dconf dump / > "$saved"; }; then
+    rm -f "$saved"
+    STATUS_FAILED+=("Your settings were not reset — they could not be saved in ${BACKUP_DIR} first")
+    return 0
+  fi
+  while read -r path key; do
+    own="$(user_dconf_read "/${path}/${key}")"
+    [ -n "$own" ] || continue
+    # The look's own value, set by the user or a program: nothing to reset.
+    ours="$(our_dconf_value "$path" "$key")"
+    [ "${own// /}" != "${ours// /}" ] || continue
+    if dconf reset "/${path}/${key}" 2>/dev/null; then n=$((n + 1)); else failed=1; fi
+  done < <(look_keys)
+  # What the look's extensions stored; one the user had before is theirs.
+  for e in ubuntu-dock@ubuntu.com:dash-to-dock ding@rastersoft.com:ding \
+           tiling-assistant@ubuntu.com:tiling-assistant ubuntu-appindicators@ubuntu.com:appindicator; do
+    look_installed_ext "${e%%:*}" || continue
+    dir="/org/gnome/shell/extensions/${e#*:}/"
+    hit=0
+    for key in $(user_dconf list "$dir"); do
+      in_word_list "${dir}${key}" "$EXTENSION_OWN_KEYS" && continue
+      if dconf reset -f "${dir}${key}" 2>/dev/null; then hit=1; else failed=1; fi
+    done
+    n=$((n + hit))
+  done
+  enable_look_extensions; st=$?
+  case $st in
+    "$RC_CHANGED") n=$((n + 1)) ;;
+    "$RC_FAILED")  failed=1 ;;
+  esac
+  # The stage adds Ctrl+Alt+T to the user's own shortcuts again.
+  rm -f "$TERMINAL_SHORTCUT_RECORD"
+  if [ "$n" -gt 0 ]; then
+    STATUS_CHANGES+=("${n} of your own settings reset to the look's defaults; they are saved in ${saved}")
+    # shellcheck disable=SC2012
+    ls -1t "${BACKUP_DIR}"/settings-before-reset-*.ini 2>/dev/null | tail -n +11 | xargs -r -d '\n' rm -f --
+  else
+    # Nothing was changed: the copy holds nothing a later look would need.
+    rm -f "$saved"
+    STATUS_NOCHANGE+=("None of your own settings differed from the look's defaults")
+  fi
+  [ "$failed" -eq 0 ] || STATUS_FAILED+=("Some of your settings could not be reset — run this again from your desktop")
+  return 0
+}
+
 # Save the fingerprint that later runs and --refresh compare against.
 save_release_state() {
   local tmp rc="$RC_FAILED"
@@ -4334,13 +4421,13 @@ show_help() {
   if [ -f "$SCRIPT_FILE" ]; then
     sed -n '/^# Usage/,/^# ====/{/^# ====/d;s/^# \{0,1\}//;p}' "$SCRIPT_FILE"
   else
-    echo "Usage: bash ubuntu-look.sh [--refresh | --uninstall | --help]"
+    echo "Usage: bash ubuntu-look.sh [--refresh | --reset | --uninstall | --help]"
     echo "Save the script to a file and run --help there for the options."
   fi
 }
 
 # Read the command line, the only place that does. Sets:
-#   ACTION   what this run does: install, refresh or uninstall
+#   ACTION   what this run does: install, refresh, reset or uninstall
 #   REFRESH  1 for --refresh
 # --help wins over everything after it.
 parse_args() {
@@ -4350,9 +4437,9 @@ parse_args() {
   for arg in "$@"; do
     case "$arg" in
       -h|--help) show_help; exit 0 ;;
-      --refresh|--uninstall)
+      --refresh|--reset|--uninstall)
         [ -z "$action" ] || [ "$action" = "${arg#--}" ] \
-          || error "Give only one of --refresh and --uninstall."
+          || error "Give only one of --refresh, --reset and --uninstall."
         action="${arg#--}" ;;
       --download|--offline|--prepare-upgrade)
         error "${arg} is no longer part of this script. See: bash ubuntu-look.sh --help" ;;
@@ -4734,30 +4821,41 @@ look_installed_ext() {
 
 # --- Uninstall: per-user steps -----------------------------------------------
 
-# The look's extensions run from Ubuntu's session mode, which goes with the
-# session; one a user turned off in the Extensions app leaves the disabled
-# list, as on Debian. The user's other entries stay; empty goes back to
-# Debian's default (unset).
-step_extensions() {
-  step "Tidying the extension lists..."
-  need_session "extension lists not changed" || return
-  local stored_dis was_dis e2 dis=""
-  stored_dis="$(user_dconf_read /org/gnome/shell/disabled-extensions)"
-  was_dis="$(array_items "$stored_dis")"
-  for e2 in $was_dis; do
-    in_word_list "$e2" "$SHELL_EXTENSIONS" || dis="${dis} ${e2}"
+# Take the look's extensions off this user's list of disabled extensions;
+# their other entries stay, and an empty list goes back to Debian's default
+# (unset). Returns RC_CHANGED, RC_UNCHANGED or RC_FAILED.
+enable_look_extensions() {
+  local stored was e dis=""
+  stored="$(user_dconf_read /org/gnome/shell/disabled-extensions)"
+  was="$(array_items "$stored")"
+  for e in $was; do
+    in_word_list "$e" "$SHELL_EXTENSIONS" || dis="${dis} ${e}"
   done
   dis="$(echo "$dis" | xargs)"
   # A changed list, or an explicit empty one ("@as []"), which Debian leaves unset.
-  if [ "$dis" != "$(echo "$was_dis" | xargs)" ] \
-     || { [ -z "$dis" ] && [ -n "$stored_dis" ]; }; then
-    if [ -z "$dis" ]; then
-      dconf reset /org/gnome/shell/disabled-extensions
-    else
-      dconf write /org/gnome/shell/disabled-extensions "$(gvariant_string_array "$dis")"
-    fi && DONE+=("The look's extensions left your list of disabled extensions") \
-       || { USER_PENDING=1; GUESSED+=("Could not write disabled-extensions"); }
+  if [ "$dis" = "$(echo "$was" | xargs)" ] && { [ -n "$dis" ] || [ -z "$stored" ]; }; then
+    return "$RC_UNCHANGED"
   fi
+  if [ -z "$dis" ]; then
+    dconf reset /org/gnome/shell/disabled-extensions 2>/dev/null || return "$RC_FAILED"
+  else
+    dconf write /org/gnome/shell/disabled-extensions "$(gvariant_string_array "$dis")" 2>/dev/null \
+      || return "$RC_FAILED"
+  fi
+  return "$RC_CHANGED"
+}
+
+# The look's extensions run from Ubuntu's session mode, which goes with the
+# session; one a user turned off in the Extensions app leaves the disabled
+# list, as on Debian.
+step_extensions() {
+  step "Tidying the extension lists..."
+  need_session "extension lists not changed" || return
+  enable_look_extensions; local st=$?
+  case $st in
+    "$RC_CHANGED") DONE+=("The look's extensions left your list of disabled extensions") ;;
+    "$RC_FAILED")  USER_PENDING=1; GUESSED+=("Could not write disabled-extensions") ;;
+  esac
   return 0
 }
 
@@ -5718,7 +5816,8 @@ uninstall_summary() {
 # 9. Install
 ###############################################################################
 
-# The install; --refresh joins it once its updates are accepted.
+# The install; --refresh joins it once its updates are accepted. A plain run
+# and --reset also reset the user's settings, in the desktop stage.
 run_install() {
   local category
   install_start
@@ -5744,8 +5843,8 @@ run_install() {
   install_finish
 }
 
-# Say what the run does and ask; --refresh lists its updates and asks instead.
-# Takes the run lock.
+# Say what the run does and ask; --refresh lists its updates and asks instead,
+# and --reset says what it resets. Takes the run lock.
 install_start() {
   if [ "$REFRESH" = 1 ]; then
     if [ ! -f "$PACKAGES_BEFORE" ]; then
@@ -5762,14 +5861,36 @@ install_start() {
     discover_releases "$UBUNTU_CODENAME"
     # Lists the updates and asks; returns only to apply them.
     refresh_check
+  elif [ "$ACTION" = reset ]; then
+    [ -f "$PACKAGES_BEFORE" ] \
+      || error "The Ubuntu look is not installed. Install it with: bash ubuntu-look.sh"
+    have_session \
+      || error "--reset changes your settings: run it from a terminal in your desktop session, with dconf-cli installed."
+    message "${GREEN}ubuntu-look --reset${ENDCOLOR}: puts the look back as after its first install."
+    message ""
+    message "For ${YELLOW}${RUN_USER}${ENDCOLOR}: your own values of the look's settings (themes, fonts,"
+    message "wallpaper, window buttons, keybindings, terminal colours, power, the dock"
+    message "and the look's other extensions) are reset, so the Ubuntu session shows"
+    message "Ubuntu's defaults. They are saved first in ${BACKUP_DIR}."
+    message "The Ubuntu session is chosen for your next login."
+    message "For everyone: the session, login screen, apt pin and boot splash are"
+    message "written again where they differ."
+    message "Your files, folders, installed apps and other settings are not touched."
+    message ""
+    confirm_continue
+    sudo -v || error "User ${RUN_USER} cannot use sudo."
+    take_run_lock
   else
     message "${GREEN}ubuntu-look${ENDCOLOR}: makes Debian GNOME look and behave like Ubuntu."
     message ""
-    message "Adds an ${YELLOW}Ubuntu${ENDCOLOR} session to the login screen for every user; the first"
-    message "install chooses it for ${YELLOW}${RUN_USER}${ENDCOLOR}."
-    message "Your own settings are not changed; where you set none, the Ubuntu session"
-    message "uses Ubuntu's defaults and GNOME keeps Debian's."
-    message "Safe to re-run. Undo with: bash ubuntu-look.sh --uninstall"
+    message "Adds an ${YELLOW}Ubuntu${ENDCOLOR} session to the login screen for every user and chooses"
+    message "it for ${YELLOW}${RUN_USER}${ENDCOLOR}."
+    message "Your own values of the look's settings (themes, fonts, wallpaper, window"
+    message "buttons, keybindings, terminal colours, power, the dock) are reset, so"
+    message "the Ubuntu session shows Ubuntu's defaults; they are saved first in"
+    message "${BACKUP_DIR}. Every run does this; --refresh only updates."
+    message "Your files, folders, installed apps and other settings are not touched."
+    message "Undo with: bash ubuntu-look.sh --uninstall"
     message ""
     confirm_continue
     sudo -v || error "User ${RUN_USER} cannot use sudo."
@@ -6159,13 +6280,13 @@ stage_desktop() {
   message "installing the Show Applications button icon"
   write_app_grid_icon
 
-  # The install chooses the Ubuntu session for this user once; later runs
-  # keep what they pick on the login screen. Only with a usable profile,
+  # A run that resets chooses the Ubuntu session for this user; --refresh
+  # keeps what they pick on the login screen. Only with a usable profile,
   # else dconf has no database.
   _env_ok=0
   if [ "$_profile_ok" -eq 0 ] && [ "$_session_rc" -ne "$RC_FAILED" ]; then
     _env_ok=1
-    if [ ! -f "$SESSION_CHOSEN" ] || [ "$_dropped" -eq 1 ]; then
+    if [ ! -f "$SESSION_CHOSEN" ] || [ "$_dropped" -eq 1 ] || resets_settings; then
       choose_ubuntu_session; _chosen_rc=$?
       case $_chosen_rc in
         "$RC_CHANGED") STATUS_CHANGES+=("Your logins use the Ubuntu session; the login screen's session menu offers GNOME too")
@@ -6186,6 +6307,16 @@ stage_desktop() {
     user_dconf dump / > "${BACKUP_ORIGINAL}/.dconf-dump.ini" \
       && mv "${BACKUP_ORIGINAL}/.dconf-dump.ini" "${BACKUP_ORIGINAL}/dconf-dump.ini"
     rm -f "${BACKUP_ORIGINAL}/.dconf-dump.ini"
+  fi
+  # A plain run and --reset: this user's own values of the look's settings
+  # go, so the session shows Ubuntu's defaults.
+  if [ "$_env_ok" -eq 1 ] && resets_settings; then
+    if have_session; then
+      reset_user_settings
+    else
+      message warn "No desktop session — your own settings are not reset; run this again from your desktop."
+      STATUS_NOCHANGE+=("Your own settings not reset — no desktop session; run this again from your desktop")
+    fi
   fi
   [ "$_env_ok" -eq 1 ] && report_own_settings
   # A user with custom shortcuts of their own gets Ctrl+Alt+T among them.
@@ -6251,8 +6382,8 @@ main() {
   init_run
 
   case "$ACTION" in
-    uninstall)       run_uninstall ;;
-    install|refresh) run_install ;;
+    uninstall)             run_uninstall ;;
+    install|refresh|reset) run_install ;;
   esac
 }
 

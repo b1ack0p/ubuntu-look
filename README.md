@@ -56,7 +56,9 @@ Where it differs from Ubuntu:
    Enter to reboot at once, Ctrl-C to cancel. A run that changed nothing
    does not reboot.
 
-Running it again is safe. To undo it, see [Uninstall](#uninstall).
+Running it again is safe: every run puts the look back as after its first
+install, and saves your settings before it resets them (see
+[Reset](#reset)). To undo the look, see [Uninstall](#uninstall).
 
 ## Requirements
 
@@ -71,8 +73,10 @@ Running it again is safe. To undo it, see [Uninstall](#uninstall).
 ## Usage
 
 ```bash
-bash ubuntu-look.sh                   # install or update
-bash ubuntu-look.sh --refresh         # list updates, then ask
+bash ubuntu-look.sh                   # install or update, and reset your
+                                      # settings to the look's defaults
+bash ubuntu-look.sh --refresh         # list updates, then ask; resets nothing
+bash ubuntu-look.sh --reset           # the same reset, for an installed look
 bash ubuntu-look.sh --uninstall       # undo the look
 bash ubuntu-look.sh --help            # commands and options
 ```
@@ -81,10 +85,12 @@ Run the script from your desktop session. It adds the **Ubuntu** session
 for every user and chooses it for you. Anyone can switch at the login
 screen: select your name, then the gear button, then Ubuntu or GNOME. The
 login screen remembers the choice. The Ubuntu look appears only in the
-Ubuntu session; Debian's GNOME session stays as it was. The script never
-changes your own settings: as on Ubuntu, they apply in both sessions, and
-Ubuntu's defaults fill in only what you have not set yourself. The login
-screen and the boot splash are shared by all users.
+Ubuntu session; Debian's GNOME session keeps Debian's defaults. Each run
+resets your own values of the look's settings, so the Ubuntu session shows
+Ubuntu's defaults; settings you make afterwards apply in both sessions, as
+on Ubuntu, until the next run. `--refresh` updates the look without
+resetting anything. The login screen and the boot splash are shared by all
+users.
 
 ## Options
 
@@ -255,13 +261,15 @@ the Debian packages it replaced.
 
 - **Session:** the login screen offers Ubuntu and Ubuntu on Xorg, next to
   GNOME and GNOME on Xorg. Ubuntu is a Wayland session on Debian's own
-  GNOME Shell and Mutter. The first install chooses it for you; later
-  runs keep what you pick on the login screen.
+  GNOME Shell and Mutter. Each run chooses it for you; `--refresh` keeps
+  what you pick on the login screen.
 - **Settings:** Ubuntu's desktop settings, listed below, as defaults of
-  the Ubuntu session, for every user. Settings you made yourself, such as
-  your own wallpaper or theme, stay and win over Ubuntu's, as on Ubuntu.
-  The summary lists them; `dconf reset` on one takes Ubuntu's value in
-  the Ubuntu session (and Debian's in GNOME).
+  the Ubuntu session, for every user. A run resets the values you set
+  yourself for these settings, such as your own wallpaper or theme, and
+  saves them first (see [Reset](#reset)). Ones you set afterwards win over
+  Ubuntu's, as on Ubuntu; after `--refresh` the summary lists them, and
+  `dconf reset` on one takes Ubuntu's value in the Ubuntu session (and
+  Debian's in GNOME).
 - **Shell theme and extensions:** GNOME Shell starts in Ubuntu's session
   mode, `ubuntu`, as on Ubuntu. The mode loads Yaru and starts the dock,
   tray icons, desktop icons and tiling assistant before anything is
@@ -470,6 +478,41 @@ gnome-extensions prefs ubuntu-dock@ubuntu.com
 - `bash ubuntu-look.sh` applies the same updates without listing them
   first.
 
+## Reset
+
+```bash
+bash ubuntu-look.sh            # install or update, then reset
+bash ubuntu-look.sh --reset    # reset an installed look
+```
+
+Every plain run, the first install included, puts the look back as after
+its first install. `--reset` does the same for a look that is already
+installed, and must be run from a terminal in your desktop session. Both
+say what they will do and ask first. `--refresh` only updates the look and
+resets nothing.
+
+- **For you:** your own values of the look's settings are reset, so the
+  Ubuntu session shows Ubuntu's defaults: themes, fonts, wallpaper, window
+  buttons, keybindings, terminal colours, power settings, and the settings
+  of the dock and the other extensions the look brought. The look's
+  extensions you turned off are on again, the Ubuntu session is chosen for
+  your next login, and Ctrl+Alt+T is added to your own shortcuts again if
+  you removed it. These are your settings in Debian's GNOME session too,
+  which then shows Debian's defaults for them.
+- **For everyone:** the session, login screen, apt pin and boot splash are
+  written again where they differ. The look's boot splash theme is set
+  again over one you chose since, and the kernel command line gets back
+  the words the look added and you took off.
+- **Kept:** your files, folders and installed apps, and every setting the
+  look does not set (favourites, keyboard layouts, app settings). No
+  package is removed.
+
+Your values are saved first, in
+`~/.ubuntu-look-backup/settings-before-reset-<date>.ini` (the newest ten
+are kept); one of them goes back with `dconf write <key> <value>`. Over
+SSH, without your desktop session, a plain run leaves your settings as
+they are and says so.
+
 ## Upgrading Debian
 
 The look's extensions and shell theme fit one GNOME Shell version, and a
@@ -630,7 +673,7 @@ another one. `ubuntu-keyring` stays while another package source uses it.
   that section 1 does not declare. It sources the script, with unset
   variables treated as errors as in a real run, and changes nothing.
 - **Real-run test.** `bash tests/vm-test.sh` runs the script for real in a
-  Debian 13 virtual machine: install, repeat run, `--refresh`, `--uninstall`
+  Debian 13 virtual machine: install, repeat run, `--refresh`, `--reset`, `--uninstall`
   and a second install, with the VM rebooting where the script reboots. It
   checks the Ubuntu session after the install and that the uninstall leaves
   packages, boot settings, apt sources and sessions as they were. It needs

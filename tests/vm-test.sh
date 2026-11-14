@@ -1,7 +1,7 @@
 #!/bin/bash
 # Real-run test of ubuntu-look.sh in a Debian VM: install, repeat run,
-# --refresh, --uninstall and a second install, each for real, with the VM
-# rebooting where the script reboots. Takes about 15 minutes.
+# --refresh, --reset, --uninstall and a second install, each for real, with
+# the VM rebooting where the script reboots. Takes about 20 minutes.
 #
 #   bash tests/vm/make-vm.sh     once: builds the VM (about 25 minutes, 7 GB)
 #   bash tests/vm-test.sh        every run starts from the VM's clean snapshot
@@ -59,6 +59,9 @@ check_look_installed installed
 check "the boot splash theme changed"  eval '! same fresh installed plymouth-theme'
 
 echo "Repeat run and --refresh"
+# What the session's extensions stored by themselves: a repeat run must not
+# count it as the user's own settings.
+in_vm 'dconf dump /org/gnome/shell/extensions/' > "$RUN/extension-settings.txt" 2> /dev/null
 run rerun y "" bash ubuntu-look.sh
 check "a repeat run changes nothing"   said rerun "Nothing changed"
 check "a repeat run does not reboot"   unsaid rerun "Rebooting in"
@@ -66,6 +69,30 @@ run refresh y "" bash ubuntu-look.sh --refresh
 check "--refresh finds nothing to do"  said refresh "up to date"
 state rerun
 check "packages unchanged by both"     same installed rerun packages grub apt-files
+
+echo "--reset, after settings changed by hand"
+in_vm "mkdir -p Documents && echo mine > Documents/notes.txt
+       dconf write /org/gnome/desktop/interface/gtk-theme \"'Adwaita'\"
+       dconf write /org/gnome/desktop/wm/preferences/button-layout \"'close:'\"
+       dconf write /org/gnome/shell/extensions/dash-to-dock/dock-position \"'BOTTOM'\"
+       dconf write /org/gnome/shell/favorite-apps \"['org.gnome.Nautilus.desktop']\""
+check "the settings were changed"      in_vm 'dconf read /org/gnome/desktop/interface/gtk-theme | grep -q Adwaita'
+run reset y "" UBUNTU_LOOK_REBOOT=0 bash ubuntu-look.sh --reset
+check "the reset finished"             said reset "All steps finished"
+check "nothing was left undone"        unsaid reset "Not done"
+check "it reset the user's settings"   said reset "of your own settings reset to the look's defaults"
+check "the theme is the look's again"  in_vm '[ -z "$(dconf read /org/gnome/desktop/interface/gtk-theme)" ]'
+check "the window buttons too"         in_vm '[ -z "$(dconf read /org/gnome/desktop/wm/preferences/button-layout)" ]'
+check "the dock's settings too"        in_vm '[ -z "$(dconf list /org/gnome/shell/extensions/dash-to-dock/)" ]'
+check "Yaru is the GTK theme"          in_vm "DCONF_PROFILE=ubuntu-look dconf read /org/gnome/desktop/interface/gtk-theme | grep -q Yaru"
+check "another setting is kept"        in_vm 'dconf read /org/gnome/shell/favorite-apps | grep -q Nautilus'
+check "the user's file is kept"        in_vm '[ "$(cat Documents/notes.txt)" = mine ]'
+check "the earlier values are saved"   in_vm 'grep -q Adwaita .ubuntu-look-backup/settings-before-reset-*.ini'
+state reset
+check "packages unchanged by the reset" same installed reset packages grub apt-files
+run reset2 y "" UBUNTU_LOOK_REBOOT=0 bash ubuntu-look.sh --reset
+check "a second reset changes nothing" said reset2 "Nothing changed"
+in_vm 'dconf reset /org/gnome/shell/favorite-apps; rm -rf Documents'
 
 echo "Uninstall, Ctrl-C at the countdown"
 boot="$(boot_id)"
