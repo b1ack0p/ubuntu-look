@@ -17,19 +17,35 @@
 cd "$(dirname -- "${BASH_SOURCE[0]}")/../.." || exit 1
 # shellcheck disable=SC1091
 . tests/vm/lib.sh
-need_tools curl cpio gzip ssh-keygen
+need_tools curl cpio gzip ssh-keygen sha256sum
 RELEASE="${UBUNTU_LOOK_VM_RELEASE:-trixie}"
 mkdir -p "$VM"
 if [ "$RELEASE" = trixie ]; then need_free_space 10240; else need_free_space 16384; fi
 REPO="$PWD"
 [ -f "$OVMF_VARS" ] || { echo "missing: $OVMF_VARS (package ovmf)" >&2; exit 2; }
 [ ! -e "$VM/disk.qcow2" ] || { echo "$VM already holds a VM; delete the folder to build a new one." >&2; exit 2; }
+case "$RELEASE" in *[!a-z]*|"") echo "UBUNTU_LOOK_VM_RELEASE is not a Debian codename: $RELEASE" >&2; exit 2 ;; esac
+# However the build ends, the VM does not stay running and holding its port.
+trap 'stop_vm' EXIT
 
-INSTALLER=https://deb.debian.org/debian/dists/trixie/main/installer-amd64/current/images/netboot/debian-installer/amd64
+IMAGES=https://deb.debian.org/debian/dists/trixie/main/installer-amd64/current/images
+INSTALLER_PATH=netboot/debian-installer/amd64
+INSTALLER="$IMAGES/$INSTALLER_PATH"
 mkdir -p "$VM" && cd "$VM" || exit 1
 
 echo "Downloading Debian's network installer..."
-curl -fsSLO "$INSTALLER/linux" && curl -fsSLO "$INSTALLER/initrd.gz" || exit 1
+curl -fsSLO "$INSTALLER/linux" && curl -fsSLO "$INSTALLER/initrd.gz" \
+  && curl -fsSL -o installer-SHA256SUMS "$IMAGES/SHA256SUMS" || exit 1
+# Both files as the installer's own list of checksums names them.
+for f in linux initrd.gz; do
+  sum="$(awk -v f="./$INSTALLER_PATH/$f" '$2 == f { print $1 }' installer-SHA256SUMS)"
+  if [ -z "$sum" ] || [ "$(sha256sum "$f" | cut -d' ' -f1)" != "$sum" ]; then
+    echo "The downloaded installer file '$f' does not match Debian's SHA256SUMS." >&2
+    rm -f linux initrd.gz installer-SHA256SUMS
+    exit 1
+  fi
+done
+rm -f installer-SHA256SUMS
 [ -f id_vm ] || ssh-keygen -q -t ed25519 -N '' -C ubuntu-look-test-vm -f id_vm
 
 # The installer's answers. The late command adds the SSH key and switches the
@@ -115,19 +131,30 @@ if ! wait_desktop 400; then
 fi
 if [ "$RELEASE" != trixie ]; then
   echo "Upgrading the VM to ${RELEASE}..."
-  to_vm "$REPO/tests/vm/upgrade.sh"
-  if ! vm_sudo "bash upgrade.sh $RELEASE autoremove" > upgrade.log 2>&1 || ! reboot_vm; then
+  if ! to_vm "$REPO/tests/vm/upgrade.sh" \
+     || ! vm_sudo "bash upgrade.sh $RELEASE autoremove" > upgrade.log 2>&1 || ! reboot_vm; then
     stop_vm
     echo "The upgrade to ${RELEASE} failed; see $VM/upgrade.log. $VM is left for inspection." >&2
     exit 1
   fi
   in_vm 'rm -f upgrade.sh'
 fi
+# The snapshot must hold the release it is named for.
+if ! in_vm ". /etc/os-release; [ \"\$VERSION_CODENAME\" = $RELEASE ]"; then
+  stop_vm
+  echo "The VM does not run ${RELEASE}; $VM is left for inspection." >&2
+  exit 1
+fi
 # The tests' rerun must not meet the screen lock.
-in_vm 'gsettings set org.gnome.desktop.session idle-delay 0; gsettings set org.gnome.desktop.screensaver lock-enabled false'
+if ! in_vm 'gsettings set org.gnome.desktop.session idle-delay 0 && gsettings set org.gnome.desktop.screensaver lock-enabled false'; then
+  stop_vm
+  echo "Could not switch the VM's screen lock off; $VM is left for inspection." >&2
+  exit 1
+fi
 # Give the blocks the install and an upgrade freed back to this machine's disk.
 vm_sudo fstrim -a > /dev/null 2>&1
 stop_vm
+if vm_running; then echo "The VM did not stop; no snapshot was taken." >&2; exit 1; fi
 qemu-img snapshot -c fresh-install disk.qcow2 && cp vars.fd vars-fresh.fd || exit 1
 rm -f linux initrd.gz initrd-preseed.gz
 echo "The ${RELEASE} test VM is ready in $VM ($(du -sh disk.qcow2 | cut -f1)). Run: bash tests/vm-test.sh"

@@ -6,6 +6,10 @@ usage: drive.py <transcript> <y|n> <timeout-seconds> -- command...
 Answers the yes/no prompt with <y|n> and sudo's prompt with $VM_PASSWORD.
 $DRIVE_COUNTDOWN chooses the key sent six seconds into the reboot countdown:
 "enter", "ctrlc", or nothing to let it run out.
+
+Exits 124 when the command did not end in time: it is then sent Ctrl-C through
+its terminal, which reaches the remote command too, before it is stopped.
+Otherwise exits 0; the command's own status is in the transcript's last line.
 """
 import os
 import pty
@@ -19,6 +23,7 @@ command = sys.argv[5:]
 password = os.environ.get("VM_PASSWORD", "")
 key = {"enter": b"\n", "ctrlc": b"\x03"}.get(os.environ.get("DRIVE_COUNTDOWN", ""))
 key_at = None
+timed_out = False
 
 pid, fd = pty.fork()
 if pid == 0:
@@ -29,8 +34,19 @@ start = time.time()
 with open(out_path, "wb") as log:
     while True:
         if time.time() - start > timeout:
-            os.kill(pid, 15)
+            timed_out = True
             log.write(b"\n### drive.py: TIMEOUT\n")
+            # Over ssh -tt a kill would end only the local end; Ctrl-C on the
+            # terminal stops the command at the far end as well.
+            try:
+                os.write(fd, b"\x03")
+                time.sleep(5)
+            except OSError:
+                pass
+            try:
+                os.kill(pid, 15)
+            except ProcessLookupError:
+                pass
             break
         if key and key_at and time.time() >= key_at:
             os.write(fd, key)
@@ -57,3 +73,4 @@ with open(out_path, "wb") as log:
             buf = b""
     _, status = os.waitpid(pid, 0)
     log.write(b"\n### drive.py: exit %d\n" % os.waitstatus_to_exitcode(status))
+sys.exit(124 if timed_out else 0)

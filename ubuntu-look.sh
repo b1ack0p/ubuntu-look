@@ -1,7 +1,7 @@
 #!/bin/bash
 # =============================================================================
 # Title       : ubuntu-look.sh
-# Version     : 1.0
+# Version     : 1.1
 # Description : Makes Debian GNOME look and behave like the newest Ubuntu
 #               release that fits the installed GNOME Shell, without
 #               breaking Debian: Yaru themes, Ubuntu fonts and wallpapers,
@@ -15,13 +15,13 @@
 # Usage       : bash ubuntu-look.sh                   install or update, and reset your
 #                                                     settings to the look's defaults
 #               bash ubuntu-look.sh --refresh         list available updates, then ask
-#                                                     to apply them
+#                                                     to apply them and repair the look;
+#                                                     your settings are not touched
 #               bash ubuntu-look.sh --reset           the same for an installed look, from
 #                                                     your desktop session
 #               bash ubuntu-look.sh --uninstall       undo it, from your desktop session
-#               bash ubuntu-look.sh --help            this text
-#               Safe to re-run: each run saves your settings before it
-#               resets them.
+#               bash ubuntu-look.sh --help            this text (also -h)
+#               Safe to re-run.
 #
 # Options     : UBUNTU_CODENAME=<name>        use this Ubuntu release
 #               UBUNTU_INCLUDE_DEVEL=1        allow the unreleased series
@@ -34,7 +34,7 @@
 #               UBUNTU_LOOK_REBOOT=0          no automatic reboot at the end
 #               UBUNTU_LOOK_ANIMATIONS=0|1    animation effects off or on for
 #                                             this user (default: unchanged)
-#               An install run saves the first five; later runs reuse them
+#               A finished run saves the first five; later runs reuse them
 #               unless given again, e.g. UBUNTU_CODENAME=auto.
 #
 # Upgrading   : Before a Debian release upgrade, run --uninstall; upgrade and
@@ -48,19 +48,24 @@
 #
 # Refresh     : --refresh lists what an update would change: a newer Ubuntu
 #               release, a Debian or GNOME Shell change, newer builds of the
-#               look's packages. It asks before applying anything.
+#               look's packages. It asks, then applies the updates and
+#               writes the look's system files again where they differ. It
+#               resets none of your settings.
 #
 # Reset       : A plain run and --reset put the look back as after its first
 #               install: your own values of the look's settings are reset,
 #               so the Ubuntu session shows Ubuntu's defaults, and the look's
-#               system files are written again where they differ. Your
-#               values are saved first; your files, folders, installed apps
-#               and other settings are not touched. --reset does it for a
-#               look already installed; --refresh only updates and resets
+#               system files are written again where they differ. The
+#               values you had are not kept; your files, folders, installed
+#               apps and other settings are not touched. --reset does it for
+#               a look already installed; --refresh only updates and resets
 #               nothing.
 #
-# Undo        : bash ubuntu-look.sh --uninstall removes the session and the
-#               system changes, and resets the settings of the user running it.
+# Undo        : bash ubuntu-look.sh --uninstall removes the session, everything
+#               the script installed and its system changes, and puts the
+#               look's settings of the user running it back to Debian's
+#               defaults: Debian's own GNOME, as before. Your files, folders,
+#               apps and other settings are kept.
 #
 # Requires    : Debian with GNOME; a normal user (not root) with sudo rights;
 #               internet access.
@@ -87,7 +92,7 @@
 # Values a run works out (options, architecture, mirror) are set by init_run.
 
 # This script's version; the run log's first line shows it.
-UBUNTU_LOOK_VERSION="1.0"
+UBUNTU_LOOK_VERSION="1.1"
 
 # This script's file; empty when it is read from a pipe (curl ... | bash).
 SCRIPT_FILE="${BASH_SOURCE[0]:-}"
@@ -111,8 +116,9 @@ RC_BUSY=5        # not tried: another program holds apt's lock
 UBUNTU_SOURCES=/etc/apt/sources.list.d/ubuntu-themes.sources
 UBUNTU_PIN=/etc/apt/preferences.d/ubuntu-themes
 
-# Records. System records are shared by all users and root-owned in SYS_DIR;
-# per-user records stay in the user's home.
+# Records. They are shared by all users and root-owned in SYS_DIR; nothing
+# is kept in a user's home beside the run logs, which a finished uninstall
+# removes.
 SYS_DIR=/var/lib/ubuntu-look
 SYS_RECORDS="${SYS_DIR}/records"
 SAVED_OPTIONS="${SYS_DIR}/options"
@@ -121,6 +127,11 @@ PACKAGES_BEFORE="${SYS_RECORDS}/packages-before.txt"
 CONFIG_FILES_BEFORE="${SYS_RECORDS}/config-files-before.txt"
 # System packages that Ubuntu's combined extensions package replaced.
 REPLACED_BY_COMBINED="${SYS_RECORDS}/replaced-by-combined.txt"
+# The users whose settings an uninstall has reset; a later run of an
+# unfinished uninstall does not ask them for a desktop session again.
+SETTINGS_RESET_USERS="${SYS_RECORDS}/settings-reset-users.txt"
+# Where packages put GNOME Shell extensions.
+SYSTEM_EXT_DIR=/usr/share/gnome-shell/extensions
 MANUAL_BEFORE="${SYS_RECORDS}/manual-before.txt"
 INSTALLED_MANIFEST="${SYS_RECORDS}/installed-by-script.txt"
 # "<package> <version it replaced>", one per line.
@@ -158,18 +169,16 @@ INITRAMFS_PENDING="${SYS_RECORDS}/initramfs-pending"
 # Set when update-initramfs rebuilt only the newest kernel; the summaries say so.
 INITRAMFS_PARTIAL=0
 INITRAMFS_PARTIAL_NOTE="update-initramfs failed for some kernels; only the newest was rebuilt — fix the others, then run: sudo update-initramfs -u -k all"
-BACKUP_DIR="${HOME:-}/.ubuntu-look-backup"
-# Copies of system records an unfinished uninstall keeps for a later run.
-DCONF_PROFILE_COPY="${BACKUP_DIR}/dconf-system-profile.ini"
-MANIFEST_COPY="${BACKUP_DIR}/look-packages.txt"
-# This user's pre-install settings snapshot.
-BACKUP_ORIGINAL="${BACKUP_DIR}/original"
-# Present once the install chose the Ubuntu session for this user.
-SESSION_CHOSEN="${BACKUP_DIR}/session-chosen"
+# The look keeps nothing in a user's home beside its run logs, until the
+# uninstall. Version 1.0
+# kept a folder of records there; the uninstall removes one it finds.
+LEGACY_BACKUP_DIR="${HOME:-}/.ubuntu-look-backup"
+# Ubuntu's defaults as the uninstall withdrew them: its reference for the
+# user's settings until they are reset.
+LOOK_DEFAULTS_COPY="${SYS_RECORDS}/look-defaults.ini"
 # GNOME's list of custom shortcuts, and the look's terminal shortcut in it.
 CUSTOM_KEYBINDINGS_KEY="/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings"
 TERMINAL_SHORTCUT_PATH="${CUSTOM_KEYBINDINGS_KEY}/ubuntu-look-terminal/"
-TERMINAL_SHORTCUT_RECORD="${BACKUP_DIR}/terminal-shortcut-added"
 # The options an install run saves: those that pick the Ubuntu release, then
 # the boot options.
 RELEASE_OPTION_NAMES="UBUNTU_CODENAME UBUNTU_INCLUDE_DEVEL UBUNTU_MIRROR"
@@ -244,9 +253,40 @@ YARU_SHELL_THEME="/usr/share/gnome-shell/theme/Yaru/gnome-shell-theme.gresource"
 APT_HOOK="/usr/local/lib/ubuntu-look/after-apt.sh"
 APT_HOOK_CONF="/etc/apt/apt.conf.d/99ubuntu-look"
 THEME_EXT_UUID="ubuntu-look-theme@ubuntu-look"
-# The session mode's extensions, where installed: the theme extension, then
-# Ubuntu's in the order of its mode; only some releases ship the last.
+# The look's extensions: the theme extension, then Ubuntu's in the order of
+# its session mode; only some releases ship the last. Every extension the
+# look may have brought, for the steps that tidy up after them.
 SHELL_EXTENSIONS="${THEME_EXT_UUID} ubuntu-dock@ubuntu.com ubuntu-appindicators@ubuntu.com ding@rastersoft.com tiling-assistant@ubuntu.com web-search-provider@ubuntu.com"
+# The extensions the session mode lists, where installed. read_ubuntu_style
+# sets them to those of the Ubuntu release's own session mode, less
+# Canonical's services (the extensions named @canonical.com: snapd's and
+# others that need Canonical's software); until then, the list above.
+MODE_EXTENSIONS="$SHELL_EXTENSIONS"
+# The session mode's stylesheet and theme resource; read_ubuntu_style sets
+# them to those of the release's own session mode.
+MODE_STYLESHEET="Yaru/gnome-shell.css"
+MODE_THEME_RESOURCE="theme/Yaru/gnome-shell-theme.gresource"
+# What read_ubuntu_style finds in the release's other packages, each with
+# the script's own value until then. The standard fontconfig files Ubuntu
+# enables (empty: not read, and the script's own rule for sub-pixel
+# rendering is used); the key combination of Ubuntu's terminal shortcut;
+# the name and comment of Ubuntu's session entry.
+UBUNTU_FONT_CONFS=""
+TERMINAL_BINDING="<Primary><Alt>t"
+SESSION_NAME="Ubuntu"
+SESSION_COMMENT="This session logs you into Ubuntu"
+# "<key>: <value>" lines of the above, with the release, for a run that
+# cannot read the release again.
+UBUNTU_EXTRAS_RECORD="${SYS_RECORDS}/ubuntu-session-extras.txt"
+# fontconfig's files: all it ships, and those this system has enabled.
+FONTCONFIG_AVAIL=/usr/share/fontconfig/conf.avail
+FONTCONFIG_ENABLED=/etc/fonts/conf.d
+# Look packages Ubuntu's own desktop depends on in the pinned release that
+# the lists above do not name; set by adopt_release_look_packages.
+ADOPTED_PACKAGES=""
+# Yaru's GTK 3 theme, compiled; it carries the colours Ubuntu's terminal
+# takes from the theme (yaru_terminal_colours reads them).
+YARU_GTK_RESOURCE=/usr/share/themes/Yaru/gtk-3.0/gtk.gresource
 
 # Ubuntu's defaults live in their own dconf database, read only in the Ubuntu
 # session: its DCONF_PROFILE adds it after the system's databases.
@@ -319,8 +359,13 @@ ENSURE_VERSION=""
 declare -a SETTINGS_KEPT=()
 # Set by need_reboot, and by init_run for a reboot an earlier run still owes.
 REBOOT_NEEDED=0
+# 1 while the reboot is owed by an earlier run of this boot only; such a run
+# names the command and starts no countdown.
+REBOOT_CARRIED=0
 # Seconds the automatic reboot waits; REBOOT_CANCELLED is set by its Ctrl-C.
 REBOOT_COUNTDOWN=60
+# Set by the uninstall: 1 when the look's records were there as it began.
+HAD_RECORDS=0
 REBOOT_CANCELLED=0
 RELOGIN_NEEDED=0
 STEP=0
@@ -385,6 +430,9 @@ DEBIAN_BUILD=""
 # The copy of /etc/default/grub a failed update left behind; the caller
 # reports it.
 GRUB_BACKUP_KEPT=""
+# The boot loader's name, where systemd-boot started the system.
+SYSTEMD_BOOT_LOADER_INFO=/sys/firmware/efi/efivars/LoaderInfo-4a67b082-0a4c-41cf-b6c7-440b29bb8c4f
+GRUB_FILE=/etc/default/grub
 # GRUB_CMDLINE_LINUX_DEFAULT's line in /etc/default/grub.
 GRUB_KEY_RE='^[[:space:]]*(export[[:space:]]+)?GRUB_CMDLINE_LINUX_DEFAULT='
 # Set by strip_grub_words: the words this script added.
@@ -397,6 +445,9 @@ TERMINAL_DEFAULT_PROFILE="org/gnome/terminal/legacy/profiles:/:b1dcc9dd-5262-4d8
 # tap-to-click stays for older GNOME, whose default is off.
 GNOME_SETTINGS=(
   "org/gnome/shell|always-show-log-out|true"
+  # Ubuntu 26.10 on: the session starts on the desktop, not in the overview.
+  # A GNOME Shell without the key ignores it.
+  "org/gnome/shell|start-in-overview|false"
   "org/gnome/desktop/session|session-name|'ubuntu'"
   "org/gnome/desktop/background|show-desktop-icons|true"
 
@@ -481,7 +532,59 @@ WALLPAPER_KEYS=(
   "org/gnome/desktop/screensaver|picture-uri"
 )
 
-# Ubuntu leaves the colour scheme at GNOME's default: the light style.
+# The style the Ubuntu release starts in, read by read_ubuntu_style from
+# that release's own packages on every run: the style its session mode
+# names for the shell, and the color-scheme its settings package sets as the
+# session's default (empty: none, so GNOME's own default applies). The
+# session mode, the look's database and the reset follow them. The values
+# here stand in until a release has been read. The uninstall goes back to
+# Debian's default whatever they are.
+UBUNTU_COLOR_SCHEME=prefer-light
+UBUNTU_COLOR_SCHEME_SETTING=""
+# "<codename> <shell style> <setting, or ->": what read_ubuntu_style found,
+# for a run that cannot read the release again.
+UBUNTU_STYLE_RECORD="${SYS_RECORDS}/ubuntu-style.txt"
+# Ubuntu's own defaults file in its ubuntu-settings package, and the copy
+# of the pinned release's kept on record: its first line names the release.
+# Every run takes the values of GNOME_SETTINGS from it (apply_release_settings),
+# so a default an Ubuntu release changes is followed; the values in
+# GNOME_SETTINGS stand in where the file cannot be read or sets none.
+UBUNTU_DEFAULTS_PATH=./usr/share/glib-2.0/schemas/10_ubuntu-settings.gschema.override
+UBUNTU_DEFAULTS_RECORD="${SYS_RECORDS}/ubuntu-defaults.override"
+# Set by read_ubuntu_style: the release's defaults file for this run; empty
+# when there is none to read.
+UBUNTU_DEFAULTS=""
+# Set once apply_release_settings has run.
+RELEASE_SETTINGS_APPLIED=0
+# Set by apply_release_settings: "<key>|<value>" lines of the release's
+# defaults for the login screen's interface settings.
+GREETER_DEFAULTS=""
+# Set by fit_fonts_to_release when the installed fonts carry Ubuntu's older
+# names ("Ubuntu", not "Ubuntu Sans").
+FONTS_OLD_NAMES=0
+# Ubuntu's defaults the look leaves out on purpose, as "<schema>.<key>" or
+# "<schema>.*"; one of them that GNOME_SETTINGS lists keeps the script's
+# value. Canonical's services and apps (favourites, web search, key server,
+# update notifier):
+UBUNTU_DEFAULTS_LEFT_OUT="org.gnome.shell.favorite-apps org.gnome.Epiphany.* org.gnome.crypto.pgp.*"
+UBUNTU_DEFAULTS_LEFT_OUT+=" com.ubuntu.update-notifier.* org.gnome.rhythmbox.encoding-settings.*"
+# Ubuntu's logo: on the login screen, and as the on-screen keyboard's Super key.
+UBUNTU_DEFAULTS_LEFT_OUT+=" org.gnome.login-screen.logo org.onboard.key-label-overrides"
+# Apps, extensions and desktops Debian's GNOME does not have.
+UBUNTU_DEFAULTS_LEFT_OUT+=" org.gnome.Empathy.conversation.* org.gnome.nautilus.desktop.*"
+UBUNTU_DEFAULTS_LEFT_OUT+=" org.gnome.shell.extensions.desktop-icons.* com.canonical.unity.*"
+UBUNTU_DEFAULTS_LEFT_OUT+=" org.gnome.settings-daemon.plugins.print-notifications.*"
+UBUNTU_DEFAULTS_LEFT_OUT+=" org.gnome.settings-daemon.plugins.background.*"
+# The wallpaper, which WALLPAPER_KEYS sets from the wallpaper package.
+UBUNTU_DEFAULTS_LEFT_OUT+=" org.gnome.desktop.background.picture-uri org.gnome.desktop.background.picture-uri-dark"
+UBUNTU_DEFAULTS_LEFT_OUT+=" org.gnome.desktop.screensaver.picture-uri"
+# The window manager keys Debian's GNOME Shell sets to the same values for
+# every GNOME session, the Ubuntu one included.
+UBUNTU_DEFAULTS_LEFT_OUT+=" org.gnome.mutter.*"
+# Defaults only later Ubuntu releases set. With the release's file read,
+# one of these it does not set is not applied: the look is that release's.
+UBUNTU_DEFAULTS_LATER="org.gnome.shell.start-in-overview"
+UBUNTU_DEFAULTS_LATER+=" org.gnome.settings-daemon.plugins.housekeeping.donation-reminder-enabled"
 COLOR_SCHEME_KEY="org/gnome/desktop/interface|color-scheme"
 
 # What the last install run was resolved against, for later runs and --refresh.
@@ -560,6 +663,7 @@ sys_record_append() {
 need_reboot() {
   local id
   REBOOT_NEEDED=1
+  REBOOT_CARRIED=0
   [ -d "$SYS_RECORDS" ] || return 0
   id="$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)"
   [ -n "$id" ] || return 0
@@ -589,7 +693,9 @@ option_value_ok() {
     UBUNTU_INCLUDE_DEVEL|UBUNTU_BOOT_SPLASH) [[ "$2" =~ ^[01]$ ]] ;;
     PLYMOUTH_THEME) [[ "$2" =~ ^[A-Za-z0-9._+-]+$ ]] ;;
     # One URL for the source's URIs line; empty means the default mirror.
-    UBUNTU_MIRROR) [ -z "$2" ] || [[ "$2" =~ ^https?://[][A-Za-z0-9._:/+~%@-]+$ ]] ;;
+    # No user name or password: the URL is shown in the run log and stored
+    # in files every user can read.
+    UBUNTU_MIRROR) [ -z "$2" ] || [[ "$2" =~ ^https?://[][A-Za-z0-9._:/+~%-]+$ ]] ;;
     *) return 0 ;;
   esac
 }
@@ -881,7 +987,9 @@ take_run_lock() {
   { exec 9< "$UBUNTU_LOOK_LOCK"; } 2>/dev/null || error "$fail"
   if ! flock -n 9; then
     message "another ubuntu-look run is in progress — waiting for it to finish"
-    flock 9 || error "$fail"
+    # Not for ever: the lock file is readable by every user.
+    flock -w 1800 9 \
+      || error "The other ubuntu-look run still holds ${UBUNTU_LOOK_LOCK} after 30 minutes — nothing is changed; run this again when it has finished."
   fi
   require_dpkg_ready
 }
@@ -942,12 +1050,8 @@ apt_get() {
   fi
 }
 
-# True when $1 was installed before the first install: per the system record,
-# else the copy an unfinished uninstall keeps in BACKUP_DIR.
-predates_install() {
-  grep -qxF "$1" "$PACKAGES_BEFORE" 2>/dev/null \
-    || { [ ! -f "$PACKAGES_BEFORE" ] && grep -qxF "$1" "${BACKUP_DIR}/packages-before.txt" 2>/dev/null; }
-}
+# True when $1 was installed before the first install, per the system record.
+predates_install() { grep -qxF "$1" "$PACKAGES_BEFORE" 2>/dev/null; }
 
 # Back to automatically installed, if it was before. One the user added
 # later keeps its mark.
@@ -992,7 +1096,11 @@ combined_carries_dock() {
 # Use the combined extensions package where the pinned release offers it.
 use_combined_extensions_if_offered() {
   local stage="2-desktop-gnome" p list=""
-  if combined_carries_dock "$(pkg_candidate_version "$COMBINED_EXT_PKG")"; then
+  # Only a build that installs here: one that does not fit the installed
+  # GNOME Shell must not take the place of the separate packages.
+  if combined_carries_dock "$(pkg_candidate_version "$COMBINED_EXT_PKG")" \
+     && { is_installed "$COMBINED_EXT_PKG" \
+          || ALLOWED_REMOVALS="$SEPARATE_EXT_PKGS" installs_cleanly "$COMBINED_EXT_PKG"; }; then
     for p in ${packages[$stage]}; do
       in_word_list "$p" "$SEPARATE_EXT_PKGS" || list="${list} ${p}"
     done
@@ -1060,11 +1168,15 @@ apt_install_checked() {
   PLANNED_REPLACED=""
 }
 
+# True when the apt cache has a build of $1; a name that other packages only
+# provide has none, though apt-cache show succeeds for it.
+has_real_package() { apt-cache show "$1" 2>/dev/null | grep -q '^Package: '; }
+
 # Keep only packages available in the apt cache.
 available_packages() {
   local avail="" pkg
   for pkg in $1; do
-    apt-cache show "$pkg" >/dev/null 2>&1 && avail="$avail $pkg"
+    has_real_package "$pkg" && avail="$avail $pkg"
   done
   echo "${avail# }"
 }
@@ -1120,7 +1232,7 @@ explain_blocked() {
   local pkg="$1" ver="${2:-}" have sim rem dep out=""
   [ -z "$ver" ] && ver="$(pkg_candidate_version "$pkg")"
   if [ -z "$ver" ]; then
-    if apt-cache show "$pkg" >/dev/null 2>&1; then
+    if has_real_package "$pkg"; then
       echo "apt has no candidate for it — every build it can see is blocked by ${UBUNTU_PIN}"
     else
       echo "no configured repository offers a package by that name"
@@ -1147,7 +1259,7 @@ explain_blocked() {
       | grep -oE '(Pre)?Depends: [^ ]+( \([^)]*\))? but ' \
       | awk '{print $2}' | sort -u); do
     if [ -z "$(pkg_candidate_version "$dep")" ] \
-       && apt-cache show "$dep" >/dev/null 2>&1; then
+       && has_real_package "$dep"; then
       out="${out} ${dep} (Ubuntu-only, blocked by ${UBUNTU_PIN})"
     else
       out="${out} ${dep}"
@@ -1165,7 +1277,7 @@ explain_blocked() {
 #   RC_UNCHANGED  already at the newest version that fits
 #   RC_FAILED     nothing on offer can be installed here
 ensure_package() {
-  local pkg="$1" have ver log rc busy
+  local pkg="$1" have ver log rc busy log_fd log_pid
   ENSURE_VERSION=""
   have="$(pkg_installed_version "$pkg")"
 
@@ -1181,8 +1293,12 @@ ensure_package() {
     log="$(mktemp)" || error "Could not create a temporary file — nothing more is changed; run this again."
     # Run here, not in a pipeline subshell, so its records reach the summary;
     # C locale so the messages below can be read.
-    LC_ALL=C apt_install_checked "${pkg}=${ver}" > >(tee "$log") 2>&1; rc=$?
-    wait $! 2>/dev/null
+    # The copy to the log is waited for by its own process id: the install
+    # starts other background readers, which would replace $!.
+    exec {log_fd}> >(tee "$log"); log_pid=$!
+    LC_ALL=C apt_install_checked "${pkg}=${ver}" >&"$log_fd" 2>&1; rc=$?
+    exec {log_fd}>&-
+    wait "$log_pid" 2>/dev/null
     # A busy apt, a lost network or an interrupted dpkg says nothing about
     # the build: stop here.
     busy=0
@@ -1214,6 +1330,8 @@ ubuntu_devel_codename() {
   local memo="${UBUNTU_RELEASE_CACHE:+${UBUNTU_RELEASE_CACHE}.devel}"
   local m out code link="" known=0 list last cn="" tried=""
   if [ -n "$memo" ] && [ -f "$memo" ]; then cat "$memo"; return 0; fi
+  # A failed lookup is not repeated for every release of the run.
+  if [ -n "$memo" ] && [ -f "${memo}-unread" ]; then return "$RC_FAILED"; fi
   for m in "${UBUNTU_MIRROR:-}" "${UBUNTU_DEFAULT_MIRROR:-}"; do
     if [ -z "$m" ] || [ "$m" = "$tried" ]; then continue; fi
     tried="$m"
@@ -1232,7 +1350,10 @@ ubuntu_devel_codename() {
   list="$(curl -fsSL -m 15 "${UBUNTU_META_RELEASE}-development" 2>/dev/null \
     | awk '/^Dist:/ { d = $2 } /^Supported:/ { if (d != "") print d, $2; d = "" }')"
   [ -z "$list" ] || known=1
-  [ "$known" -eq 1 ] || return "$RC_FAILED"
+  if [ "$known" -ne 1 ]; then
+    [ -z "$memo" ] || : > "${memo}-unread"
+    return "$RC_FAILED"
+  fi
   if [ -n "$link" ] && ! grep -qx "${link} 1" <<< "$list"; then
     cn="$link"
   elif [ -n "$list" ]; then
@@ -1272,7 +1393,9 @@ ubuntu_release_info() {
       state=stable
       # Every retired release was published.
       if [ "$mirror" != "${UBUNTU_OLD_MIRROR:-}" ]; then
-        devel="$(ubuntu_devel_codename)" || { unread=1; continue; }
+        # Unknown which series is in development: the release cannot be
+        # told from an unreleased one, and no other mirror would tell.
+        devel="$(ubuntu_devel_codename)" || return "$RC_FAILED"
         [ "$devel" = "$cn" ] && state=devel
       fi
       out="${out} ${state} ${mirror}"
@@ -1420,6 +1543,10 @@ ensure_prereqs() {
 
 # Report on stderr that release $1 could not be read from the archive.
 release_unread() {
+  if [ -f "${UBUNTU_RELEASE_CACHE:-/nonexistent}.devel-unread" ]; then
+    message error "Could not find out which Ubuntu series is in development, so Ubuntu ${1} cannot be told from an unreleased one: neither ${UBUNTU_DEFAULT_MIRROR:-archive.ubuntu.com} nor ${UBUNTU_META_RELEASE%/*} answered — check the connection, then run this again." >&2
+    return
+  fi
   message error "Could not read Ubuntu ${1} from the archive — check the connection, then run this again." >&2
 }
 
@@ -1503,7 +1630,7 @@ write_ubuntu_sources() {
       # The host that answered; a retired release is on old-releases.
       _m="$(ubuntu_mirror_for "$_c")"; _rc_m=$?
       if [ "$_rc_m" -ne 0 ] || [ -z "$_m" ]; then
-        if [ "$_rc_m" -eq 2 ]; then
+        if [ "$_rc_m" -eq "$RC_FAILED" ]; then
           message warn "could not reach the archive for Ubuntu '${_c}' — leaving it out of the apt source" >&2
         else
           message warn "no archive serves Ubuntu '${_c}' — leaving it out of the apt source" >&2
@@ -1527,7 +1654,7 @@ write_ubuntu_sources() {
      || { [ -n "${UBUNTU_CODENAME:-}" ] && [ "$UBUNTU_CODENAME" != auto ] \
           && in_word_list "$UBUNTU_CODENAME" "$_missing"; }; then
     rm -f "$tmp"
-    STATUS_FAILED+=("Ubuntu apt sources left as they were — no archive answered${_missing:+ for:${_missing}}")
+    STATUS_FAILED+=("Ubuntu apt sources left as they were — not reached or not published${_missing:+:${_missing}}")
     return "$RC_FAILED"
   fi
 
@@ -1656,7 +1783,7 @@ drop_unserved_universe() {
   [ -n "$pairs" ] || return 1
   local tmp cn m dropped=""
   tmp="$(mktemp)" || return 1
-  cp "$UBUNTU_SOURCES" "$tmp"
+  cp "$UBUNTU_SOURCES" "$tmp" || { rm -f "$tmp"; return 1; }
   # Only those releases' stanzas go to main.
   while read -r cn m; do
     source_on_main "$tmp" "$cn" "$m" > "${tmp}.new" && mv -f "${tmp}.new" "$tmp"
@@ -1920,15 +2047,24 @@ check_shell_coupling_drift() {
 pinned_codename() { sed -n 's/^Pin: release o=Ubuntu, n=//p' "$UBUNTU_PIN" 2>/dev/null | head -1; }
 
 # Without a pin, write one that blocks every Ubuntu package. Returns
-# RC_CHANGED, RC_UNCHANGED (a pin exists) or RC_FAILED.
+# RC_CHANGED, RC_UNCHANGED (a pin exists) or RC_FAILED. A file that does not
+# block Ubuntu's packages (empty, cut short) is no pin and is written anew.
 write_provisional_pin() {
-  [ ! -f "$UBUNTU_PIN" ] || return "$RC_UNCHANGED"
+  local tmp rc
+  if grep -qx 'Pin: release o=Ubuntu.*' "$UBUNTU_PIN" 2>/dev/null \
+     && grep -qx 'Pin-Priority: -1' "$UBUNTU_PIN" 2>/dev/null; then
+    return "$RC_UNCHANGED"
+  fi
+  tmp="$(mktemp)" || return "$RC_FAILED"
   printf '%s\n' \
     "# provisional — written before the Ubuntu sources, replaced once the codename resolves" \
     "Package: *" \
     "Pin: release o=Ubuntu" \
-    "Pin-Priority: -1" | sudo_tee "$UBUNTU_PIN" \
-    || { sudo rm -f "$UBUNTU_PIN"; return "$RC_FAILED"; }
+    "Pin-Priority: -1" > "$tmp"
+  rc="$RC_CHANGED"
+  sudo_write_atomic "$tmp" "$UBUNTU_PIN" || { sudo rm -f "$UBUNTU_PIN"; rc="$RC_FAILED"; }
+  rm -f "$tmp"
+  return "$rc"
 }
 
 # The per-release wallpaper packs that the pinned release's ubuntu-wallpapers
@@ -2180,8 +2316,13 @@ mask_session_migration() {
 choose_ubuntu_session() {
   local user
   user="/org/freedesktop/Accounts/User$(id -u)"
-  [ "$(busctl get-property org.freedesktop.Accounts "$user" org.freedesktop.Accounts.User \
-        Session 2>/dev/null)" = "s \"${SHELL_MODE_NAME}\"" ] && return "$RC_UNCHANGED"
+  # Any of the session's entries counts: one picked on the login screen
+  # ("Ubuntu on Xorg", say) stays.
+  case "$(busctl get-property org.freedesktop.Accounts "$user" org.freedesktop.Accounts.User \
+            Session 2>/dev/null)" in
+    "s \"${SHELL_MODE_NAME}\""|"s \"${SHELL_MODE_NAME}-wayland\""|"s \"${SHELL_MODE_NAME}-xorg\"")
+      return "$RC_UNCHANGED" ;;
+  esac
   sudo busctl call org.freedesktop.Accounts "$user" org.freedesktop.Accounts.User \
     SetSession s "$SHELL_MODE_NAME" >/dev/null 2>&1 || return "$RC_FAILED"
 }
@@ -2210,16 +2351,16 @@ extension_active() { LC_ALL=C gnome-extensions info "$1" 2>/dev/null | grep -qE 
 # installed for everyone.
 session_mode_content() {
   local e list=""
-  for e in $SHELL_EXTENSIONS; do
+  for e in $MODE_EXTENSIONS; do
     [ -d "/usr/share/gnome-shell/extensions/$e" ] || [ -d "${LOCAL_EXT_DIR}/$e" ] \
       && list="${list:+${list},}"$'\n'"        \"${e}\""
   done
   cat << MODE
 {
     "parentMode": "user",
-    "stylesheetName": "Yaru/gnome-shell.css",
-    "themeResourceName": "theme/Yaru/gnome-shell-theme.gresource",
-    "colorScheme": "prefer-light",
+    "stylesheetName": "${MODE_STYLESHEET}",
+    "themeResourceName": "${MODE_THEME_RESOURCE}",
+    "colorScheme": "${UBUNTU_COLOR_SCHEME}",
     "enabledExtensions": [${list}
     ]
 }
@@ -2231,6 +2372,28 @@ MODE
 # Inside the session only, "none" becomes "rgb"; a value an app sets itself
 # stays.
 session_fonts_content() {
+  local name includes=""
+  # Ubuntu enables other standard fontconfig files than Debian (sub-pixel
+  # rendering "rgb" where Debian has "none"). Those Debian ships and has
+  # not enabled are read first inside the session: they append their
+  # values, and the first one counts.
+  for name in $UBUNTU_FONT_CONFS; do
+    [ -e "${FONTCONFIG_ENABLED}/${name}" ] && continue
+    [ -f "${FONTCONFIG_AVAIL}/${name}" ] || continue
+    includes="${includes}  <include ignore_missing=\"yes\">${FONTCONFIG_AVAIL}/${name}</include>"$'\n'
+  done
+  if [ -n "$UBUNTU_FONT_CONFS" ]; then
+    cat << FONTS
+<?xml version="1.0"?>
+<!DOCTYPE fontconfig SYSTEM "urn:fontconfig:fonts.dtd">
+<!-- Written by ubuntu-look.sh; its uninstall removes this file. The
+     standard fontconfig files Ubuntu enables and Debian does not. -->
+<fontconfig>
+${includes}  <include>/etc/fonts/fonts.conf</include>
+</fontconfig>
+FONTS
+    return 0
+  fi
   cat << 'FONTS'
 <?xml version="1.0"?>
 <!DOCTYPE fontconfig SYSTEM "urn:fontconfig:fonts.dtd">
@@ -2358,8 +2521,8 @@ write_session() {
     dest="/usr/local/share/${src#/usr/share/}"; dest="${dest%/*}/${f}"
     mkdir -p "${tmp}${dest%/*}"
     { echo "# Written by ubuntu-look.sh; removed by its uninstall."
-      sed -e '/^\(Name\|Comment\)\[/d' -e 's/^Name=GNOME/Name=Ubuntu/' \
-          -e 's/^Comment=.*/Comment=This session logs you into Ubuntu/' \
+      sed -e '/^\(Name\|Comment\)\[/d' -e "s/^Name=GNOME/Name=${SESSION_NAME}/" \
+          -e "s/^Comment=.*/Comment=${SESSION_COMMENT}/" \
           -e "s#^Exec=.*#Exec=env ${SESSION_ENV} /usr/bin/gnome-session --session=${SHELL_MODE_NAME}#" \
           -e "s/^DesktopNames=.*/DesktopNames=${SHELL_MODE_NAME};GNOME/" "$src"
     } > "${tmp}${dest}"
@@ -2385,14 +2548,19 @@ write_session() {
     rm -rf "$tmp"
     return "$RC_FAILED"
   fi
+  # Debian's session files the Ubuntu session is made from: without them the
+  # session could not start, so nothing of it is written.
+  for f in /usr/share/gnome-session/sessions/gnome.session \
+           /usr/lib/systemd/user/gnome-session@gnome.target.d/gnome.session.conf; do
+    [ -f "$f" ] || { rm -rf "$tmp"; return "$RC_FAILED"; }
+  done
   # The hook before what it guards, and its apt entry last.
   if [ -f "$APT_HOOK" ] && cmp -s "${tmp}/hook" "$APT_HOOK"; then r="$RC_UNCHANGED"
   elif sudo_write_atomic "${tmp}/hook" "$APT_HOOK" 0755; then r="$RC_CHANGED"
   else r="$RC_FAILED"; fi
   rc=$r
   for f in "${tmp}/mode:${SHELL_MODE_FILE}" "${tmp}/fonts:${SESSION_FONTS_CONF}" \
-           "${tmp}/end:${SESSION_END_SCRIPT}" "${tmp}/unset:${SESSION_MANAGER_DROPIN}" \
-           $pairs "${tmp}/conf:${APT_HOOK_CONF}"; do
+           "${tmp}/end:${SESSION_END_SCRIPT}" "${tmp}/unset:${SESSION_MANAGER_DROPIN}"; do
     [ "$rc" = "$RC_FAILED" ] && break
     sudo_install_if_changed "${f%%:*}" "${f#*:}"; r=$?
     [ "$r" = "$RC_CHANGED" ] && rc="$RC_CHANGED"
@@ -2421,6 +2589,15 @@ write_session() {
     [ "$(readlink "$dest" 2>/dev/null)" = "$src" ] && continue
     if sudo ln -sfn "$src" "$dest"; then rc="$RC_CHANGED"; else rc="$RC_FAILED"; fi
   done
+  # The login screen's entries last, once the session they name can start;
+  # then the hook's apt entry.
+  # shellcheck disable=SC2086
+  for f in $pairs "${tmp}/conf:${APT_HOOK_CONF}"; do
+    [ "$rc" = "$RC_FAILED" ] && break
+    sudo_install_if_changed "${f%%:*}" "${f#*:}"; r=$?
+    [ "$r" = "$RC_CHANGED" ] && rc="$RC_CHANGED"
+    [ "$r" = "$RC_FAILED" ] && rc="$RC_FAILED"
+  done
   rm -rf "$tmp"
   return "$rc"
 }
@@ -2433,18 +2610,441 @@ fit_fonts_to_release() {
   local i major
   if command -v fc-list >/dev/null 2>&1 && ! fc-list -q 'Ubuntu Sans' \
      && fc-list -q 'Ubuntu'; then
+    FONTS_OLD_NAMES=1
     for i in "${!GNOME_SETTINGS[@]}"; do
       GNOME_SETTINGS[i]="${GNOME_SETTINGS[i]//Ubuntu Sans Mono/Ubuntu Mono}"
       GNOME_SETTINGS[i]="${GNOME_SETTINGS[i]//Ubuntu Sans/Ubuntu}"
     done
     return 0
   fi
+  # With the release's own defaults read, its sizes are in place already.
+  [ -z "$UBUNTU_DEFAULTS" ] || return 0
   # Ubuntu's monospace size by release: 11 with GNOME 49 and later, 13 before.
   major="$(shell_major)"
   [ "${major:-0}" -ge 49 ] || return 0
   for i in "${!GNOME_SETTINGS[@]}"; do
     GNOME_SETTINGS[i]="${GNOME_SETTINGS[i]//Ubuntu Sans Mono 13/Ubuntu Sans Mono 11}"
   done
+}
+
+# File $2 of the package file $1, on stdout.
+deb_file() { dpkg-deb --fsys-tarfile "$1" 2>/dev/null | tar -xO "$2" 2>/dev/null; }
+
+# The style a GNOME Shell session mode on stdin names; empty when it names
+# none or one that is no style.
+mode_color_scheme() {
+  sed -n 's/.*"colorScheme"[[:space:]]*:[[:space:]]*"\(prefer-light\|prefer-dark\|default\)".*/\1/p' | head -n 1
+}
+
+# The value of string key $1 in a GNOME Shell session mode on stdin; only a
+# plain file or resource name is taken.
+mode_string() {
+  sed -n "s/.*\"${1}\"[[:space:]]*:[[:space:]]*\"\([A-Za-z0-9._/-]*\)\".*/\1/p" | head -n 1
+}
+
+# The extensions a GNOME Shell session mode on stdin enables, in its order.
+mode_extensions() {
+  tr -d '\n' | sed -n 's/.*"enabledExtensions"[[:space:]]*:[[:space:]]*\[\([^]]*\)\].*/\1/p' \
+    | grep -oE '"[A-Za-z0-9._-]+@[A-Za-z0-9._-]+"' | tr -d '"' | xargs
+}
+
+# The color-scheme a settings override file on stdin sets for the Ubuntu
+# session: its own section's, else the one for every session. Empty when it
+# sets none; "default" is GNOME's own and reads as none.
+override_color_scheme() {
+  awk '
+    /^\[/ { s = 0
+            if ($0 == "[org.gnome.desktop.interface]") s = 1
+            if ($0 == "[org.gnome.desktop.interface:ubuntu]") s = 2
+            next }
+    s && /^color-scheme[ \t]*=/ {
+      v = $0; sub(/^[^=]*=[ \t]*/, "", v); gsub(/[\047" \t]/, "", v)
+      if (s >= best) { best = s; out = v } }
+    END { if (out == "prefer-light" || out == "prefer-dark") print out }'
+}
+
+# Ubuntu's defaults for session $2 (default: ubuntu) in defaults file $1, as
+# "<schema> <key> <value>" lines: the keys of the sections for every session
+# and of that session's own, the latter winning. Other sessions' sections
+# are not read.
+ubuntu_defaults() {
+  awk -v ses=":${2:-ubuntu}" '
+    /^[ \t]*#/ || /^[ \t]*$/ { next }
+    /^[ \t]*\[/ {
+      sec = $0; gsub(/^[ \t]*\[|\][ \t]*$/, "", sec); rank = 0
+      if (sec !~ /:/) rank = 1
+      else if (substr(sec, length(sec) - length(ses) + 1) == ses) {
+        rank = 2; sec = substr(sec, 1, length(sec) - length(ses)) }
+      next }
+    rank && /^[ \t]*[A-Za-z][A-Za-z0-9-]*[ \t]*=/ {
+      k = $0; sub(/[ \t]*=.*/, "", k); gsub(/^[ \t]+/, "", k)
+      v = $0; sub(/^[^=]*=[ \t]*/, "", v); sub(/[ \t]+$/, "", v)
+      id = sec " " k
+      if (!(id in r)) order[++n] = id
+      if (!(id in r) || rank >= r[id]) { r[id] = rank; val[id] = v } }
+    END { for (i = 1; i <= n; i++) print order[i], val[order[i]] }' "$1" 2>/dev/null
+}
+
+# Value $1 of a defaults file as dconf prints it: strings in single quotes.
+gvariant_canon() { printf '%s\n' "$1" | sed "s/\"\([^\"']*\)\"/'\1'/g"; }
+
+# The kind of value $1: string, bool, number or strings (a list of them);
+# empty for anything else. A value of the release's is taken only when it
+# is of the kind the look's own value has, so no release can write a
+# defaults database that does not compile.
+gvariant_kind() {
+  local s="'[^']*'"
+  if   [[ "$1" =~ ^${s}$ ]]; then echo string
+  elif [[ "$1" =~ ^(true|false)$ ]]; then echo bool
+  elif [[ "$1" =~ ^-?[0-9]+(\.[0-9]+)?$ ]]; then echo number
+  elif [[ "$1" =~ ^\[[[:space:]]*(${s}([[:space:]]*,[[:space:]]*${s})*)?[[:space:]]*\]$ ]]; then echo strings
+  fi
+}
+
+# True when value $1 can go into a dconf database: one of the kinds above,
+# or anything dconf's own compiler accepts.
+gvariant_valid() {
+  local d rc=1
+  [ -z "$(gvariant_kind "$1")" ] || return 0
+  [ -n "$1" ] && command -v dconf > /dev/null 2>&1 || return 1
+  d="$(mktemp -d)" || return 1
+  mkdir "${d}/db.d" && printf '[check]\nvalue=%s\n' "$1" > "${d}/db.d/check" \
+    && dconf compile "${d}/db" "${d}/db.d" > /dev/null 2>&1 && rc=0
+  rm -rf "$d"
+  return "$rc"
+}
+
+# The schema whose keys are stored under dconf path $1.
+schema_of_path() {
+  case "$1" in
+    org/gtk/settings/file-chooser) echo org.gtk.Settings.FileChooser ;;
+    org/gnome/terminal/legacy)     echo org.gnome.Terminal.Legacy.Settings ;;
+    *) echo "${1//\//.}" ;;
+  esac
+}
+
+# Give each setting in GNOME_SETTINGS the value the pinned Ubuntu release
+# sets for it (UBUNTU_DEFAULTS); one the release does not set, or sets to
+# something of another kind, keeps the script's value. Then list what the
+# release sets and the look does not apply. Once per run, before anything
+# is written from GNOME_SETTINGS.
+apply_release_settings() {
+  [ "$RELEASE_SETTINGS_APPLIED" = 1 ] && return 0
+  RELEASE_SETTINGS_APPLIED=1
+  [ -s "$UBUNTU_DEFAULTS" ] || return 0
+  local i j path key value schema new kind defaults followed=0 applied="" extra="" id line paths="" one installed=""
+  local -a fresh=() rebuilt=()
+  defaults="$(ubuntu_defaults "$UBUNTU_DEFAULTS")"
+  [ -n "$defaults" ] || return 0
+  for i in "${!GNOME_SETTINGS[@]}"; do
+    IFS='|' read -r path key value <<< "${GNOME_SETTINGS[i]}"
+    schema="$(schema_of_path "$path")"
+    applied="${applied} ${schema}.${key}"
+    paths="${paths} ${schema}=${path}"
+    in_word_list "${schema}.${key}" "$UBUNTU_DEFAULTS_LEFT_OUT" && continue
+    new="$(awk -v s="$schema" -v k="$key" '$1 == s && $2 == k { sub(/^[^ ]+ [^ ]+ /, ""); print; exit }' <<< "$defaults")"
+    if [ -z "$new" ]; then
+      # A later release's default: not part of this release's look.
+      in_word_list "${schema}.${key}" "$UBUNTU_DEFAULTS_LATER" && unset "GNOME_SETTINGS[$i]"
+      continue
+    fi
+    new="$(gvariant_canon "$new")"
+    kind="$(gvariant_kind "$new")"
+    if [ -z "$kind" ] || [ "$kind" != "$(gvariant_kind "$value")" ]; then
+      message warn "Ubuntu ${UBUNTU_CODENAME} sets ${key} to ${new}, which this script cannot take — keeping ${value}"
+      continue
+    fi
+    [ "${new// /}" != "${value// /}" ] || continue
+    GNOME_SETTINGS[i]="${path}|${key}|${new}"
+    followed=$((followed + 1))
+    message "  Ubuntu ${UBUNTU_CODENAME} sets ${key} to ${new} (this script's own value: ${value})"
+  done
+  [ "$followed" -eq 0 ] || message "${followed} of Ubuntu ${UBUNTU_CODENAME}'s defaults differ from this script's own and are followed"
+  # What the release sets beside: new in it, or not known to this script.
+  applied="${applied} ${COLOR_SCHEME_KEY//\//.}"; applied="${applied//|/.}"
+  while read -r schema key value; do
+    [ -n "$schema" ] || continue
+    id="${schema}.${key}"
+    in_word_list "$id" "$applied" && continue
+    in_word_list "$id" "$UBUNTU_DEFAULTS_LEFT_OUT" && continue
+    # A "<prefix>.*" entry covers every schema below the prefix.
+    for line in $UBUNTU_DEFAULTS_LEFT_OUT; do
+      case "$line" in *.\*) case "$id" in "${line%\*}"*) continue 2 ;; esac ;; esac
+    done
+    # A default new in this release: Ubuntu's look or behaviour for its
+    # session, so it is applied. One whose value this script cannot take
+    # is only reported.
+    path=""
+    for one in $paths; do [ "${one%%=*}" != "$schema" ] || { path="${one#*=}"; break; }; done
+    # A schema the look sets no key of: its path as this system has it.
+    # One this Debian does not have is for software that is not here.
+    if [ -z "$path" ]; then
+      [ -n "$installed" ] || installed="$(gsettings list-schemas --print-paths 2>/dev/null) -"
+      path="$(awk -v s="$schema" '$1 == s && $2 ~ /^\/.*\/$/ { print substr($2, 2, length($2) - 2); exit }' <<< "$installed")"
+      if [ -z "$path" ]; then
+        message "  Ubuntu ${UBUNTU_CODENAME} also sets ${id}, for software this Debian does not have — not applied"
+        continue
+      fi
+    fi
+    new="$(gvariant_canon "$value")"
+    # Of a kind the script knows, or of any kind where it is as Ubuntu
+    # wrote it and dconf's compiler takes it.
+    [ -n "$(gvariant_kind "$new")" ] || new="$value"
+    if [ -n "$path" ] && gvariant_valid "$new"; then
+      fresh+=("${path}|${key}|${new}")
+      message "  Ubuntu ${UBUNTU_CODENAME} also sets ${id} to ${new} — applied"
+      continue
+    fi
+    extra="${extra} ${id}"
+  done <<< "$defaults"
+  # Each new default goes behind the last setting of its path.
+  if [ "${#fresh[@]}" -gt 0 ]; then
+    for i in "${!GNOME_SETTINGS[@]}"; do rebuilt+=("${GNOME_SETTINGS[i]}"); done
+    for line in "${fresh[@]}"; do
+      j=-1
+      for i in "${!rebuilt[@]}"; do [ "${rebuilt[i]%%|*}" != "${line%%|*}" ] || j="$i"; done
+      # A path the look had no setting of goes last.
+      [ "$j" -ge 0 ] || j=$((${#rebuilt[@]} - 1))
+      rebuilt=("${rebuilt[@]:0:j+1}" "$line" "${rebuilt[@]:j+1}")
+    done
+    GNOME_SETTINGS=("${rebuilt[@]}")
+  fi
+  # The wallpaper files the release names for the Ubuntu session.
+  for key in picture-uri picture-uri-dark; do
+    new="$(awk -v k="$key" '$1 == "org.gnome.desktop.background" && $2 == k { sub(/^[^ ]+ [^ ]+ /, ""); print; exit }' <<< "$defaults")"
+    new="$(gvariant_canon "$new")"; new="${new#\'file://}"; new="${new%\'}"
+    [[ "$new" =~ ^/usr/share/backgrounds/[A-Za-z0-9._+-]+$ ]] || continue
+    if [ "$key" = picture-uri ]; then WP_LIGHT="$new"; else WP_DARK="$new"; fi
+  done
+  # The login screen's own values for its theme and fonts.
+  GREETER_DEFAULTS="$(ubuntu_defaults "$UBUNTU_DEFAULTS" GNOME-Greeter \
+    | awk '$1 == "org.gnome.desktop.interface" { k = $2; sub(/^[^ ]+ [^ ]+ /, ""); print k "|" $0 }')"
+  if [ -n "$extra" ]; then
+    for line in $extra; do message "  not applied by the look: ${line}"; done
+    # shellcheck disable=SC2086
+    STATUS_NOCHANGE+=("Ubuntu ${UBUNTU_CODENAME} sets $(printf '%s\n' $extra | wc -l) default(s) whose value this script cannot take, not applied:${extra}")
+  fi
+  return 0
+}
+
+# Take into the look the packages Ubuntu's own desktop depends on in the
+# pinned release that the script's lists do not name: themes, fonts,
+# wallpapers and shell extensions new in a release. Each is taken only
+# when apt can install the release's build without removing anything;
+# it then joins the pin and the desktop stage. Called before the pin is
+# written. One that does not install here is named in the summary.
+adopt_release_look_packages() {
+  local cn="${UBUNTU_CODENAME:-}" p ver dep known more=""
+  ADOPTED_PACKAGES=""
+  [ -n "$cn" ] && [ "$cn" != auto ] || return 0
+  known="${UBUNTU_PINNED_PACKAGES} ${ALL_STAGE_PACKAGES:-} ${SEPARATE_EXT_PKGS} ${COMBINED_EXT_PKG}"
+  for p in ubuntu-session ubuntu-desktop-minimal; do
+    ver="$(release_build "$p" "$cn")"
+    [ -n "$ver" ] || continue
+    for dep in $(LC_ALL=C apt-cache show "${p}=${ver}" 2>/dev/null \
+        | sed -n 's/^\(Depends\|Recommends\): //p' | tr ',|' '\n\n' | awk '{ print $1 }' | sort -u); do
+      case "$dep" in
+        yaru-theme-*|fonts-ubuntu*|ubuntu-wallpapers*|gnome-shell-extension-*) ;;
+        *) continue ;;
+      esac
+      [[ "$dep" =~ ^[a-z0-9][a-z0-9.+-]*$ ]] || continue
+      in_word_list "$dep" "${known} ${more} ${ADOPTED_PACKAGES}" && continue
+      ver="$(release_build "$dep" "$cn")"
+      if [ -n "$ver" ] && ALLOWED_REMOVALS="" installs_cleanly "${dep}=${ver}"; then
+        ADOPTED_PACKAGES="${ADOPTED_PACKAGES} ${dep}"
+        message "  Ubuntu ${cn}'s desktop also uses ${dep} — added to the look"
+      else
+        more="${more} ${dep}"
+      fi
+    done
+  done
+  if [ -n "$ADOPTED_PACKAGES" ]; then
+    UBUNTU_PINNED_PACKAGES="${UBUNTU_PINNED_PACKAGES}${ADOPTED_PACKAGES}"
+    packages[2-desktop-gnome]="${packages[2-desktop-gnome]}${ADOPTED_PACKAGES}"
+    ALL_STAGE_PACKAGES="$(printf '%s ' "${packages[@]}" | xargs -n1 | sort -u | xargs)"
+  fi
+  [ -z "$more" ] \
+    || STATUS_NOCHANGE+=("Ubuntu ${cn}'s desktop also uses look packages that do not install on this Debian:${more}")
+  return 0
+}
+
+# The packages the pin admits from the pinned release, as the pin has them.
+pin_packages() { sed -n 's/^Package: //p' "$UBUNTU_PIN" 2>/dev/null | sed -n 2p | xargs; }
+
+# Give gnome-terminal's default profile the colours Ubuntu's terminal takes
+# from the installed Yaru theme (its rule for the terminal's screen), in
+# place of the script's own. Ubuntu's terminal reads them from the theme;
+# Debian's cannot, so the profile carries them.
+yaru_terminal_colours() {
+  local css rule bg fg i path key value new
+  command -v gresource > /dev/null 2>&1 && [ -f "$YARU_GTK_RESOURCE" ] || return 0
+  css="$(gresource list "$YARU_GTK_RESOURCE" 2>/dev/null | grep -m 1 '/gtk-dark\.css$')"
+  [ -n "$css" ] || return 0
+  rule="$(gresource extract "$YARU_GTK_RESOURCE" "$css" 2>/dev/null \
+    | awk '/^terminal-window \.terminal-screen \{/ { f = 1; next } f { print } f && /\}/ { exit }')"
+  bg="$(printf '%s\n' "$rule" | sed -n 's/^[[:space:]]*background-color:[[:space:]]*\(#[0-9A-Fa-f]\{6\}\);.*/\1/p' | head -n 1)"
+  fg="$(printf '%s\n' "$rule" | sed -n 's/^[[:space:]]*color:[[:space:]]*\([#A-Za-z0-9]*\);.*/\1/p' | head -n 1)"
+  case "$fg" in white) fg="#FFFFFF" ;; black) fg="#000000" ;; esac
+  [[ "$fg" =~ ^#[0-9A-Fa-f]{6}$ ]] || fg=""
+  if [ -n "${bg}${fg}" ]; then
+    message "terminal colours read from the Yaru theme: background ${bg:-not given}, text ${fg:-not given}"
+  else
+    message "the Yaru theme names no terminal colours — this script's own are used"
+  fi
+  for i in "${!GNOME_SETTINGS[@]}"; do
+    IFS='|' read -r path key value <<< "${GNOME_SETTINGS[i]}"
+    [ "$path" = "$TERMINAL_DEFAULT_PROFILE" ] || continue
+    case "$key" in
+      background-color) new="$bg" ;;
+      foreground-color) new="$fg" ;;
+      *) continue ;;
+    esac
+    [ -n "$new" ] && [ "'${new}'" != "$value" ] || continue
+    GNOME_SETTINGS[i]="${path}|${key}|'${new}'"
+    message "  Yaru's terminal ${key} is ${new} (this script's own value: ${value})"
+  done
+  return 0
+}
+
+# Read the style the pinned Ubuntu release starts in from that release's
+# own packages, which are downloaded and read, never installed:
+# gnome-shell-common carries Ubuntu's session mode, ubuntu-settings the
+# defaults of the Ubuntu session. Sets UBUNTU_COLOR_SCHEME and
+# UBUNTU_COLOR_SCHEME_SETTING and records them with the release. A release
+# that cannot be read keeps what was recorded for it, else the light style.
+read_ubuntu_style() {
+  local cn="${UBUNTU_CODENAME:-}" tmp p ver f mode="" setting="" got=0 rec said text exts="" e list sheet="" res=""
+  local confs="" binding="" name="" comment="" i
+  [ -n "$cn" ] && [ "$cn" != auto ] || return 0
+  message "reading Ubuntu ${cn}'s own defaults and starting style from its packages"
+  if tmp="$(mktemp -d)"; then
+    for p in gnome-shell-common ubuntu-settings fontconfig-config gnome-settings-daemon-common ubuntu-session; do
+      ver="$(release_build "$p" "$cn")"
+      [ -n "$ver" ] || continue
+      (cd "$tmp" && apt-get download "${p}=${ver}" > /dev/null 2>&1)
+    done
+    for f in "$tmp"/gnome-shell-common_*.deb; do
+      [ -f "$f" ] || continue
+      text="$(deb_file "$f" ./usr/share/gnome-shell/modes/ubuntu.json)"
+      mode="$(printf '%s\n' "$text" | mode_color_scheme)"
+      exts="$(printf '%s\n' "$text" | mode_extensions)"
+      sheet="$(printf '%s\n' "$text" | mode_string stylesheetName)"
+      res="$(printf '%s\n' "$text" | mode_string themeResourceName)"
+    done
+    for f in "$tmp"/ubuntu-settings_*.deb; do
+      [ -f "$f" ] || continue
+      # Read at all, whether or not it sets the key.
+      text="$(deb_file "$f" "$UBUNTU_DEFAULTS_PATH")"
+      [ -n "$text" ] || continue
+      got=1
+      setting="$(printf '%s\n' "$text" | override_color_scheme)"
+      # Kept on record with the release's name, for apply_release_settings
+      # and for a run that cannot read the release again.
+      text="# release: ${cn}
+${text}"
+      [ "$(cat "$UBUNTU_DEFAULTS_RECORD" 2>/dev/null)" = "$text" ] \
+        || sys_record_write "$UBUNTU_DEFAULTS_RECORD" "$text" || true
+    done
+    # The standard fontconfig files Ubuntu enables.
+    for f in "$tmp"/fontconfig-config_*.deb; do
+      [ -f "$f" ] || continue
+      confs="$(dpkg-deb --fsys-tarfile "$f" 2>/dev/null | tar -t 2>/dev/null \
+        | sed -n 's#^\./etc/fonts/conf\.d/\([0-9][0-9]-[A-Za-z0-9._-]*\.conf\)$#\1#p' | xargs)"
+    done
+    # The key combination of Ubuntu's terminal shortcut: the first one its
+    # settings daemon's schema gives the "terminal" key.
+    for f in "$tmp"/gnome-settings-daemon-common_*.deb; do
+      [ -f "$f" ] || continue
+      binding="$(deb_file "$f" ./usr/share/glib-2.0/schemas/org.gnome.settings-daemon.plugins.media-keys.gschema.xml \
+        | awk '/<key name="terminal" type="as">/ { f = 1 } f && /<default>/ { print; exit }' \
+        | sed -e 's/&lt;/</g' -e 's/&gt;/>/g' -e "s/.*<default>\\['\\([^']*\\)'.*/\\1/")"
+      [[ "$binding" =~ ^(\<[A-Za-z0-9_]+\>)+[A-Za-z0-9_]+$ ]] || binding=""
+    done
+    # The name and comment of Ubuntu's session entry.
+    for f in "$tmp"/ubuntu-session_*.deb; do
+      [ -f "$f" ] || continue
+      name="$(deb_file "$f" ./usr/share/wayland-sessions/ubuntu.desktop | sed -n 's/^Name=//p' | head -n 1)"
+      comment="$(deb_file "$f" ./usr/share/wayland-sessions/ubuntu.desktop | sed -n 's/^Comment=//p' | head -n 1)"
+      [[ "$name" =~ ^[A-Za-z0-9\ ._-]{1,40}$ ]] || name=""
+      [[ "$comment" =~ ^[A-Za-z0-9\ ,._-]{1,80}$ ]] || comment=""
+    done
+    rm -rf "$tmp"
+  fi
+  if [ -n "$mode" ] && [ "$got" -eq 1 ]; then
+    UBUNTU_COLOR_SCHEME="$mode"
+    UBUNTU_COLOR_SCHEME_SETTING="$setting"
+    exts="${exts// /,}"
+    rec="${cn} ${mode} ${setting:--} ${exts:--} ${sheet:--} ${res:--}"
+    exts="${exts//,/ }"
+    [ "$(cat "$UBUNTU_STYLE_RECORD" 2>/dev/null)" = "$rec" ] || sys_record_write "$UBUNTU_STYLE_RECORD" "$rec" || true
+    said="read from its packages"
+  else
+    rec="$(cat "$UBUNTU_STYLE_RECORD" 2>/dev/null)"
+    if [ "${rec%% *}" = "$cn" ] && [ -n "${rec#* }" ]; then
+      read -r _ UBUNTU_COLOR_SCHEME UBUNTU_COLOR_SCHEME_SETTING exts sheet res <<< "$rec"
+      [ "$exts" != - ] || exts=""
+      [ "$sheet" != - ] || sheet=""
+      [ "$res" != - ] || res=""
+      exts="${exts//,/ }"
+      [ "$UBUNTU_COLOR_SCHEME_SETTING" != - ] || UBUNTU_COLOR_SCHEME_SETTING=""
+      said="its packages could not be read; as recorded by an earlier run"
+    else
+      said="its packages could not be read; the light style is assumed"
+    fi
+    STATUS_NOCHANGE+=("Ubuntu ${cn}'s starting style not read from its packages — ${said#*; }")
+  fi
+  # What the other packages gave, kept for a run that cannot read them; a
+  # part not read this time comes from the record of the same release.
+  rec="$(cat "$UBUNTU_EXTRAS_RECORD" 2>/dev/null)"
+  [ "$(sed -n 's/^release: //p' <<< "$rec")" = "$cn" ] || rec=""
+  [ -n "$confs" ]   || confs="$(sed -n 's/^fontconfig: //p' <<< "$rec")"
+  [ -n "$binding" ] || binding="$(sed -n 's/^terminal: //p' <<< "$rec")"
+  [ -n "$name" ]    || name="$(sed -n 's/^name: //p' <<< "$rec")"
+  [ -n "$comment" ] || comment="$(sed -n 's/^comment: //p' <<< "$rec")"
+  text="release: ${cn}
+fontconfig: ${confs}
+terminal: ${binding}
+name: ${name}
+comment: ${comment}"
+  [ -z "${confs}${binding}${name}${comment}" ] || [ "$rec" = "$text" ] \
+    || sys_record_write "$UBUNTU_EXTRAS_RECORD" "$text" || true
+  [ -z "$confs" ] || UBUNTU_FONT_CONFS="$confs"
+  [ -z "$name" ] || SESSION_NAME="$name"
+  [ -z "$comment" ] || SESSION_COMMENT="$comment"
+  if [ -n "$binding" ]; then
+    TERMINAL_BINDING="$binding"
+    for i in "${!SESSION_ONLY_SETTINGS[@]}"; do
+      case "${SESSION_ONLY_SETTINGS[i]}" in
+        *"|binding|"*) SESSION_ONLY_SETTINGS[i]="${SESSION_ONLY_SETTINGS[i]%|*}|'${binding}'" ;;
+      esac
+    done
+  fi
+  # The stylesheet and theme resource the release's mode names.
+  [ -z "$sheet" ] || MODE_STYLESHEET="$sheet"
+  [ -z "$res" ] || MODE_THEME_RESOURCE="$res"
+  # The session mode's extensions as the release's own mode lists them,
+  # Canonical's services apart; each is still listed only where installed.
+  if [ -n "$exts" ]; then
+    list="$THEME_EXT_UUID"
+    for e in $exts; do
+      case "$e" in
+        *@canonical.com) message "  Ubuntu ${cn} also enables ${e}, one of Canonical's services — left out" ;;
+        *) list="${list} ${e}"
+           in_word_list "$e" "$SHELL_EXTENSIONS" || SHELL_EXTENSIONS="${SHELL_EXTENSIONS} ${e}" ;;
+      esac
+    done
+    MODE_EXTENSIONS="$list"
+  fi
+  # The release's defaults file, this run's or an earlier one's.
+  UBUNTU_DEFAULTS=""
+  [ "$(head -n 1 "$UBUNTU_DEFAULTS_RECORD" 2>/dev/null)" != "# release: ${cn}" ] \
+    || UBUNTU_DEFAULTS="$UBUNTU_DEFAULTS_RECORD"
+  [ -n "$UBUNTU_DEFAULTS" ] \
+    || STATUS_NOCHANGE+=("Ubuntu ${cn}'s own defaults could not be read — this script's own values are used")
+  apply_release_settings
+  p="${UBUNTU_COLOR_SCHEME_SETTING:-default}"
+  message "Ubuntu ${cn} starts with the shell's style ${UBUNTU_COLOR_SCHEME} and the apps' style ${p} (${said})"
+  return 0
 }
 
 # Render GNOME_SETTINGS and SESSION_ONLY_SETTINGS as dconf keyfile groups.
@@ -2457,6 +3057,9 @@ render_dconf_groups() {
       [ -n "$last_path" ] && echo ""
       echo "[${path}]"
       last_path="$path"
+      # The style Ubuntu's settings set as the session's default, if any.
+      [ "$path" != "${COLOR_SCHEME_KEY%%|*}" ] || [ -z "$UBUNTU_COLOR_SCHEME_SETTING" ] \
+        || echo "${COLOR_SCHEME_KEY#*|}='${UBUNTU_COLOR_SCHEME_SETTING}'"
     fi
     echo "${key}=${value}"
   done
@@ -2476,10 +3079,11 @@ session_on_look_profile() { shell_started_with "DCONF_PROFILE=${LOOK_PROFILE_NAM
 # True when this user's running gnome-shell started in Ubuntu's session mode.
 session_in_look_mode() { shell_started_with "GNOME_SHELL_SESSION_MODE=${SHELL_MODE_NAME}"; }
 
-# The value the look set for the key, from its defaults database.
+# The value the look set for the key, from its defaults database, or from
+# the copy the uninstall keeps of it.
 our_dconf_value() {
   local f
-  for f in "$LOOK_DB_FILE" "$DCONF_PROFILE_COPY"; do
+  for f in "$LOOK_DB_FILE" "$LOOK_DEFAULTS_COPY"; do
     [ -f "$f" ] && { ini_value "$f" "$1" "$2"; return; }
   done
 }
@@ -2957,6 +3561,13 @@ dconf_db_stale() {
 
 # Compile the system dconf databases; a failure is reported for a re-run.
 compile_dconf() {
+  local d
+  # dconf update compiles a database whose directory is newer than it; a
+  # file edited in place leaves the directory's time as it was.
+  for d in /etc/dconf/db/*.d; do
+    [ -d "$d" ] && [ -f "${d%.d}" ] || continue
+    [ -z "$(find "$d" -newer "${d%.d}" -print -quit 2>/dev/null)" ] || sudo touch "$d"
+  done
   sudo dconf update && return 0
   STATUS_FAILED+=("dconf update failed — the new defaults are not in effect; re-run to retry")
   return 1
@@ -3027,6 +3638,22 @@ write_greeter_dconf_profile() {
   fi
 }
 
+# The login screen's value for interface key $1: the one the Ubuntu release
+# sets for its greeter, when it is of the kind of the session's value $2;
+# else that value.
+greeter_value() {
+  local new
+  new="$(awk -F'|' -v k="$1" '$1 == k { sub(/^[^|]*\|/, ""); print; exit }' <<< "$GREETER_DEFAULTS")"
+  new="$(gvariant_canon "$new")"
+  if [ -z "$new" ] || [ "$(gvariant_kind "$new")" != "$(gvariant_kind "$2")" ]; then
+    printf '%s\n' "$2"; return
+  fi
+  if [ "$FONTS_OLD_NAMES" = 1 ]; then
+    new="${new//Ubuntu Sans Mono/Ubuntu Mono}"; new="${new//Ubuntu Sans/Ubuntu}"
+  fi
+  printf '%s\n' "$new"
+}
+
 write_gdm_profile() {
   local wp_light="${1:-}" wp_dark="${2:-}" bg_block="" ext_block=""
   if ! is_installed gdm3; then
@@ -3069,7 +3696,7 @@ enabled-extensions=['${GREETER_EXT_UUID}']"
       org/gnome/desktop/interface/icon-theme|org/gnome/desktop/interface/cursor-theme|\
       org/gnome/desktop/interface/font-name|org/gnome/desktop/interface/monospace-font-name|\
       org/gnome/desktop/interface/font-antialiasing)
-        iface="${iface}${key}=${value}"$'\n' ;;
+        iface="${iface}${key}=$(greeter_value "$key" "$value")"$'\n' ;;
       org/gnome/desktop/sound/theme-name)
         sound="
 [org/gnome/desktop/sound]
@@ -3146,32 +3773,51 @@ normalise_binding() {
 
 # Ubuntu binds Ctrl+Alt+T to the terminal; Debian binds nothing there. The
 # look's settings bind it with a custom shortcut, but a user's own list of
-# custom shortcuts replaces the look's: for this user it is added to theirs,
-# once, so one they remove stays removed. Their own Ctrl+Alt+T wins.
+# custom shortcuts replaces the look's: a run that resets adds it to theirs.
+# Their own Ctrl+Alt+T wins.
+# The shortcut's name, command and keys as the user's own values. The
+# user's list of shortcuts is read in Debian's GNOME session too, where the
+# look's database is not: without these the entry there would be empty.
+# Returns RC_CHANGED, RC_UNCHANGED or RC_FAILED.
+fill_terminal_shortcut() {
+  local line path key val rc="$RC_UNCHANGED"
+  for line in "${SESSION_ONLY_SETTINGS[@]}"; do
+    IFS='|' read -r path key val <<< "$line"
+    [ "/${path}/" = "$TERMINAL_SHORTCUT_PATH" ] || continue
+    [ "$(user_dconf_read "/${path}/${key}")" != "$val" ] || continue
+    if dconf write "/${path}/${key}" "$val" 2>/dev/null; then rc="$RC_CHANGED"; else return "$RC_FAILED"; fi
+  done
+  return "$rc"
+}
+
 add_terminal_shortcut() {
-  local list p want
-  if [ -f "$TERMINAL_SHORTCUT_RECORD" ]; then
-    STATUS_NOCHANGE+=("Ctrl+Alt+T terminal shortcut already added")
-    return 0
-  fi
+  local list p want st
   list="$(user_dconf_read "$CUSTOM_KEYBINDINGS_KEY")"
   [ -n "$list" ] || return 0
   list="$(array_items "$list" | xargs)"
-  if ! in_word_list "$TERMINAL_SHORTCUT_PATH" "$list"; then
-    want="$(normalise_binding '<Primary><Alt>t')"
-    for p in $list; do
-      if [ "$(normalise_binding "$(dconf read "${p}binding" 2>/dev/null)")" = "$want" ]; then
-        STATUS_NOCHANGE+=("Ctrl+Alt+T already runs your own shortcut — left as it is")
-        return 0
-      fi
-    done
-    if ! dconf write "$CUSTOM_KEYBINDINGS_KEY" "$(gvariant_string_array "${list} ${TERMINAL_SHORTCUT_PATH}")" 2>/dev/null; then
-      STATUS_FAILED+=("Ctrl+Alt+T terminal shortcut not added to your shortcuts — re-run to retry")
+  if in_word_list "$TERMINAL_SHORTCUT_PATH" "$list"; then
+    fill_terminal_shortcut; st=$?
+    case $st in
+      "$RC_CHANGED") STATUS_CHANGES+=("Ctrl+Alt+T terminal shortcut among your own shortcuts completed — it shows and works in Debian's GNOME session too") ;;
+      "$RC_FAILED")  STATUS_FAILED+=("Ctrl+Alt+T terminal shortcut among your own shortcuts could not be completed — re-run to retry") ;;
+      *)             STATUS_NOCHANGE+=("Ctrl+Alt+T terminal shortcut already among your own shortcuts") ;;
+    esac
+    return 0
+  fi
+  want="$(normalise_binding "$TERMINAL_BINDING")"
+  for p in $list; do
+    if [ "$(normalise_binding "$(dconf read "${p}binding" 2>/dev/null)")" = "$want" ]; then
+      STATUS_NOCHANGE+=("Ctrl+Alt+T already runs your own shortcut — left as it is")
       return 0
     fi
-    STATUS_CHANGES+=("Ctrl+Alt+T opens the terminal, as on Ubuntu — added to your own shortcuts")
+  done
+  if ! dconf write "$CUSTOM_KEYBINDINGS_KEY" "$(gvariant_string_array "${list} ${TERMINAL_SHORTCUT_PATH}")" 2>/dev/null; then
+    STATUS_FAILED+=("Ctrl+Alt+T terminal shortcut not added to your shortcuts — re-run to retry")
+    return 0
   fi
-  mkdir -p "$BACKUP_DIR" && : > "$TERMINAL_SHORTCUT_RECORD"
+  [ "$(fill_terminal_shortcut; echo $?)" != "$RC_FAILED" ] \
+    || STATUS_FAILED+=("Ctrl+Alt+T terminal shortcut among your own shortcuts could not be completed — re-run to retry")
+  STATUS_CHANGES+=("Ctrl+Alt+T opens the terminal, as on Ubuntu — added to your own shortcuts")
 }
 
 # Write $1 to $2 with its viewBox widened until the artwork covers
@@ -3314,7 +3960,11 @@ has_boot_splash_tools() {
   # systemd-boot, whose command line is /etc/kernel/cmdline.
   dpkg-query -W -f='${db:Status-Status} ${Package}\n' 'grub-pc' 'grub-efi-*' 'grub-ieee1275' \
     'grub-coreboot' 'grub-xen' 'grub-uboot' 2>/dev/null \
-    | grep -qE '^installed grub-(pc|efi-(amd64|arm64|ia32|ia64|arm|riscv64|loong64)|ieee1275|coreboot|xen|uboot)$'
+    | grep -qE '^installed grub-(pc|efi-(amd64|arm64|ia32|ia64|arm|riscv64|loong64)|ieee1275|coreboot|xen|uboot)$' \
+    || return 1
+  # Started by systemd-boot, which says so in an EFI variable, while GRUB's
+  # package is still installed: GRUB's command line is not the one in use.
+  ! tr -d '\0' < "$SYSTEMD_BOOT_LOADER_INFO" 2>/dev/null | grep -q 'systemd-boot'
 }
 
 # Run boot tool $@ through sudo once no dpkg run holds its lock: a dpkg
@@ -3388,13 +4038,19 @@ put_back_plymouth_theme() {
 # unparsable (not safe to rewrite). Strict, because a grub file that no
 # longer parses as shell breaks every later update-grub.
 read_grub_cmdline() {
-  local file=/etc/default/grub line val q body rest
+  local file="$GRUB_FILE" line val q body rest
   # Unreadable is not absent: callers drop their record on absent.
   if [ -e "$file" ] && [ ! -r "$file" ]; then
     printf 'unparsable \n'; return 0
   fi
   [ -r "$file" ] || { printf 'absent \n'; return 0; }
 
+  # An assignment later on a line (after "then", ";" or "&&") is not read
+  # here, and a line added below it would override it.
+  if grep -vE "$GRUB_KEY_RE" "$file" 2>/dev/null | sed -E 's/(^|[[:space:]])#.*$//' \
+       | grep -qE '[;&|({[:space:]]GRUB_CMDLINE_LINUX_DEFAULT\+?='; then
+    printf 'unparsable \n'; return 0
+  fi
   line="$(grep -E "$GRUB_KEY_RE" "$file" 2>/dev/null)"
   if [ -z "$line" ]; then
     if grep -qE "^[[:space:]]*#${GRUB_KEY_RE#^}" "$file" 2>/dev/null; then
@@ -3731,7 +4387,8 @@ add_grub_splash_words() {
   fi
   before="$(tr '\n' ' ' 2>/dev/null < "$GRUB_ADDED_FILE")"
   # A run that resets puts back the words the look added and the user took
-  # off since; one that was off before the first install stays off.
+  # off since; one that was there before the first install and the user took
+  # off since stays off.
   ! resets_settings || before=""
   # The first run records which words were already there, so one the user
   # takes off later is not put back either.
@@ -3803,8 +4460,9 @@ set_plymouth_theme() {
     return 0
   fi
 
-  local current new_record=0 owed_before=0
+  local current new_record=0 owed_before=0 set_before
   current="$(plymouth_current_theme)"
+  set_before="$(cat "$PLYMOUTH_SET_FILE" 2>/dev/null)"
 
   if [ -z "$current" ]; then
     STATUS_NOCHANGE+=("Could not read the current boot splash theme — left as it is")
@@ -3848,8 +4506,14 @@ set_plymouth_theme() {
       need_reboot
     else
       # Drop only records made by this attempt; an older one is the original.
-      [ "$new_record" -eq 1 ] \
-        && drop_plymouth_records
+      if [ "$new_record" -eq 1 ]; then
+        drop_plymouth_records
+      elif [ -n "$set_before" ]; then
+        # The theme was not set: the record names the one the look set before.
+        sys_record_write "$PLYMOUTH_SET_FILE" "$set_before"
+      else
+        sudo rm -f "$PLYMOUTH_SET_FILE"
+      fi
       [ "$owed_before" -eq 1 ] || sudo rm -f "$INITRAMFS_PENDING"
       message warn "could not set the boot splash theme to '${PLYMOUTH_THEME}'"
       STATUS_FAILED+=("Boot splash theme could not be set to '${PLYMOUTH_THEME}'")
@@ -4015,9 +4679,10 @@ fingerprint_file() {
   if release_fingerprint | sort -u > "$tmp"; then echo "$tmp"; else rm -f "$tmp"; return 1; fi
 }
 
-# --refresh: list what an update would change, then ask. Exits when there is
-# nothing to do or the user declines; returns to apply the update. Before
-# the answer it changes nothing but apt's package lists.
+# --refresh: list what an update would change, then ask. Exits when the user
+# declines; returns to apply the updates and to repair the look's files,
+# also when there is no update. Before the answer it changes nothing but
+# apt's package lists.
 refresh_check() {
   # Counted by the steps below.
   REFRESH_FINDINGS=0
@@ -4032,11 +4697,13 @@ refresh_check() {
 
   echo ""
   if [ "$REFRESH_FINDINGS" -eq 0 ]; then
-    message "The Ubuntu look is up to date — nothing to apply."
-    exit 0
+    message "The Ubuntu look is up to date. Check its files and repair any that changed?"
+  else
+    message "${REFRESH_FINDINGS} update(s) found. Apply them now, and repair the look's files?"
   fi
-  message "${REFRESH_FINDINGS} update(s) found. Apply them now?"
-  ask_yes || { message "Nothing changed."; exit 0; }
+  # Status 1, as for every declined prompt: without a terminal the answer
+  # is no, and that run did not update anything.
+  ask_yes || { message "Nothing changed."; exit 1; }
 }
 
 # --refresh: bring apt's package lists up to date, changing nothing else.
@@ -4169,31 +4836,38 @@ refresh_list_unsupported() {
 # --reset: this user's own values of the look's settings go, so the Ubuntu
 # session shows Ubuntu's defaults again, as after the first install: every key
 # the look sets where the user's value differs from the look's, and the
-# settings of the extensions the look brought (EXTENSION_OWN_KEYS apart). The
-# values are saved first, the newest ten copies kept. Nothing else of the
-# user's is touched: no file, folder or app, and no other setting. Without
-# the saved copy nothing is reset.
+# settings of the extensions the look brought (EXTENSION_OWN_KEYS apart).
+# The values are not kept. Nothing else of the user's is touched: no file,
+# folder or app, and no other setting.
 reset_user_settings() {
-  local saved path key own ours e dir hit n=0 failed=0 st
+  local path key own ours e dir hit n=0 failed=0 st
   message "resetting your own values of the look's settings"
-  saved="${BACKUP_DIR}/settings-before-reset-$(date +%Y%m%d-%H%M%S).ini"
-  if ! { mkdir -p "$BACKUP_DIR" && user_dconf dump / > "$saved"; }; then
-    rm -f "$saved"
-    STATUS_FAILED+=("Your settings were not reset — they could not be saved in ${BACKUP_DIR} first")
-    return 0
-  fi
   while read -r path key; do
     own="$(user_dconf_read "/${path}/${key}")"
     [ -n "$own" ] || continue
     # The look's own value, set by the user or a program: nothing to reset.
     ours="$(our_dconf_value "$path" "$key")"
     [ "${own// /}" != "${ours// /}" ] || continue
+    # The style goes back to the one the Ubuntu release starts in
+    # (read_ubuntu_style). That style written out is left. Where Ubuntu's
+    # settings set none, that is GNOME's 'default', and also the style of
+    # Ubuntu's session mode: with GNOME Shell 51 the Ubuntu session has it
+    # as the user's value after login, and a reset of it would make each
+    # run report a change.
+    if [ "${path}|${key}" = "$COLOR_SCHEME_KEY" ]; then
+      [ "$own" != "'${UBUNTU_COLOR_SCHEME_SETTING:-default}'" ] || continue
+      [ -n "$UBUNTU_COLOR_SCHEME_SETTING" ] || [ "$own" != "'${UBUNTU_COLOR_SCHEME}'" ] || continue
+    fi
+    # Without a wallpaper of the look's (its file is missing), the user's
+    # own stays: the look has none to show in its place.
+    [ -n "$ours" ] || ! in_word_list "${path}|${key}" "${WALLPAPER_KEYS[*]}" || continue
     if dconf reset "/${path}/${key}" 2>/dev/null; then n=$((n + 1)); else failed=1; fi
   done < <(look_keys)
-  # What the look's extensions stored; one the user had before is theirs.
+  # What the look's extensions stored; one the user had before, or has a
+  # build of their own of, is theirs.
   for e in ubuntu-dock@ubuntu.com:dash-to-dock ding@rastersoft.com:ding \
            tiling-assistant@ubuntu.com:tiling-assistant ubuntu-appindicators@ubuntu.com:appindicator; do
-    look_installed_ext "${e%%:*}" || continue
+    ext_settings_are_looks "${e%%:*}" || continue
     dir="/org/gnome/shell/extensions/${e#*:}/"
     hit=0
     for key in $(user_dconf list "$dir"); do
@@ -4207,15 +4881,9 @@ reset_user_settings() {
     "$RC_CHANGED") n=$((n + 1)) ;;
     "$RC_FAILED")  failed=1 ;;
   esac
-  # The stage adds Ctrl+Alt+T to the user's own shortcuts again.
-  rm -f "$TERMINAL_SHORTCUT_RECORD"
   if [ "$n" -gt 0 ]; then
-    STATUS_CHANGES+=("${n} of your own settings reset to the look's defaults; they are saved in ${saved}")
-    # shellcheck disable=SC2012
-    ls -1t "${BACKUP_DIR}"/settings-before-reset-*.ini 2>/dev/null | tail -n +11 | xargs -r -d '\n' rm -f --
+    STATUS_CHANGES+=("${n} of your own settings reset to the look's defaults")
   else
-    # Nothing was changed: the copy holds nothing a later look would need.
-    rm -f "$saved"
     STATUS_NOCHANGE+=("None of your own settings differed from the look's defaults")
   fi
   [ "$failed" -eq 0 ] || STATUS_FAILED+=("Some of your settings could not be reset — run this again from your desktop")
@@ -4288,11 +4956,18 @@ reboot_can_be_answered() { [ -t 0 ] && { : < /dev/tty; } 2>/dev/null; }
 # Reboot: as the desktop user where the system allows it, else through sudo.
 reboot_now() { systemctl --no-ask-password reboot 2>/dev/null || sudo systemctl reboot; }
 
+# The countdown's wait for Enter on the terminal: 0 on Enter, above 128 when
+# the time is up, 1 when the terminal cannot be read.
+countdown_read() {
+  local key
+  read -r -t "$REBOOT_COUNTDOWN" key < /dev/tty
+}
+
 # Reboot after a countdown of REBOOT_COUNTDOWN seconds: Enter reboots at once,
 # Ctrl-C cancels. With UBUNTU_LOOK_REBOOT=0, or with no terminal to answer
 # from, it only names the command.
 auto_reboot() {
-  local n key old_int tty_state ticker reader
+  local n key old_int tty_state ticker reader answer
   if [ "${UBUNTU_LOOK_REBOOT:-1}" = 0 ] || ! reboot_can_be_answered; then
     echo -e "   Run: ${YELLOW}sudo reboot${ENDCOLOR}"
     return 0
@@ -4313,10 +4988,13 @@ auto_reboot() {
   # take back the signals the exit trap switched off, so they can be stopped.
   ( trap - INT TERM; for ((n = REBOOT_COUNTDOWN; n > 0; n--)); do printf '\r   %2d ' "$n"; sleep 1; done > /dev/tty ) 2>/dev/null &
   ticker=$!
-  ( trap - INT TERM; read -r -t "$REBOOT_COUNTDOWN" key < /dev/tty ) 2>/dev/null &
+  ( trap - INT TERM; countdown_read ) 2>/dev/null &
   reader=$!
-  # Ends on Enter, when the time is up, or on Ctrl-C (status 130).
-  wait "$reader" 2>/dev/null; [ $? -ne 130 ] || REBOOT_CANCELLED=1
+  # Ends on Enter (status 0), when the time is up (above 128), or on Ctrl-C
+  # (130). Any other status is a terminal that went away: closing it must
+  # not reboot.
+  wait "$reader" 2>/dev/null; answer=$?
+  [ "$answer" -ne 130 ] || REBOOT_CANCELLED=1
   kill "$reader" "$ticker" 2>/dev/null
   wait "$reader" "$ticker" 2>/dev/null
   [ -z "$tty_state" ] || { stty "$tty_state" < /dev/tty; } 2>/dev/null
@@ -4324,6 +5002,10 @@ auto_reboot() {
   eval "${old_int:-trap - INT}"
   if [ "$REBOOT_CANCELLED" = 1 ]; then
     echo -e "   Reboot cancelled. When you are ready, run: ${YELLOW}sudo reboot${ENDCOLOR}"
+    return 0
+  fi
+  if [ "$answer" -ne 0 ] && [ "$answer" -le 128 ]; then
+    echo -e "   The terminal is gone — not rebooting. Run: ${YELLOW}sudo reboot${ENDCOLOR}"
     return 0
   fi
   echo "   Rebooting now."
@@ -4334,7 +5016,7 @@ auto_reboot() {
 print_summary() {
   # First: any command before it would replace the exit status.
   local rc=$?
-  local reboot=0
+  local reboot=0 hint="Each line gives the reason."
   # Nothing ran yet: a wrong argument, a declined prompt.
   [ "${RUN_STARTED:-0}" = 1 ] || return 0
   # A finished run added it before its exit status; a stopped one adds it here.
@@ -4350,8 +5032,9 @@ print_summary() {
   summary_block "$YELLOW" "Kept at the last compatible build (${#STATUS_HELD[@]}):" = \
     "A newer build exists but will not install here — the installed one is the newest that fits." \
     "${STATUS_HELD[@]}"
-  summary_block "$RED" "Not done (${#STATUS_FAILED[@]}):" "!" \
-    "Everything else was applied. Each line gives the reason." "${STATUS_FAILED[@]}"
+  # Only a run that reached its end applied everything else.
+  [ "$RUN_FINISHED" != 1 ] || hint="Everything else was applied. ${hint}"
+  summary_block "$RED" "Not done (${#STATUS_FAILED[@]}):" "!" "$hint" "${STATUS_FAILED[@]}"
   summary_block "$GREEN"  "Configuration changes:" + "" "${STATUS_CHANGES[@]}"
   summary_block "$YELLOW" "Already in place (no change):" = "" "${STATUS_NOCHANGE[@]}"
 
@@ -4369,7 +5052,10 @@ print_summary() {
   if [ $rc -ne 0 ] && [ "$RUN_FINISHED" != 1 ]; then
     echo -e "${RED}✗  Script stopped (rc=$rc). See the ERROR or WARN lines above.${ENDCOLOR}"
   elif [ $REBOOT_NEEDED -eq 1 ] || [ $RELOGIN_NEEDED -eq 1 ]; then
-    if [ $REBOOT_NEEDED -eq 1 ]; then
+    if [ $REBOOT_NEEDED -eq 1 ] && [ "$REBOOT_CARRIED" = 1 ] && [ $RELOGIN_NEEDED -eq 0 ]; then
+      echo -e "${RED}⚠  REBOOT STILL REQUIRED${ENDCOLOR} by an earlier run, for the boot splash and kernel command line."
+      echo -e "   This run changed nothing that needs it."
+    elif [ $REBOOT_NEEDED -eq 1 ]; then
       echo -e "${RED}⚠  REBOOT REQUIRED${ENDCOLOR} for the boot splash and kernel command line."
       echo -e "   The reboot also applies the theme and extensions."
     else
@@ -4378,7 +5064,9 @@ print_summary() {
       echo -e "   The login screen's gear button shows which session is chosen."
     fi
     # Not with items left undone: their reasons are read first.
-    if [ "$RUN_FINISHED" = 1 ] && [ ${#STATUS_FAILED[@]} -eq 0 ]; then
+    # Nor for a reboot only an earlier run owes: this one changed nothing.
+    if [ "$RUN_FINISHED" = 1 ] && [ ${#STATUS_FAILED[@]} -eq 0 ] \
+       && { [ "$REBOOT_CARRIED" != 1 ] || [ $RELOGIN_NEEDED -eq 1 ]; }; then
       reboot=1
     else
       echo -e "   Run: ${YELLOW}sudo reboot${ENDCOLOR}"
@@ -4398,7 +5086,28 @@ print_summary() {
 # Remove the run's release cache with its suite and development-series memos.
 rm_release_cache() {
   [ -n "${UBUNTU_RELEASE_CACHE:-}" ] || return 0
-  rm -f "$UBUNTU_RELEASE_CACHE" "${UBUNTU_RELEASE_CACHE}.suites" "${UBUNTU_RELEASE_CACHE}.devel"
+  rm -f "$UBUNTU_RELEASE_CACHE" "${UBUNTU_RELEASE_CACHE}.suites" "${UBUNTU_RELEASE_CACHE}.devel" \
+    "${UBUNTU_RELEASE_CACHE}.devel-unread"
+}
+
+# The run's on and off switches take 0 or 1 only: "no" or "false" must not
+# read as on.
+check_switches() {
+  local name
+  for name in UBUNTU_LOOK_REBOOT UBUNTU_LOOK_LOG UBUNTU_LOOK_SYSTEM_UPGRADE; do
+    case "${!name:-}" in
+      ''|0|1) ;;
+      *) error "${name} takes 0 or 1 (got '${!name}')." ;;
+    esac
+  done
+}
+
+# From here on the run changes the system: a stopped run reports it, and
+# its log is kept.
+mark_run_started() {
+  RUN_STARTED=1
+  [ -z "${UBUNTU_LOOK_STARTED_MARK:-}" ] || { echo 1 > "$UBUNTU_LOOK_STARTED_MARK"; } 2>/dev/null
+  return 0
 }
 
 # The EXIT trap's cleanup; returns the exit status for print_summary.
@@ -4443,6 +5152,7 @@ parse_args() {
         action="${arg#--}" ;;
       --download|--offline|--prepare-upgrade)
         error "${arg} is no longer part of this script. See: bash ubuntu-look.sh --help" ;;
+      '') error "An empty argument was given. See: bash ubuntu-look.sh --help" ;;
       *) unknown="${unknown:+${unknown} }${arg}" ;;
     esac
   done
@@ -4458,15 +5168,14 @@ parse_args() {
 # The logged run re-reads the script, so it must come from a file; the log
 # must be writable, or the run would die with the pipe.
 start_run_log() {
-  local _log_file _log_name _o _opts _rc
+  local _log_file _log_name _o _opts _rc _n=1 _sfx="" _mark=""
   _log_name="ubuntu-look-${ACTION}"
-  _log_file="${HOME:-/nonexistent}/${_log_name}-$(date +%Y%m%d-%H%M%S).log"
+  _log_file="${HOME:-/nonexistent}/${_log_name}-$(date +%Y%m%d-%H%M%S)"
+  # A second run in the same second gets a file of its own.
+  while [ -e "${_log_file}${_sfx}.log" ]; do _n=$((_n + 1)); _sfx="-${_n}"; done
+  _log_file="${_log_file}${_sfx}.log"
   if [ "${UBUNTU_LOOK_LOG:-1}" != "0" ] && [ -z "${UBUNTU_LOOK_LOGGING:-}" ] \
      && { [ -f "$SCRIPT_FILE" ] && : > "$_log_file"; } 2>/dev/null; then
-
-    # The newest ten logs of this kind stay; older ones go.
-    # shellcheck disable=SC2012
-    ls -1t "${HOME}/${_log_name}"-*.log 2>/dev/null | tail -n +11 | xargs -r -d '\n' rm -f --
 
     # Pass on the shell options -u, -e and -x.
     _opts=()
@@ -4475,6 +5184,9 @@ start_run_log() {
     done
 
     export UBUNTU_LOOK_LOGGING=1
+    # The run writes here once it starts changing the system.
+    _mark="$(mktemp 2>/dev/null)" || _mark=""
+    export UBUNTU_LOOK_STARTED_MARK="$_mark"
     echo "Recording this run to ${_log_file}"
     # tee and sed ignore Ctrl-C and a closed terminal, so the summary still
     # reaches the log; a failed log write does not stop the run. The log's
@@ -4483,7 +5195,22 @@ start_run_log() {
       | (trap '' INT HUP; tee --output-error=warn-nopipe \
            >(trap '' INT HUP; sed -r 's/\x1b\[[0-9;]*[mK]//g' > "$_log_file"); wait $! 2>/dev/null)
     _rc=${PIPESTATUS[0]}
-    echo "Log written to ${_log_file}"
+    if [ "$(cat "$_mark" 2>/dev/null)" = removed ]; then
+      # A finished uninstall removed the run logs, this one included.
+      rm -f "$_log_file"
+      echo "No log kept: the uninstall is complete and removed the look's run logs."
+    elif [ -n "$_mark" ] && [ ! -s "$_mark" ]; then
+      # Declined or refused before anything was changed: no log to keep,
+      # and no older log pushed out for it.
+      rm -f "$_log_file"
+      echo "No log kept: this run changed nothing."
+    else
+      # The newest ten logs of this kind stay; older ones go.
+      # shellcheck disable=SC2012
+      ls -1t "${HOME}/${_log_name}"-*.log 2>/dev/null | tail -n +11 | xargs -r -d '\n' rm -f --
+      echo "Log written to ${_log_file}"
+    fi
+    [ -z "$_mark" ] || rm -f "$_mark"
     exit "$_rc"
   elif [ "${UBUNTU_LOOK_LOG:-1}" != "0" ] && [ -z "${UBUNTU_LOOK_LOGGING:-}" ]; then
     echo "No run log: the script is not read from a file, or ${_log_file} is not writable."
@@ -4564,7 +5291,7 @@ init_options() {
   esac
   REQUESTED_MIRROR="${UBUNTU_MIRROR:-}"
   option_value_ok UBUNTU_MIRROR "$REQUESTED_MIRROR" \
-    || error "UBUNTU_MIRROR takes one http:// or https:// URL without spaces (got '${REQUESTED_MIRROR}')."
+    || error "UBUNTU_MIRROR takes one http:// or https:// URL without spaces, user name or password."
   UBUNTU_MIRROR="${UBUNTU_MIRROR:-$UBUNTU_DEFAULT_MIRROR}"
   UBUNTU_MIRROR="${UBUNTU_MIRROR%/}"
   add_mirror_to_hosts_re "$UBUNTU_MIRROR"
@@ -4646,7 +5373,7 @@ init_run() {
   # A reboot an interrupted run of this boot owes is still asked for.
   [ -s "$REBOOT_OWED" ] \
     && [ "$(cat "$REBOOT_OWED" 2>/dev/null)" = "$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)" ] \
-    && REBOOT_NEEDED=1
+    && REBOOT_NEEDED=1 && REBOOT_CARRIED=1
   # Filled here, outside any $(...), so every later call reuses it.
   shell_major > /dev/null
 
@@ -4671,8 +5398,8 @@ init_run() {
 # 8. Uninstall (--uninstall)
 ###############################################################################
 # The look's settings go back to Debian's defaults; installed packages go,
-# replaced ones get Debian's build back, for everyone; this user's settings
-# return to Debian's defaults. In five parts: helpers, settings helpers,
+# replaced ones get Debian's build back, for everyone; this user's own
+# values of the look's settings return to Debian's defaults. In five parts: helpers, settings helpers,
 # per-user steps, system steps, and the run that calls them.
 
 # --- Uninstall: helpers ------------------------------------------------------
@@ -4781,9 +5508,6 @@ apt_or_pending() {
 
 # --- Uninstall: settings helpers ---------------------------------------------
 
-# Pre-install value of key $2 in path $1; empty when it was at the default.
-snapshot_dconf_value() { ini_value "${BACKUP_ORIGINAL}/dconf-dump.ini" "$1" "$2"; }
-
 # The separate package of extension $1, where there is one.
 ext_own_package() {
   case "$1" in
@@ -4799,7 +5523,7 @@ ext_own_package() {
 ext_package() {
   case "$1" in
     ubuntu-dock@*|tiling-assistant@*|ubuntu-appindicators@*|ding@*|web-search-provider@*)
-      if grep -qxF "$COMBINED_EXT_PKG" "$INSTALLED_MANIFEST" "$MANIFEST_COPY" 2>/dev/null; then
+      if grep -qxF "$COMBINED_EXT_PKG" "$INSTALLED_MANIFEST" 2>/dev/null; then
         echo "$COMBINED_EXT_PKG"; return
       fi ;;
   esac
@@ -4810,13 +5534,67 @@ ext_package() {
 # separate package was there before: the extension is the user's own.
 look_installed_ext() {
   local own pkg
-  # Records gone with an uninstall another user ran: this user's backup
-  # shows the look was theirs.
-  [ ! -f "$INSTALLED_MANIFEST" ] && [ ! -f "$MANIFEST_COPY" ] && [ -d "$BACKUP_DIR" ] && return 0
   own="$(ext_own_package "$1")"
+  # No records: an uninstall another user ran took them with the look. The
+  # extension was the look's if its package went too.
+  if [ ! -f "$INSTALLED_MANIFEST" ]; then
+    [ -n "$own" ] && ! is_present "$own" && ! is_present "$COMBINED_EXT_PKG"
+    return
+  fi
   [ -n "$own" ] && predates_install "$own" && return 1
   pkg="$(ext_package "$1")"
-  [ -n "$pkg" ] && grep -qxF "$pkg" "$INSTALLED_MANIFEST" "$MANIFEST_COPY" 2>/dev/null
+  [ -n "$pkg" ] && grep -qxF "$pkg" "$INSTALLED_MANIFEST" 2>/dev/null
+}
+
+# The other builds of extension $1 that keep their settings in the same
+# dconf folder as the look's.
+ext_other_builds() {
+  case "$1" in
+    ubuntu-dock@*)          echo "dash-to-dock@micxgx.gmail.com" ;;
+    tiling-assistant@*)     echo "tiling-assistant@leleat-on-github" ;;
+    ubuntu-appindicators@*) echo "appindicatorsupport@rgcjonas.gmail.com" ;;
+  esac
+}
+
+# True when this user has a build of extension $1 that is not the look's: a
+# copy in their home, or a system one from a package the look did not
+# install. It shares the look's settings folder, and what is there is theirs.
+has_own_ext_build() {
+  local uuid dir pkg mine
+  # shellcheck disable=SC2046
+  for uuid in "$1" $(ext_other_builds "$1"); do
+    [ -d "${DATA_HOME:-${HOME:-}/.local/share}/gnome-shell/extensions/${uuid}" ] && return 0
+    [ "$uuid" != "$1" ] || continue
+    dir="${SYSTEM_EXT_DIR}/${uuid}"
+    [ -d "$dir" ] || continue
+    mine=0
+    for pkg in $(dpkg-query -S "$dir" 2>/dev/null | sed 's/: .*//' | tr ',' ' '); do
+      grep -qxF "$pkg" "$INSTALLED_MANIFEST" 2>/dev/null && ! predates_install "$pkg" && continue
+      mine=1
+    done
+    # No package owns it, or one the look did not bring.
+    [ "$mine" -eq 1 ] || [ -z "$(dpkg-query -S "$dir" 2>/dev/null)" ] || continue
+    return 0
+  done
+  return 1
+}
+
+# True when the settings in extension $1's dconf folder are the look's to
+# reset: the look installed the extension, and the user has no build of
+# their own that keeps its settings there.
+ext_settings_are_looks() { look_installed_ext "$1" && ! has_own_ext_build "$1"; }
+
+# The value the tiling assistant saved for key $2 under path $1 when it took
+# the key over: the user's own value, or "@mb nothing" where they had none.
+# Returns 1 when it saved none (it is not running, or never took the key).
+tiling_saved_value() {
+  local name saved
+  name="${1//\//.}.${2}"
+  saved="$(dconf read /org/gnome/shell/extensions/tiling-assistant/overridden-settings 2>/dev/null)"
+  saved="$(printf '%s\n' "$saved" \
+    | sed -n "s/.*'${name//./\\.}': <\\(@mb nothing\\|@as \\[\\]\\|\\[[^]]*\\]\\|true\\|false\\)>.*/\\1/p")"
+  [ -n "$saved" ] || return 1
+  printf '%s\n' "$saved"
 }
 
 # --- Uninstall: per-user steps -----------------------------------------------
@@ -4859,15 +5637,17 @@ step_extensions() {
   return 0
 }
 
-# What the look's own extensions stored beyond its table: Tiling Assistant's
-# and Desktop Icons' settings and Tiling Assistant's session file. Only when
-# the look installed the extension; Debian's default is none of it.
+# What the look's own extensions stored: their settings, and Tiling
+# Assistant's session file. Only when the look installed the extension;
+# Debian's default is none of it.
 step_clear_extension_state() {
   step "Clearing what the look's extensions stored..."
   local e dir cleared=0 left=0
-  for e in tiling-assistant@ubuntu.com ding@rastersoft.com; do
-    look_installed_ext "$e" || continue
-    dir="/org/gnome/shell/extensions/${e%%@*}/"
+  for e in tiling-assistant@ubuntu.com:tiling-assistant ding@rastersoft.com:ding \
+           ubuntu-dock@ubuntu.com:dash-to-dock ubuntu-appindicators@ubuntu.com:appindicator; do
+    dir="/org/gnome/shell/extensions/${e#*:}/"; e="${e%%:*}"
+    # An extension the user has a build of their own of keeps its settings.
+    ext_settings_are_looks "$e" || continue
     if [ -n "$(user_dconf list "$dir")" ]; then
       need_session "the settings of ${e%%@*} not cleared" || { left=1; continue; }
       if dconf reset -f "$dir" 2>/dev/null; then cleared=1; else USER_PENDING=1; left=1; GUESSED+=("Could not clear ${dir}"); fi
@@ -4893,8 +5673,13 @@ step_restore_tiling_keybindings() {
     SKIPPED+=("Tiling keybindings left alone — the look did not install the tiling assistant")
     return
   fi
+  # A tiling assistant of the user's own stays and keeps the keys.
+  if has_own_ext_build tiling-assistant@ubuntu.com; then
+    SKIPPED+=("Tiling keybindings left alone — you have a tiling assistant of your own")
+    return
+  fi
   need_session "tiling keybindings not checked" || return
-  local entry path key now before restored=0 failed=0
+  local entry path key now saved restored=0 own=0 failed=0
   # It runs until the session ends; the keys are reset now.
   extension_active tiling-assistant@ubuntu.com \
     && SKIPPED+=("Tiling assistant runs until the reboot — until then both it and GNOME answer Super+Arrow")
@@ -4907,20 +5692,25 @@ step_restore_tiling_keybindings() {
     for key in ${entry#*:}; do
       now="$(dconf read "/${path}/${key}" 2>/dev/null)"
       case "$now" in "@as []"|"[]"|"false") ;; *) continue ;; esac
-      # The user's own value from before the install stays.
-      before="$(snapshot_dconf_value "$path" "$key")"
-      [ -n "$before" ] && [ "${before// /}" = "${now// /}" ] && continue
-      # Debian's default, as for every other key the look touched.
-      if dconf reset "/${path}/${key}" 2>/dev/null; then
+      # The user's own value, which the tiling assistant holds while it
+      # runs, goes back; where they had none, Debian's default.
+      if saved="$(tiling_saved_value "$path" "$key")" && [ "$saved" != "@mb nothing" ]; then
+        if dconf write "/${path}/${key}" "$saved" 2>/dev/null; then
+          own=$((own + 1))
+        else
+          USER_PENDING=1; failed=1; GUESSED+=("Could not put back your own ${key}")
+        fi
+      elif dconf reset "/${path}/${key}" 2>/dev/null; then
         restored=$((restored + 1))
       else
         USER_PENDING=1; failed=1; GUESSED+=("Could not reset ${key}")
       fi
     done
   done
+  [ "$own" -eq 0 ] || DONE+=("Put back ${own} tiling setting(s) of your own that the tiling assistant had taken over")
   if [ "$restored" -gt 0 ]; then
     DONE+=("Gave back ${restored} tiling keybinding(s) (Super+Arrow, edge tiling)")
-  elif [ "$failed" -eq 0 ]; then
+  elif [ "$failed" -eq 0 ] && [ "$own" -eq 0 ]; then
     SKIPPED+=("Tiling keybindings already at Debian's default")
   fi
 }
@@ -4932,26 +5722,11 @@ dconf_or_pending() {
   return 1
 }
 
-# True when dconf value $1 names what the uninstall removes: a Yaru theme, an
-# Ubuntu font or one of Ubuntu's wallpapers, from a package the look brought.
-names_look_asset() {
-  local pkg f
-  case "$1" in
-    *Yaru*) pkg=yaru-theme-gtk ;;
-    *"Ubuntu Sans"*|*"Ubuntu Mono"*|*"'Ubuntu "*) pkg=fonts-ubuntu ;;
-    *file:///*)
-      f="${1#*file://}"; f="${f%%\'*}"
-      pkg="$(dpkg -S "$f" 2>/dev/null | head -n 1 | cut -d: -f1)"
-      case "$pkg" in ubuntu-wallpapers*) ;; *) return 1 ;; esac ;;
-    *) return 1 ;;
-  esac
-  ! predates_install "$pkg"
-}
 
-# Settings the user made stay, as in Debian's GNOME session; only those that
-# name what the uninstall removes go back to Debian's default.
+# This user's own values of the look's settings go back to Debian's
+# defaults, as in a native GNOME session; every other setting stays.
 step_restore_gnome_settings() {
-  step "Resetting settings that name the look's themes, fonts and wallpapers..."
+  step "Resetting the look's settings to Debian's defaults..."
   need_session "GNOME settings not reset" || return
   local path key ours value nudge=0 reset=0 failed=0
   # The theme extension runs until the session ends, but follows no change
@@ -4961,7 +5736,6 @@ step_restore_gnome_settings() {
   while read -r path key; do
     value="$(user_dconf_read "/${path}/${key}")"
     if [ -n "$value" ]; then
-      names_look_asset "$value" || continue
       if dconf_or_pending reset "/${path}/${key}"; then reset=$((reset + 1)); else failed=1; fi
     elif [ "$nudge" -eq 1 ]; then
       # The extensions' own keys; they run until the session ends.
@@ -4983,9 +5757,9 @@ step_restore_gnome_settings() {
   if [ "$failed" -eq 1 ]; then
     GUESSED+=("Some GNOME settings could not be reset")
   elif [ "$reset" -gt 0 ]; then
-    DONE+=("Settings that named the look's themes, fonts or wallpapers back to Debian's defaults (${reset}); your other settings stay")
+    DONE+=("The look's settings back to Debian's defaults (${reset}); your other settings stay")
   else
-    SKIPPED+=("No setting of yours names the look's themes, fonts or wallpapers")
+    SKIPPED+=("The look's settings are at Debian's defaults already")
   fi
 }
 
@@ -4995,10 +5769,9 @@ step_terminal_shortcut() {
   local key="$CUSTOM_KEYBINDINGS_KEY"
   local list one keep="" failed=0
   list="$(array_items "$(user_dconf_read "$key")")"
-  # Without the record too, when an interrupted install left the shortcut:
-  # its path is the look's alone.
-  if [ ! -f "$TERMINAL_SHORTCUT_RECORD" ] \
-     && ! in_word_list "$TERMINAL_SHORTCUT_PATH" "$list" \
+  # Its path is the look's alone: in the user's list, or left by an
+  # interrupted run.
+  if ! in_word_list "$TERMINAL_SHORTCUT_PATH" "$list" \
      && [ -z "$(dconf list "$TERMINAL_SHORTCUT_PATH" 2>/dev/null)" ]; then
     SKIPPED+=("No terminal shortcut was added by this script")
     return
@@ -5016,7 +5789,6 @@ step_terminal_shortcut() {
   fi
   dconf reset -f "$TERMINAL_SHORTCUT_PATH" 2>/dev/null || failed=1
   if [ "$failed" -eq 0 ]; then
-    rm -f "$TERMINAL_SHORTCUT_RECORD"
     DONE+=("Removed the terminal keyboard shortcut; your own shortcuts are kept")
   else
     USER_PENDING=1
@@ -5027,11 +5799,12 @@ step_terminal_shortcut() {
 # --- Uninstall: system steps -------------------------------------------------
 
 # Compile Ubuntu's defaults empty, so the running session drops them now. A
-# copy of the keyfile stays as the reference for the settings steps.
+# copy of the keyfile stays among the records as the reference for the
+# settings steps.
 step_empty_look_defaults() {
   [ -f "$LOOK_DB_FILE" ] || return 0
   step "Withdrawing Ubuntu's GNOME defaults from your session..."
-  mkdir -p "$BACKUP_DIR" && cp "$LOOK_DB_FILE" "$DCONF_PROFILE_COPY" || return 0
+  { sys_records_dir && sudo_write_atomic "$LOOK_DB_FILE" "$LOOK_DEFAULTS_COPY"; } || return 0
   must_sudo rm -f "$LOOK_DB_FILE" && must_sudo dconf update
 }
 
@@ -5117,8 +5890,6 @@ step_remove_session() {
     while case "$f" in /usr/local/share/*|/usr/local/lib/*) true ;; *) false ;; esac \
           && sudo rmdir "$f" 2>/dev/null; do f="${f%/*}"; done
   done
-  # A later install chooses the session for this user anew.
-  rm -f "$SESSION_CHOSEN"
   # The directory is root's own, so the pattern is expanded under sudo.
   for f in $(sudo sh -c "grep -lE '^X?Session=${SHELL_MODE_NAME}' ${ACCOUNTS_USERS_DIR}/*" 2>/dev/null); do
     u="$(id -u "${f##*/}" 2>/dev/null)" || continue
@@ -5159,6 +5930,9 @@ step_remove_gdm_profile() {
     case "$d" in "${LOCAL_EXT_DIR%/*}"|"$LOCAL_EXT_DIR") ;; *) continue ;; esac
     sudo rmdir "$d" 2>/dev/null || true
   done
+  # The session's mode file made their parent where the extensions came
+  # later; empty and without the extensions' directory, it goes as well.
+  [ -d "$LOCAL_EXT_DIR" ] || sudo rmdir "${LOCAL_EXT_DIR%/*}" 2>/dev/null || true
   # The profiles the install created; each record goes with its file.
   for pair in gdm:gdm-profile-created Debian-gdm:gdm-profile-Debian-gdm-created; do
     prof="/etc/dconf/profile/${pair%%:*}"; rec="${SYS_RECORDS}/${pair#*:}"
@@ -5348,7 +6122,8 @@ step_remove_ubuntu_repo() {
   # from here; a successful update also deletes them. A failing source of the
   # user's own changes neither.
   message "refreshing apt's package lists..."
-  apt_get update -qq < /dev/null 2>/dev/null || true
+  apt_get update -qq < /dev/null 2>/dev/null \
+    || SKIPPED+=("apt's package lists could not be refreshed — Ubuntu's lists stay, unused, until the next: sudo apt update")
   return 0
 }
 
@@ -5605,7 +6380,7 @@ uninstall_begin() {
   # A closed terminal must not stop the run between a purge and its cleanup.
   trap '' HUP
 
-  # The records are read from $HOME, so it must be this user's home.
+  # The user's settings are found through $HOME, so it must be this user's home.
   _home="$(getent passwd "$RUN_USER" | cut -d: -f6)"
   _h="${HOME:-}"
   [ -n "$_home" ] && [ "${_h%/}" = "${_home%/}" ] \
@@ -5615,6 +6390,8 @@ uninstall_begin() {
   SKIPPED=()
   GUESSED=()
 
+  HAD_RECORDS=0
+  [ -d "$SYS_RECORDS" ] && HAD_RECORDS=1
   USER_PENDING=0
   SYSTEM_PENDING=0
   ANIMATIONS_FAILED=0
@@ -5636,13 +6413,14 @@ uninstall_begin() {
   echo -e "${YELLOW}       ubuntu-look UNINSTALL${ENDCOLOR}"
   echo -e "${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${ENDCOLOR}"
   echo ""
-  echo "This undoes only what ubuntu-look.sh did:"
+  echo "This removes the look and restores Debian's own GNOME:"
   echo "  - for everyone: the Ubuntu session, packages it installed, apt source and"
   echo "    pin, login screen, boot splash and kernel command line"
-  echo "  - for you: settings that name its themes, fonts or wallpapers, and the"
-  echo "    terminal shortcut it added"
-  echo "Your other settings, and the packages and apps you had before or installed"
-  echo "later, are kept."
+  echo "  - for you: the look's settings (themes, fonts, wallpaper, window buttons,"
+  echo "    keybindings, terminal colours, power, its extensions) go back to"
+  echo "    Debian's defaults, and the terminal shortcut it added is removed"
+  echo "Your files, folders and other settings, and the packages and apps you had"
+  echo "before or installed later, are kept."
   [ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ] \
     && message warn "No desktop session: your settings are checked on a later run from the desktop."
   echo ""
@@ -5653,31 +6431,56 @@ uninstall_begin() {
   # Wait for any run in progress; from here no other run can start.
   take_run_lock
   # From here on the run changes the system; a stopped run reports it.
-  RUN_STARTED=1
+  mark_run_started
 }
 
-# Reset this user's settings, and drop their records once that is done.
+# A finished uninstall leaves nothing of the look in the user's home: its
+# run logs go, this run's included (the summary is on the terminal). Only
+# files named as start_run_log names them.
+remove_run_logs() {
+  local f n=0
+  for f in "${HOME}"/ubuntu-look-{install,refresh,reset,uninstall}-[0-9]*.log; do
+    [ -f "$f" ] && rm -f -- "$f" && n=$((n + 1))
+  done
+  # Tells the run that copies this one to its log to keep none.
+  [ -z "${UBUNTU_LOOK_STARTED_MARK:-}" ] || { echo removed > "$UBUNTU_LOOK_STARTED_MARK"; } 2>/dev/null
+  [ "$n" -eq 0 ] || message "Removed the look's run logs from your home folder (${n})"
+  return 0
+}
+
+# Reset this user's settings that belong to the look: every key the look
+# sets that has a value of the user's, the settings of the extensions the
+# look brought, and its terminal shortcut. Settings the look does not set
+# are not touched.
 uninstall_user_settings() {
   local _anim _rc
-  # A user who never ran the install, or never kept a Yaru theme from the
-  # Ubuntu session, keeps their settings as they are.
-  if [ -d "$BACKUP_DIR" ] || user_dconf dump /org/gnome/desktop/ 2>/dev/null | grep -q "^[a-z-]*-theme='Yaru"; then
-    step_extensions
-    step_restore_tiling_keybindings
-    step_restore_gnome_settings
-    step_clear_extension_state
-    step_terminal_shortcut
-
-    # session-migration's records (one per session type), where the look
-    # brought session-migration in.
-    grep -qxF session-migration "$INSTALLED_MANIFEST" "$MANIFEST_COPY" 2>/dev/null \
-      && rm -f "${DATA_HOME}"/session_migration-*
-    # The install may have created these; rmdir leaves any that hold files.
-    rmdir "$DATA_HOME" 2>/dev/null || true
-    rmdir "$HOME/.local" 2>/dev/null || true
-  else
-    SKIPPED+=("No settings of the look recorded for ${RUN_USER} — settings left unchanged")
+  # An earlier run of this uninstall reset them and then removed dconf-cli
+  # with the look's packages: nothing is left to do, and nothing pending.
+  if ! command -v dconf >/dev/null 2>&1 \
+     && grep -qxF -- "$RUN_USER" "$SETTINGS_RESET_USERS" 2>/dev/null; then
+    SKIPPED+=("Your settings were reset by an earlier run of this uninstall")
+    return 0
   fi
+  # The settings the Ubuntu release's own defaults added to the look are
+  # the look's as well: read again from the copy on record, so the steps
+  # below reset them too.
+  if [ -s "$UBUNTU_DEFAULTS_RECORD" ]; then
+    UBUNTU_DEFAULTS="$UBUNTU_DEFAULTS_RECORD"
+    apply_release_settings > /dev/null 2>&1
+  fi
+  step_extensions
+  step_restore_tiling_keybindings
+  step_restore_gnome_settings
+  step_clear_extension_state
+  step_terminal_shortcut
+
+  # session-migration's records (one per session type), where the look
+  # brought session-migration in.
+  grep -qxF session-migration "$INSTALLED_MANIFEST" 2>/dev/null \
+    && rm -f "${DATA_HOME}"/session_migration-*
+  # The session may have created these; rmdir leaves any that hold files.
+  rmdir "$DATA_HOME" 2>/dev/null || true
+  rmdir "$HOME/.local" 2>/dev/null || true
   ANIMATIONS_FAILED=0
   if [ -n "$UBUNTU_LOOK_ANIMATIONS" ]; then
     _anim="$(apply_animation_option)"; _rc=$?
@@ -5688,12 +6491,17 @@ uninstall_user_settings() {
     esac
   fi
 
-  # This user's records go once their settings are reset, so a run cut off in
-  # the system part does not repeat these steps.
-  if [ "$USER_PENDING" -eq 0 ] && [ -d "$BACKUP_DIR" ]; then
-    rm -rf "$BACKUP_DIR"
-    message "Removed ${BACKUP_DIR}"
+  # The folder of records version 1.0 kept in the user's home.
+  if [ "$USER_PENDING" -eq 0 ] && [ -d "$LEGACY_BACKUP_DIR" ]; then
+    rm -rf "$LEGACY_BACKUP_DIR"
+    message "Removed ${LEGACY_BACKUP_DIR}, left by an earlier version of this script"
   fi
+  # On record while the records last, for a run that has to be finished.
+  if [ "$USER_PENDING" -eq 0 ] && [ -d "$SYS_RECORDS" ] \
+     && ! grep -qxF -- "$RUN_USER" "$SETTINGS_RESET_USERS" 2>/dev/null; then
+    sys_record_append "$SETTINGS_RESET_USERS" "$RUN_USER" || true
+  fi
+  return 0
 }
 
 # Put Debian's builds back and remove the look's packages, working from a
@@ -5772,20 +6580,22 @@ uninstall_summary() {
   local _reboot
   uninstall_lists "UNINSTALL SUMMARY"
 
-  # System records go once all system work is done.
-  if [ "$SYSTEM_PENDING" -eq 0 ]; then
-    # Settings still to restore need to know which extensions came with the look.
-    if [ "$USER_PENDING" -eq 1 ] && [ -f "$INSTALLED_MANIFEST" ]; then
-      mkdir -p "$BACKUP_DIR" && cp "$INSTALLED_MANIFEST" "$MANIFEST_COPY"
-      cp "$PACKAGES_BEFORE" "${BACKUP_DIR}/packages-before.txt" 2>/dev/null
-    fi
+  # The records go once all work is done. Settings still to reset need them:
+  # they say which extensions came with the look and what its defaults were.
+  if [ "$SYSTEM_PENDING" -eq 0 ] && [ "$USER_PENDING" -eq 0 ]; then
     sudo rm -rf "$SYS_DIR"
+    # With nothing at all left to do, the run logs go too.
+    [ $((ANIMATIONS_FAILED || INITRAMFS_PARTIAL)) -ne 0 ] || remove_run_logs
+  elif [ "$SYSTEM_PENDING" -eq 0 ] && [ "$HAD_RECORDS" -eq 0 ]; then
+    # No records when the run began: those it made itself say nothing a
+    # later run needs.
+    sudo rm -rf "$SYS_DIR"
+    message warn "Your settings are still to reset. Run 'bash ubuntu-look.sh --uninstall' again from your desktop."
+  elif [ "$SYSTEM_PENDING" -eq 0 ]; then
+    message warn "Keeping ${SYS_DIR}: your settings are still to reset. Run 'bash ubuntu-look.sh --uninstall' again from your desktop."
   else
     message warn "Keeping ${SYS_DIR}: system work is unfinished. Run this again to finish it."
   fi
-
-  [ "$USER_PENDING" -eq 1 ] && [ -d "$BACKUP_DIR" ] \
-    && message warn "Keeping ${BACKUP_DIR}: run 'bash ubuntu-look.sh --uninstall' again from your desktop to reset your settings."
 
   _reboot=0
   if [ "$REBOOT_NEEDED" -eq 1 ] || [ "${#DONE[@]}" -gt 0 ]; then
@@ -5823,6 +6633,9 @@ run_install() {
   install_start
   install_snapshots
   install_configure_source
+  # Before anything is written from it: the session mode, the look's
+  # database and the reset follow the release's own style.
+  read_ubuntu_style
   install_system_upgrade
 
   use_combined_extensions_if_offered
@@ -5855,15 +6668,19 @@ install_start() {
     fi
     [ -z "$(missing_packages "curl ca-certificates")" ] \
       || error "curl or ca-certificates is missing; run 'bash ubuntu-look.sh' to install them with the look."
-    message "Checking the Ubuntu look for updates. Nothing is changed without your yes."
+    message "Checking the Ubuntu look for updates. Nothing is changed without your yes,"
+    message "and your own settings are never touched."
     sudo -v || error "User ${RUN_USER} cannot use sudo."
     take_run_lock
     discover_releases "$UBUNTU_CODENAME"
     # Lists the updates and asks; returns only to apply them.
     refresh_check
   elif [ "$ACTION" = reset ]; then
-    [ -f "$PACKAGES_BEFORE" ] \
-      || error "The Ubuntu look is not installed. Install it with: bash ubuntu-look.sh"
+    # The pin's version line is written once the release is resolved and
+    # removed by the uninstall: records alone are left by an install that
+    # stopped early or an uninstall still to finish.
+    { [ -f "$PACKAGES_BEFORE" ] && grep -q '^# pin-version: ' "$UBUNTU_PIN" 2>/dev/null; } \
+      || error "The Ubuntu look is not installed, or its install did not finish. Install it with: bash ubuntu-look.sh"
     have_session \
       || error "--reset changes your settings: run it from a terminal in your desktop session, with dconf-cli installed."
     message "${GREEN}ubuntu-look --reset${ENDCOLOR}: puts the look back as after its first install."
@@ -5871,7 +6688,7 @@ install_start() {
     message "For ${YELLOW}${RUN_USER}${ENDCOLOR}: your own values of the look's settings (themes, fonts,"
     message "wallpaper, window buttons, keybindings, terminal colours, power, the dock"
     message "and the look's other extensions) are reset, so the Ubuntu session shows"
-    message "Ubuntu's defaults. They are saved first in ${BACKUP_DIR}."
+    message "Ubuntu's defaults. They are not kept: note any you want back."
     message "The Ubuntu session is chosen for your next login."
     message "For everyone: the session, login screen, apt pin and boot splash are"
     message "written again where they differ."
@@ -5887,8 +6704,8 @@ install_start() {
     message "it for ${YELLOW}${RUN_USER}${ENDCOLOR}."
     message "Your own values of the look's settings (themes, fonts, wallpaper, window"
     message "buttons, keybindings, terminal colours, power, the dock) are reset, so"
-    message "the Ubuntu session shows Ubuntu's defaults; they are saved first in"
-    message "${BACKUP_DIR}. Every run does this; --refresh only updates."
+    message "the Ubuntu session shows Ubuntu's defaults. They are not kept: note any"
+    message "you want back. Every run does this; --refresh only updates."
     message "Your files, folders, installed apps and other settings are not touched."
     message "Undo with: bash ubuntu-look.sh --uninstall"
     message ""
@@ -5897,40 +6714,16 @@ install_start() {
     take_run_lock
   fi
   # From here on the run changes the system; the summary reports it.
-  RUN_STARTED=1
+  mark_run_started
 }
 
-# The snapshots the uninstall works from, each taken once: this user's
-# settings and the system's packages.
+# The package snapshot the uninstall works from, taken once.
 install_snapshots() {
-  local _snap
-  # Per-user snapshot, taken once.
-  if [ ! -d "$BACKUP_ORIGINAL" ]; then
-    message "first run for ${RUN_USER} — saving your settings to ${BACKUP_ORIGINAL} (for the uninstall)"
-    # Made in a side directory and moved into place whole, so a cut run leaves
-    # either no snapshot or a complete one.
-    _snap="${BACKUP_ORIGINAL}.new"
-    rm -rf "$_snap"
-    mkdir -p "$_snap" || error "Could not create ${_snap}"
-    # Ubuntu's defaults need a desktop session, now or on a later run.
-    # dconf reads the database file itself; no session is needed. A failed
-    # dump leaves none, which a later run takes again.
-    if command -v dconf >/dev/null 2>&1; then
-      user_dconf dump / > "${_snap}/dconf-dump.ini" || rm -f "${_snap}/dconf-dump.ini"
-    fi
-    echo "ubuntu-look.sh pre-install snapshot — $(date -Iseconds)" > "${_snap}/INFO"
-    mv "$_snap" "$BACKUP_ORIGINAL" || error "Could not create ${BACKUP_ORIGINAL}"
-    STATUS_CHANGES+=("Your pre-install settings saved → ${BACKUP_ORIGINAL}")
-  else
-    STATUS_NOCHANGE+=("Your pre-install settings snapshot already exists")
-  fi
-
-  # System snapshot, taken once.
   record_packages_before
 
-  # An unfinished uninstall's snapshot and hand-over copies no longer apply.
-  [ -e "$UNINSTALL_SNAPSHOT" ] && sudo rm -f "$UNINSTALL_SNAPSHOT"
-  rm -f "${BACKUP_DIR}/packages-before.txt" "$MANIFEST_COPY" "$DCONF_PROFILE_COPY"
+  # What an unfinished uninstall kept no longer applies.
+  [ ! -e "$UNINSTALL_SNAPSHOT" ] && [ ! -e "$LOOK_DEFAULTS_COPY" ] \
+    || sudo rm -f "$UNINSTALL_SNAPSHOT" "$LOOK_DEFAULTS_COPY"
 }
 
 # Online: configure the Ubuntu apt source, choose the release that fits this
@@ -6050,6 +6843,9 @@ install_pin_release() {
 
   [ "$UBUNTU_CODENAME" = "auto" ] && resolve_release "$PINNED_BEFORE"
 
+  # The look packages of the release's own desktop, before the pin names them.
+  adopt_release_look_packages
+
   # Rewrite a missing, provisional, outdated or other-release pin, and one
   # that names another wallpaper pack than the release's package asks for.
   NEED_PIN_REWRITE=1
@@ -6059,6 +6855,9 @@ install_pin_release() {
     message warn "Ubuntu pin is out of date — rewriting"
   elif ! grep -q "n=${UBUNTU_CODENAME}\$" "$UBUNTU_PIN"; then
     message warn "Ubuntu release changed to ${UBUNTU_CODENAME} — rewriting the Ubuntu pin"
+  elif [ -n "$ADOPTED_PACKAGES" ] \
+       && [ "$(pin_packages)" != "$(echo "${UBUNTU_PINNED_PACKAGES} $(wallpaper_packs)" | xargs)" ]; then
+    message warn "${UBUNTU_CODENAME}'s desktop uses more look packages (${ADOPTED_PACKAGES# }) — rewriting the Ubuntu pin"
   elif [ "$(pinned_wallpaper_packs)" != "$(wallpaper_packs)" ]; then
     message warn "${UBUNTU_CODENAME}'s wallpaper pack is now $(wallpaper_packs) — rewriting the Ubuntu pin"
   else
@@ -6261,6 +7060,8 @@ stage_desktop() {
     return 0
   fi
 
+  # The terminal's colours as the Yaru theme now installed has them.
+  yaru_terminal_colours
   # System defaults, read at the next login.
   message "writing Ubuntu's GNOME defaults"
   write_dconf_profile "$WP_LIGHT" "$WP_DARK"; _profile_ok=$?
@@ -6275,7 +7076,13 @@ stage_desktop() {
     "$RC_CHANGED") STATUS_CHANGES+=("Ubuntu session on the login screen → ${SESSION_ENTRIES%% *}; GNOME Shell starts with Yaru and Ubuntu's extensions")
        RELOGIN_NEEDED=1 ;;
     "$RC_UNCHANGED") STATUS_NOCHANGE+=("Ubuntu session already current") ;;
-    "$RC_FAILED") STATUS_FAILED+=("Could not install the Ubuntu session (${SHELL_MODE_FILE}) — the login screen offers Debian's GNOME only") ;;
+    "$RC_FAILED")
+      # shellcheck disable=SC2086
+      if [ -n "$(ls $SESSION_ENTRIES 2>/dev/null)" ]; then
+        STATUS_FAILED+=("Could not write all of the Ubuntu session's files — its entry on the login screen may not start; choose GNOME there until a run succeeds")
+      else
+        STATUS_FAILED+=("Could not install the Ubuntu session (${SHELL_MODE_FILE}) — the login screen offers Debian's GNOME only")
+      fi ;;
   esac
   message "installing the Show Applications button icon"
   write_app_grid_icon
@@ -6286,45 +7093,32 @@ stage_desktop() {
   _env_ok=0
   if [ "$_profile_ok" -eq 0 ] && [ "$_session_rc" -ne "$RC_FAILED" ]; then
     _env_ok=1
-    if [ ! -f "$SESSION_CHOSEN" ] || [ "$_dropped" -eq 1 ] || resets_settings; then
+    if [ "$_dropped" -eq 1 ] || resets_settings; then
       choose_ubuntu_session; _chosen_rc=$?
       case $_chosen_rc in
         "$RC_CHANGED") STATUS_CHANGES+=("Your logins use the Ubuntu session; the login screen's session menu offers GNOME too")
            RELOGIN_NEEDED=1 ;;
         "$RC_FAILED") STATUS_FAILED+=("Could not choose the Ubuntu session for you — pick Ubuntu in the login screen's session menu") ;;
       esac
-      if [ "$_chosen_rc" -ne "$RC_FAILED" ]; then
-        mkdir -p "$BACKUP_DIR" && : > "$SESSION_CHOSEN"
-        [ "$_dropped" -eq 0 ] || forget_session_user
-      fi
+      [ "$_chosen_rc" -eq "$RC_FAILED" ] || [ "$_dropped" -eq 0 ] || forget_session_user
     fi
     export DCONF_PROFILE="$LOOK_PROFILE_NAME"
   fi
 
-  # The settings before the install, for the uninstall's tiling step; a
-  # first run without dconf-cli takes them now that the stages brought it.
-  if [ ! -f "${BACKUP_ORIGINAL}/dconf-dump.ini" ] && command -v dconf >/dev/null 2>&1; then
-    user_dconf dump / > "${BACKUP_ORIGINAL}/.dconf-dump.ini" \
-      && mv "${BACKUP_ORIGINAL}/.dconf-dump.ini" "${BACKUP_ORIGINAL}/dconf-dump.ini"
-    rm -f "${BACKUP_ORIGINAL}/.dconf-dump.ini"
-  fi
   # A plain run and --reset: this user's own values of the look's settings
   # go, so the session shows Ubuntu's defaults.
   if [ "$_env_ok" -eq 1 ] && resets_settings; then
     if have_session; then
       reset_user_settings
+      # A user with custom shortcuts of their own gets Ctrl+Alt+T among them.
+      add_terminal_shortcut
     else
       message warn "No desktop session — your own settings are not reset; run this again from your desktop."
-      STATUS_NOCHANGE+=("Your own settings not reset — no desktop session; run this again from your desktop")
+      # Not done: the run does not count as complete, and does not reboot.
+      STATUS_FAILED+=("Your own settings not reset — no desktop session; run this again from your desktop")
     fi
   fi
   [ "$_env_ok" -eq 1 ] && report_own_settings
-  # A user with custom shortcuts of their own gets Ctrl+Alt+T among them.
-  if [ "$_env_ok" -eq 1 ] && [ -n "${DBUS_SESSION_BUS_ADDRESS:-}" ]; then
-    add_terminal_shortcut
-  elif [ "$_env_ok" -eq 1 ]; then
-    message warn "No D-Bus session detected — run this again from the desktop to add Ctrl+Alt+T to your own shortcuts."
-  fi
 
   message "theming the login screen"
   write_gdm_profile "$WP_LIGHT" "$WP_DARK"
@@ -6348,7 +7142,11 @@ install_finish() {
   [ "$SHELL_MOVED" = 0 ] && save_release_state
 
   [ "$INITRAMFS_PARTIAL" = 1 ] && STATUS_FAILED+=("$INITRAMFS_PARTIAL_NOTE")
-  message "${GREEN}All steps finished. See SUMMARY below.${ENDCOLOR}"
+  if [ ${#STATUS_FAILED[@]} -eq 0 ]; then
+    message "${GREEN}All steps finished. See SUMMARY below.${ENDCOLOR}"
+  else
+    message "${YELLOW}Finished, with ${#STATUS_FAILED[@]} step(s) not done. See SUMMARY below.${ENDCOLOR}"
+  fi
   RUN_FINISHED=1
   # A step not done makes the exit status 1, as in the uninstall.
   [ ${#STATUS_FAILED[@]} -eq 0 ] || exit 1
@@ -6362,6 +7160,8 @@ main() {
   # An unset variable stops the run instead of reading as empty.
   set -u
   parse_args "$@"
+
+  check_switches
 
   # Before the run log, so root leaves no log file behind.
   [ "$(id -u)" -eq 0 ] \

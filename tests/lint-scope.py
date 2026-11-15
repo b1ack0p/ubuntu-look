@@ -31,13 +31,75 @@ for line in lines:
 # Variables that belong to the environment of the commands the script runs.
 ENVIRONMENT = {
     "LC_ALL", "IFS", "DCONF_PROFILE", "DBUS_SESSION_BUS_ADDRESS", "XDG_RUNTIME_DIR",
-    "DEBIAN_FRONTEND", "UBUNTU_LOOK_LOGGING", "http_proxy", "https_proxy", "_",
+    "DEBIAN_FRONTEND", "UBUNTU_LOOK_LOGGING", "UBUNTU_LOOK_STARTED_MARK", "http_proxy", "https_proxy", "_",
 }
 
-# Strip comments and single-quoted strings (awk, sed and JS snippets).
-def code(line):
-    line = re.sub(r"'[^']*'", "''", line)
-    return re.sub(r"(^|\s)#.*$", "", line)
+# Strip comments and the text of single-quoted strings (awk, sed and JS
+# snippets), over the whole script so a string that spans lines is one string.
+# Line numbers stay as they are. Returns the lines, and the numbers of the
+# function headings found inside a string: there the quotes were misread.
+def strip_code(lines):
+    text = "\n".join(lines)
+    out, lost = [], []
+    # The stack holds "code" or "dq"; $( inside a double-quoted string opens
+    # code again.
+    stack, i, n, line_no = ["code"], 0, len(text), 1
+    heading = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\(\) *\{")
+    while i < n:
+        ch = text[i]
+        if ch == "\n":
+            line_no += 1
+            out.append(ch)
+            i += 1
+            continue
+        if ch == "\\" and i + 1 < n and text[i + 1] != "\n":
+            out.append(text[i:i + 2])
+            i += 2
+            continue
+        if stack[-1] == "dq":
+            if ch == '"':
+                stack.pop()
+            elif text.startswith("$(", i) and not text.startswith("$((", i):
+                stack.append("code")
+                out.append("$(")
+                i += 2
+                continue
+            out.append(ch)
+            i += 1
+            continue
+        if ch == '"':
+            stack.append("dq")
+        elif ch == "#" and (i == 0 or text[i - 1] in " \t\n;("):
+            while i < n and text[i] != "\n":
+                i += 1
+            continue
+        elif ch == "'":
+            # $'...' takes backslash escapes; '...' takes none.
+            ansi = i > 0 and text[i - 1] == "$"
+            out.append("'")
+            i += 1
+            while i < n and text[i] != "'":
+                if ansi and text[i] == "\\" and i + 1 < n:
+                    i += 1
+                if text[i] == "\n":
+                    line_no += 1
+                    out.append("\n")
+                    if heading.match(text, i + 1):
+                        lost.append(line_no)
+                i += 1
+            out.append("'")
+            i += 1
+            continue
+        elif text.startswith("$(", i) and not text.startswith("$((", i):
+            stack.append("code")
+            out.append("$(")
+            i += 2
+            continue
+        elif ch == ")" and len(stack) > 1:
+            stack.pop()
+        out.append(ch)
+        i += 1
+    return "".join(out).split("\n"), lost
 
 # Drop the text of double-quoted strings, keeping command substitutions.
 def unquote(text):
@@ -64,17 +126,28 @@ def unquote(text):
         i += 1
     return "".join(out)
 
+stripped, lost = strip_code(clean)
+if lost:
+    # Code after such a line would be checked as text or not at all.
+    for n in lost:
+        print(f"{path}:{n}: a function starts inside a quoted string: the quotes before it were misread")
+    print(f"{len(lost)} scope problem(s): the script could not be read")
+    sys.exit(1)
+
 functions, name, top = {}, None, []
-for i, raw in enumerate(clean, 1):
+for i, (raw, line) in enumerate(zip(clean, stripped), 1):
     m = re.match(r"^([A-Za-z_][A-Za-z0-9_]*)\(\) *\{", raw)
     if m:
         name = m.group(1)
         functions[name] = []
     if name:
-        functions[name].append((i, code(raw)))
+        functions[name].append((i, line))
     else:
-        top.append(code(raw))
-    if raw.startswith("}"):
+        top.append(line)
+    # The function ends at its closing brace: on a line of its own, or on the
+    # heading's line when the whole function is written there.
+    if line.startswith("}") or (m and line.rstrip().endswith("}")
+                                and line.count("{") == line.count("}")):
         name = None
 
 NAME = r"[A-Za-z_][A-Za-z0-9_]*"

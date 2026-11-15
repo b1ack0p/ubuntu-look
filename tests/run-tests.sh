@@ -58,22 +58,27 @@ ok "mirror: empty means the default"     option_value_ok UBUNTU_MIRROR ""
 ok "mirror: an http URL"                 option_value_ok UBUNTU_MIRROR "http://mirror.example.org/ubuntu"
 ok "mirror: an IPv6 host"                option_value_ok UBUNTU_MIRROR "https://[2001:db8::1]:8080/ubuntu"
 no "mirror: not ftp"                     option_value_ok UBUNTU_MIRROR "ftp://mirror.example.org/ubuntu"
+no "mirror: no user name or password"    option_value_ok UBUNTU_MIRROR "http://me:secret@mirror.example.org/ubuntu"
 no "mirror: no spaces"                   option_value_ok UBUNTU_MIRROR "http://a.example/u b"
 no "mirror: no shell characters"         option_value_ok UBUNTU_MIRROR 'http://a.example/$(id)'
 
 ### Saved options: parsed, never sourced
-tmp="$(mktemp)"
-printf '%s\n' 'UBUNTU_CODENAME=plucky' 'PLYMOUTH_THEME=$(touch /tmp/x)' \
-  'UBUNTU_BOOT_SPLASH=5' 'PATH=/nowhere' 'UBUNTU_MIRROR=http://m.example/ubuntu' > "$tmp"
+# UBUNTU_LOOK_REBOOT is an option of the script's that is not a saved one, and
+# is unset here: only the list of saved names keeps it out.
+tmpd="$(mktemp -d)"; tmp="$tmpd/options"
+printf '%s\n' 'UBUNTU_CODENAME=plucky' "PLYMOUTH_THEME=\$(touch $tmpd/made)" \
+  'UBUNTU_BOOT_SPLASH=5' 'PATH=/nowhere' 'UBUNTU_LOOK_REBOOT=0' \
+  'UBUNTU_MIRROR=http://m.example/ubuntu' > "$tmp"
 is "saved options: valid ones load, the rest are ignored" \
-  "plucky|unset|unset|http://m.example/ubuntu|kept" \
-  "$(unset UBUNTU_CODENAME PLYMOUTH_THEME UBUNTU_BOOT_SPLASH UBUNTU_MIRROR
+  "plucky|unset|unset|http://m.example/ubuntu|kept|unset|not run" \
+  "$(unset UBUNTU_CODENAME PLYMOUTH_THEME UBUNTU_BOOT_SPLASH UBUNTU_MIRROR UBUNTU_LOOK_REBOOT
      old_path="$PATH"; SAVED_OPTIONS="$tmp"; load_saved_options
      [ "$PATH" = "$old_path" ] && p=kept || p=changed
-     echo "${UBUNTU_CODENAME-unset}|${PLYMOUTH_THEME-unset}|${UBUNTU_BOOT_SPLASH-unset}|${UBUNTU_MIRROR-unset}|$p")"
+     [ -e "$tmpd/made" ] && m=run || m="not run"
+     echo "${UBUNTU_CODENAME-unset}|${PLYMOUTH_THEME-unset}|${UBUNTU_BOOT_SPLASH-unset}|${UBUNTU_MIRROR-unset}|$p|${UBUNTU_LOOK_REBOOT-unset}|$m")"
 is "saved options: a value given this run wins" "noble" \
   "$(UBUNTU_CODENAME=noble; SAVED_OPTIONS="$tmp"; load_saved_options; echo "$UBUNTU_CODENAME")"
-rm -f "$tmp"
+rm -rf "$tmpd"
 
 ### dconf values
 is "gvariant_string_array"               "['a', 'b']" "$(gvariant_string_array "a b")"
@@ -96,6 +101,19 @@ ok "grub_without_words: a word was dropped"  grub_without_words "quiet splash" s
 no "grub_without_words: none matched"    grub_without_words "quiet nosplash" splash
 is "grub_without_words leaves * alone"   "a=* b" "$(grub_without_words "a=* splash b" splash)"
 
+# read_grub_cmdline against a stand-in /etc/default/grub.
+grub_read() { ( GRUB_FILE="$(mktemp)"; printf '%b' "$1" > "$GRUB_FILE"; read_grub_cmdline; rm -f "$GRUB_FILE" ); }
+is "grub: a quoted line is read"         "active ro quiet" "$(grub_read 'GRUB_DEFAULT=0\nGRUB_CMDLINE_LINUX_DEFAULT="ro quiet"\n')"
+is "grub: no line"                       "absent "         "$(grub_read 'GRUB_DEFAULT=0\n')"
+is "grub: a commented line"              "commented "      "$(grub_read '#GRUB_CMDLINE_LINUX_DEFAULT="quiet"\n')"
+is "grub: two lines are not rewritten"   "unparsable "     "$(grub_read 'GRUB_CMDLINE_LINUX_DEFAULT="a"\nGRUB_CMDLINE_LINUX_DEFAULT="b"\n')"
+is "grub: an assignment later on a line is not rewritten" \
+  "unparsable " "$(grub_read 'if true; then GRUB_CMDLINE_LINUX_DEFAULT="a"; fi\n')"
+is "grub: one behind && is not rewritten" \
+  "unparsable " "$(grub_read 'GRUB_CMDLINE_LINUX_DEFAULT="a"\n[ -d /x ] && GRUB_CMDLINE_LINUX_DEFAULT="b"\n')"
+is "grub: the name in a comment does not count" \
+  "active a" "$(grub_read 'GRUB_CMDLINE_LINUX_DEFAULT="a"\nGRUB_TIMEOUT=5 # not GRUB_CMDLINE_LINUX_DEFAULT=\n')"
+
 ### Arguments
 is "no arguments: an install"            "install 0"    "$(parsed)"
 is "--refresh"                           "refresh 1"    "$(parsed --refresh)"
@@ -114,6 +132,21 @@ for gone in --download --offline --prepare-upgrade; do
   is "${gone} is gone" \
     "rc=1 [ERROR] ${gone} is no longer part of this script. See: bash ubuntu-look.sh --help" "$(parsed "$gone")"
 done
+is "an empty argument is refused" \
+  "rc=1 [ERROR] An empty argument was given. See: bash ubuntu-look.sh --help" "$(parsed "")"
+is "an empty argument beside a command is refused" \
+  "rc=1 [ERROR] An empty argument was given. See: bash ubuntu-look.sh --help" "$(parsed "" --reset)"
+# The on and off switches: only 0 and 1.
+switched() {  # switched <name> <value>: "ok", or the error
+  ( unset UBUNTU_LOOK_REBOOT UBUNTU_LOOK_LOG UBUNTU_LOOK_SYSTEM_UPGRADE
+    export "$1=$2"
+    (check_switches && echo ok) 2>&1 | sed -r 's/\x1b\[[0-9;]*m//g' )
+}
+is "a switch takes 0"                    "ok" "$(switched UBUNTU_LOOK_REBOOT 0)"
+is "a switch takes 1"                    "ok" "$(switched UBUNTU_LOOK_LOG 1)"
+is "a switch may be empty"               "ok" "$(switched UBUNTU_LOOK_SYSTEM_UPGRADE "")"
+is "a switch takes no word" \
+  "[ERROR] UBUNTU_LOOK_REBOOT takes 0 or 1 (got 'no')." "$(switched UBUNTU_LOOK_REBOOT no)"
 help="$(parsed --bogus --help)"
 is "--help wins over a bad command line" "Usage" "${help%% *}"
 
@@ -171,7 +204,7 @@ ensured() {  # ensured <installed version> <versions on offer> <"version=refused
       return 0
     }
     HAVE="$1" OFFER="$2" FAILS="$3" REJECTED_BUILDS="${4:-}" TRIED=""
-    ensure_package pkg > /dev/null 2>&1; rc=$?
+    ensure_package pkg > "$T/ensure.out" 2>&1; rc=$?
     echo "${rc} version=${ENSURE_VERSION} tried=${TRIED} rejected=${REJECTED_BUILDS# }"
   )
 }
@@ -191,9 +224,17 @@ is "ensure_package: nothing on offer installs" \
   "${RC_FAILED} version= tried=2 1 rejected=pkg=2 pkg=1" "$(ensured "" "2 1" "2=refused 1=refused")"
 is "ensure_package: a build turned down earlier is not tried twice" \
   "0 version=2 tried=2 rejected=pkg=3" "$(ensured "" "3 2" "" "pkg=3")"
-# These two stop the run: the subshell ends before it prints.
-is "ensure_package: a busy apt stops the run"      "" "$(ensured "" "3 2" "3=busy")"
-is "ensure_package: unwritable records stop the run" "" "$(ensured "" "3 2" "3=no-record")"
+# These two stop the run: the subshell ends before it prints, with the
+# error's status and its reason.
+stopped() {  # stopped <text of the error> <ensured's arguments...>
+  local said="$1" out rc; shift
+  out="$(ensured "$@")"; rc=$?
+  echo "rc=${rc} out=${out} said=$(grep -c -- "$said" "$T/ensure.out")"
+}
+is "ensure_package: a busy apt stops the run" \
+  "rc=1 out= said=1" "$(stopped "apt is busy or the network failed" "" "3 2" "3=busy")"
+is "ensure_package: unwritable records stop the run" \
+  "rc=1 out= said=1" "$(stopped "could not write the look's records" "" "3 2" "3=no-record")"
 
 # plymouth_put_back: hands back PLY_WAS, PLY_CURRENT and the outcome's name.
 put_back() {  # put_back <current theme> <theme before> <theme set> <owed: 0|1> <put status> <rebuild status> [owe status]
@@ -296,18 +337,26 @@ is "set_boot_splash: an unparsable grub file leaves the theme alone" \
 is "set_boot_splash: with the words in place the theme is set" \
   "0 theme=1 changes=0 failed=0" "$(splash "active ro quiet splash")"
 
-# auto_reboot: the real reboot command is never reached here. Without a
-# terminal the countdown's reads fail at once, so it runs out immediately.
-rebooted() {  # rebooted <UBUNTU_LOOK_REBOOT> <terminal: 0|1> [reboot status]
+# auto_reboot: the real reboot command is never reached here, and the wait
+# for Enter is a stand-in that ends at once with the status of an Enter (0),
+# of the time running out (142) or of a terminal that went away (1).
+rebooted() {  # rebooted <UBUNTU_LOOK_REBOOT> <terminal: 0|1> [reboot status] [wait status]
   (
     reboot_now() { echo "REBOOT"; return "$R_RC"; }
     reboot_can_be_answered() { [ "$TTY" = 1 ]; }
-    UBUNTU_LOOK_REBOOT="$1" TTY="$2" R_RC="${3:-0}" REBOOT_COUNTDOWN=3
+    countdown_read() { return "$READ_RC"; }
+    UBUNTU_LOOK_REBOOT="$1" TTY="$2" R_RC="${3:-0}" READ_RC="${4:-142}" REBOOT_COUNTDOWN=3
     auto_reboot 2>&1 | sed -r 's/\x1b\[[0-9;]*m//g' | tr -s ' ' | tr '\n' '|'
   )
 }
 is "auto_reboot: counts down, then reboots" \
   " Rebooting in 3 seconds. Press Enter to reboot now, Ctrl-C to cancel.| Rebooting now.|REBOOT|" "$(rebooted 1 1)"
+is "auto_reboot: Enter reboots" \
+  " Rebooting in 3 seconds. Press Enter to reboot now, Ctrl-C to cancel.| Rebooting now.|REBOOT|" "$(rebooted 1 1 0 0)"
+is "auto_reboot: Ctrl-C cancels" \
+  " Rebooting in 3 seconds. Press Enter to reboot now, Ctrl-C to cancel.| Reboot cancelled. When you are ready, run: sudo reboot|" "$(rebooted 1 1 0 130)"
+is "auto_reboot: a terminal that went away does not reboot" \
+  " Rebooting in 3 seconds. Press Enter to reboot now, Ctrl-C to cancel.| The terminal is gone — not rebooting. Run: sudo reboot|" "$(rebooted 1 1 0 1)"
 is "auto_reboot: UBUNTU_LOOK_REBOOT=0 only names the command" \
   " Run: sudo reboot|" "$(rebooted 0 1)"
 is "auto_reboot: no terminal, no reboot" \
@@ -315,11 +364,94 @@ is "auto_reboot: no terminal, no reboot" \
 is "auto_reboot: a reboot that does not start is reported" \
   " Rebooting in 3 seconds. Press Enter to reboot now, Ctrl-C to cancel.| Rebooting now.|REBOOT|[WARN] could not start the reboot — run: sudo reboot|" "$(rebooted 1 1 1)"
 
+### The summary's reboot: one an earlier run owes starts no countdown
+summarised() {  # summarised <carried: 0|1> <relogin: 0|1> <failed items> <finished: 0|1>
+  (
+    log_final_state() { :; }
+    auto_reboot() { echo "COUNTDOWN"; }
+    RUN_STARTED=1 RUN_FINISHED="$4" INITRAMFS_PARTIAL=0 REBOOT_NEEDED=1 REBOOT_CARRIED="$1" RELOGIN_NEEDED="$2"
+    STATUS_INSTALLED=() STATUS_UPGRADED=() STATUS_ALREADY=() STATUS_HELD=() STATUS_CHANGES=() STATUS_NOCHANGE=()
+    STATUS_FAILED=(); [ "$3" -eq 0 ] || STATUS_FAILED=("one thing")
+    SETTINGS_KEPT=()
+    true; print_summary 2>&1 | sed -r 's/\x1b\[[0-9;]*m//g' \
+      | grep -oE 'REBOOT (STILL )?REQUIRED|COUNTDOWN|Run: sudo reboot|Everything else was applied' | tr '\n' '|'
+  )
+}
+is "summary: a reboot this run needs counts down" \
+  "REBOOT REQUIRED|COUNTDOWN|" "$(summarised 0 0 0 1)"
+is "summary: a reboot only an earlier run owes names the command" \
+  "REBOOT STILL REQUIRED|Run: sudo reboot|" "$(summarised 1 0 0 1)"
+is "summary: an owed reboot with new changes counts down" \
+  "REBOOT REQUIRED|COUNTDOWN|" "$(summarised 1 1 0 1)"
+is "summary: with a step not done there is no countdown" \
+  "Everything else was applied|REBOOT REQUIRED|Run: sudo reboot|" "$(summarised 0 0 1 1)"
+
+### The provisional pin: a file that blocks nothing is no pin
+provisional() {  # provisional <content of the pin file, or "absent">
+  (
+    d="$T/pin"; rm -rf "$d"; mkdir -p "$d"
+    UBUNTU_PIN="$d/pin"
+    [ "$1" = absent ] || printf '%b' "$1" > "$UBUNTU_PIN"
+    sudo_write_atomic() { cp "$1" "$2"; }
+    sudo() { "$@"; }
+    write_provisional_pin; rc=$?
+    echo "rc=${rc} blocks=$(grep -cx 'Pin-Priority: -1' "$UBUNTU_PIN")"
+  )
+}
+is "provisional pin: written where there is none"   "rc=${RC_CHANGED} blocks=1"   "$(provisional absent)"
+is "provisional pin: an empty file is written anew" "rc=${RC_CHANGED} blocks=1"   "$(provisional "")"
+is "provisional pin: a pin that blocks is kept" \
+  "rc=${RC_UNCHANGED} blocks=1" "$(provisional 'Package: *\nPin: release o=Ubuntu\nPin-Priority: -1\n')"
+
+### The session choice: any of the Ubuntu session's entries counts as chosen
+chosen() {  # chosen <the user's session>
+  (
+    busctl() { [ "$1" = get-property ] && echo "s \"$SESSION\""; }
+    sudo() { echo "SET"; }
+    SESSION="$1"
+    choose_ubuntu_session > /dev/null; echo "$?"
+  )
+}
+is "session: ubuntu is already chosen"            "$RC_UNCHANGED" "$(chosen ubuntu)"
+is "session: Ubuntu on Xorg stays as picked"      "$RC_UNCHANGED" "$(chosen ubuntu-xorg)"
+is "session: Ubuntu on Wayland stays as picked"   "$RC_UNCHANGED" "$(chosen ubuntu-wayland)"
+is "session: GNOME is changed to Ubuntu"          "$RC_CHANGED"   "$(chosen gnome)"
+
+### --reset needs a finished install, not only its records
+reset_start() {  # reset_start <records: 0|1> <pin: full|provisional|none>
+  (
+    d="$T/resetstart"; rm -rf "$d"; mkdir -p "$d"
+    PACKAGES_BEFORE="$d/before"; UBUNTU_PIN="$d/pin"
+    [ "$1" -eq 0 ] || : > "$PACKAGES_BEFORE"
+    case "$2" in
+      full)        printf '# pin-version: 1\nPackage: *\n' > "$UBUNTU_PIN" ;;
+      provisional) printf '# provisional\nPackage: *\n' > "$UBUNTU_PIN" ;;
+    esac
+    have_session() { echo "REACHED"; exit 0; }
+    ACTION=reset REFRESH=0
+    install_start 2>&1 | sed -r 's/\x1b\[[0-9;]*m//g' | head -n 1
+  )
+}
+is "--reset: an installed look goes on" "REACHED" "$(reset_start 1 full)"
+is "--reset: records of an install that stopped early are not an install" \
+  "[ERROR] The Ubuntu look is not installed, or its install did not finish. Install it with: bash ubuntu-look.sh" \
+  "$(reset_start 1 provisional)"
+is "--reset: records an uninstall kept are not an install" \
+  "[ERROR] The Ubuntu look is not installed, or its install did not finish. Install it with: bash ubuntu-look.sh" \
+  "$(reset_start 1 none)"
+is "--reset: no records, no install" \
+  "[ERROR] The Ubuntu look is not installed, or its install did not finish. Install it with: bash ubuntu-look.sh" \
+  "$(reset_start 0 none)"
+
 ### Variable scope: a lowercase variable a function sets is local, and run
 ### state is declared in section 1 (tests/lint-scope.py).
 if command -v python3 > /dev/null 2>&1; then
+  # The linter's status as well as its findings: one that stops with an
+  # error prints no finding either.
+  scope_out="$(python3 tests/lint-scope.py ubuntu-look.sh 2>&1)"; scope_rc=$?
+  is "scope: the linter ran to its end" "0" "$scope_rc"
   is "scope: every variable is local or declared" "" \
-    "$(python3 tests/lint-scope.py ubuntu-look.sh | grep -v '^0 scope problem')"
+    "$(printf '%s\n' "$scope_out" | grep -v '^0 scope problem(s) in [1-9][0-9]* functions$')"
 else
   echo "SKIP scope check: python3 is missing"
 fi
@@ -463,7 +595,8 @@ is "uninstall: a stopped run lists what it did"   "3" "$(stopped_uninstall 1 0)"
 is "uninstall: a finished run adds nothing"       "0" "$(stopped_uninstall 1 1)"
 is "uninstall: a run stopped before it began adds nothing" "0" "$(stopped_uninstall 0 0)"
 
-### --reset: the user's own values of the look's settings, and nothing else
+### The reset: the user's own values of the look's settings, and nothing else;
+### nothing is written to the user's home
 # A stand-in settings database: "<key>=<value>" lines in $T/reset/db.
 reset_run() {  # reset_run <"key=value" lines of the user's own settings> [dconf status]
   (
@@ -486,43 +619,441 @@ reset_run() {  # reset_run <"key=value" lines of the user's own settings> [dconf
       esac
     }
     look_installed_ext() { [ "$1" != ubuntu-appindicators@ubuntu.com ]; }
-    # The look's own values: Yaru as the GTK theme, nothing else.
-    our_dconf_value() { [ "$1/$2" != org/gnome/desktop/interface/gtk-theme ] || echo "'Yaru'"; }
+    # The look's own values: Yaru as the GTK theme, and with WALLPAPER=1 its
+    # wallpaper; nothing else.
+    our_dconf_value() {
+      case "$1/$2" in
+        org/gnome/desktop/interface/gtk-theme) echo "'Yaru'" ;;
+        org/gnome/desktop/background/picture-uri) [ "${WALLPAPER:-0}" = 0 ] || echo "'file:///look.png'" ;;
+      esac
+    }
     message() { :; }
-    HOME="$d/home" BACKUP_DIR="$d/home/.ubuntu-look-backup" TERMINAL_SHORTCUT_RECORD="$d/home/.ubuntu-look-backup/terminal-shortcut-added"
+    HOME="$d/home"
     DCONF_RC="${2:-0}" STATUS_CHANGES=() STATUS_NOCHANGE=() STATUS_FAILED=()
     reset_user_settings > /dev/null 2>&1
-    saved="$(find "$BACKUP_DIR" -name 'settings-before-reset-*.ini' | wc -l)"
-    echo "left=$(tr '\n' ' ' < "$d/db" | sed 's/ *$//') changes=${#STATUS_CHANGES[@]} failed=${#STATUS_FAILED[@]} saved=${saved} file=$(cat "$d/home/Documents/notes.txt")"
+    # Nothing may appear in the user's home beside what was there.
+    echo "left=$(tr '\n' ' ' < "$d/db" | sed 's/ *$//') changes=${#STATUS_CHANGES[@]} failed=${#STATUS_FAILED[@]} home=$(cd "$d/home" && find . -mindepth 1 | sort | xargs)"
   )
 }
 is "reset: the look's keys go, every other setting stays" \
-  "left=/org/gnome/shell/favorite-apps=['a'] /org/gnome/desktop/input-sources/sources=x changes=1 failed=0 saved=1 file=mine" \
+  "left=/org/gnome/shell/favorite-apps=['a'] /org/gnome/desktop/input-sources/sources=x changes=1 failed=0 home=./Documents ./Documents/notes.txt" \
   "$(reset_run "/org/gnome/desktop/interface/gtk-theme='Adwaita' /org/gnome/desktop/wm/preferences/button-layout='close:' /org/gnome/shell/favorite-apps=['a'] /org/gnome/desktop/input-sources/sources=x")"
 is "reset: the settings of the look's extensions go" \
-  "left= changes=1 failed=0 saved=1 file=mine" \
+  "left= changes=1 failed=0 home=./Documents ./Documents/notes.txt" \
   "$(reset_run "/org/gnome/shell/extensions/dash-to-dock/dock-position='LEFT' /org/gnome/shell/extensions/tiling-assistant/x=1")"
 is "reset: the tiling assistant keeps its note of the shortcuts it took over" \
-  "left=/org/gnome/shell/extensions/tiling-assistant/overridden-settings={} changes=1 failed=0 saved=1 file=mine" \
+  "left=/org/gnome/shell/extensions/tiling-assistant/overridden-settings={} changes=1 failed=0 home=./Documents ./Documents/notes.txt" \
   "$(reset_run "/org/gnome/shell/extensions/tiling-assistant/overridden-settings={} /org/gnome/shell/extensions/tiling-assistant/gaps/window=8 /org/gnome/shell/extensions/tiling-assistant/x=1")"
 is "reset: what the extensions store by themselves stays" \
-  "left=/org/gnome/shell/extensions/tiling-assistant/last-version-installed=51 /org/gnome/shell/extensions/tiling-assistant/focus-hint-color='rgb(237,91,0)' /org/gnome/shell/extensions/ding/check-x11wayland=true changes=0 failed=0 saved=0 file=mine" \
+  "left=/org/gnome/shell/extensions/tiling-assistant/last-version-installed=51 /org/gnome/shell/extensions/tiling-assistant/focus-hint-color='rgb(237,91,0)' /org/gnome/shell/extensions/ding/check-x11wayland=true changes=0 failed=0 home=./Documents ./Documents/notes.txt" \
   "$(reset_run "/org/gnome/shell/extensions/tiling-assistant/last-version-installed=51 /org/gnome/shell/extensions/tiling-assistant/focus-hint-color='rgb(237,91,0)' /org/gnome/shell/extensions/ding/check-x11wayland=true")"
 is "reset: a value that is the look's own is left" \
-  "left=/org/gnome/desktop/interface/gtk-theme='Yaru' changes=0 failed=0 saved=0 file=mine" \
+  "left=/org/gnome/desktop/interface/gtk-theme='Yaru' changes=0 failed=0 home=./Documents ./Documents/notes.txt" \
   "$(reset_run "/org/gnome/desktop/interface/gtk-theme='Yaru'")"
 is "reset: an extension the user had before keeps its settings" \
-  "left=/org/gnome/shell/extensions/appindicator/icon-size=5 changes=0 failed=0 saved=0 file=mine" \
+  "left=/org/gnome/shell/extensions/appindicator/icon-size=5 changes=0 failed=0 home=./Documents ./Documents/notes.txt" \
   "$(reset_run "/org/gnome/shell/extensions/appindicator/icon-size=5")"
 is "reset: the look's extensions leave the disabled list" \
-  "left=/org/gnome/shell/favorite-apps=['a'] changes=1 failed=0 saved=1 file=mine" \
+  "left=/org/gnome/shell/favorite-apps=['a'] changes=1 failed=0 home=./Documents ./Documents/notes.txt" \
   "$(reset_run "/org/gnome/shell/disabled-extensions=['ubuntu-dock@ubuntu.com'] /org/gnome/shell/favorite-apps=['a']")"
+is "reset: the user's wallpaper goes for the look's" \
+  "left= changes=1 failed=0 home=./Documents ./Documents/notes.txt" \
+  "$(WALLPAPER=1 reset_run "/org/gnome/desktop/background/picture-uri='file:///mine.png'")"
+is "reset: without a wallpaper of the look's the user's stays" \
+  "left=/org/gnome/desktop/background/picture-uri='file:///mine.png' changes=0 failed=0 home=./Documents ./Documents/notes.txt" \
+  "$(reset_run "/org/gnome/desktop/background/picture-uri='file:///mine.png'")"
+is "reset: the dark style goes, though the look sets no value for it" \
+  "left= changes=1 failed=0 home=./Documents ./Documents/notes.txt" \
+  "$(reset_run "/org/gnome/desktop/interface/color-scheme='prefer-dark'")"
+is "reset: the light style written out is the look's default and stays" \
+  "left=/org/gnome/desktop/interface/color-scheme='prefer-light' changes=0 failed=0 home=./Documents ./Documents/notes.txt" \
+  "$(reset_run "/org/gnome/desktop/interface/color-scheme='prefer-light'")"
+is "reset: were Ubuntu's style dark, a light one would go" \
+  "left= changes=1 failed=0 home=./Documents ./Documents/notes.txt" \
+  "$(UBUNTU_COLOR_SCHEME=prefer-dark; reset_run "/org/gnome/desktop/interface/color-scheme='prefer-light'")"
+is "reset: were Ubuntu's style dark, a dark one would stay" \
+  "left=/org/gnome/desktop/interface/color-scheme='prefer-dark' changes=0 failed=0 home=./Documents ./Documents/notes.txt" \
+  "$(UBUNTU_COLOR_SCHEME=prefer-dark; reset_run "/org/gnome/desktop/interface/color-scheme='prefer-dark'")"
+is "reset: a style Ubuntu's settings set is the one that stays" \
+  "left=/org/gnome/desktop/interface/color-scheme='prefer-dark' changes=0 failed=0 home=./Documents ./Documents/notes.txt" \
+  "$(UBUNTU_COLOR_SCHEME_SETTING=prefer-dark; reset_run "/org/gnome/desktop/interface/color-scheme='prefer-dark'")"
+is "reset: with a style set by Ubuntu's settings, GNOME's default goes" \
+  "left= changes=1 failed=0 home=./Documents ./Documents/notes.txt" \
+  "$(UBUNTU_COLOR_SCHEME_SETTING=prefer-dark; reset_run "/org/gnome/desktop/interface/color-scheme='default'")"
+is "defaults: no style set by Ubuntu's settings, no key" "0" \
+  "$(render_dconf_groups | grep -c '^color-scheme=')"
+is "defaults: a style Ubuntu's settings set is written, in the interface group" "[org/gnome/desktop/interface]|color-scheme='prefer-dark'" \
+  "$(UBUNTU_COLOR_SCHEME_SETTING=prefer-dark; render_dconf_groups | grep -B1 '^color-scheme=' | tr '\n' '|' | sed 's/|$//')"
+is "session mode: it names the release's style" "1" \
+  "$(UBUNTU_COLOR_SCHEME=prefer-dark; session_mode_content 2>/dev/null | grep -c '"colorScheme": "prefer-dark"')"
+# Ubuntu's own files, as its packages carry them.
+is "style: Ubuntu's session mode names it" "prefer-light" \
+  "$(printf '{\n    "parentMode": "user",\n    "colorScheme": "prefer-light",\n    "enabledExtensions": []\n}\n' | mode_color_scheme)"
+is "style: a mode that names none" "" "$(printf '{\n    "parentMode": "user"\n}\n' | mode_color_scheme)"
+is "style: a word that is no style is not taken" "" "$(printf '"colorScheme": "$(id)",\n' | mode_color_scheme)"
+is "style: settings that set none" "" \
+  "$(printf '[org.gnome.desktop.interface]\ngtk-theme="Yaru"\n[org.gnome.desktop.interface:ubuntu]\nicon-theme="Yaru"\n' | override_color_scheme)"
+is "style: the Ubuntu session's own section wins" "prefer-dark" \
+  "$(printf '[org.gnome.desktop.interface:ubuntu]\ncolor-scheme = "prefer-dark"\n[org.gnome.desktop.interface]\ncolor-scheme="prefer-light"\n' | override_color_scheme)"
+is "style: another session's section does not count" "" \
+  "$(printf "[org.gnome.desktop.interface:Unity]\ncolor-scheme='prefer-dark'\n" | override_color_scheme)"
+is "style: GNOME's default reads as none" "" \
+  "$(printf "[org.gnome.desktop.interface]\ncolor-scheme='default'\n" | override_color_scheme)"
+# read_ubuntu_style against stand-ins for apt and the package files.
+styled() {  # styled <packages readable: 0|1> <record, or ""> <mode's style> <settings' style, or "">
+  (
+    d="$T/style"; rm -rf "$d"; mkdir -p "$d"
+    UBUNTU_STYLE_RECORD="$d/record"; [ -z "$2" ] || echo "$2" > "$UBUNTU_STYLE_RECORD"
+    UBUNTU_DEFAULTS_RECORD="$d/defaults"
+    [ -z "${5:-}" ] || printf '# release: %s\n[org.gnome.desktop.interface:ubuntu]\ngtk-theme="Yaru"\n' "$5" > "$UBUNTU_DEFAULTS_RECORD"
+    UBUNTU_CODENAME=stonking STATUS_NOCHANGE=() RELEASE_SETTINGS_APPLIED=0
+    release_build() { echo 1; }
+    UBUNTU_EXTRAS_RECORD="$d/extras"
+    apt-get() { [ "$READABLE" = 1 ] && touch "${2%%=*}_1_all.deb"; }
+    deb_file() {
+      case "$2" in
+        */ubuntu.json) echo "{ \"colorScheme\": \"${MODE}\", \"enabledExtensions\": [ ${EXTS:-} ] }" ;;
+        *) printf '[org.gnome.desktop.interface:ubuntu]\ngtk-theme="Yaru"\n'; [ -z "$SETTING" ] || echo "color-scheme='${SETTING}'" ;;
+      esac
+    }
+    sys_record_write() { echo "$2" > "$1"; }
+    message() { :; }
+    READABLE="$1" MODE="$3" SETTING="${4:-}"
+    read_ubuntu_style
+    [ -z "${EXTS:-}" ] || { echo "mode=${MODE_EXTENSIONS#* } record=$(cut -d' ' -f4 "$UBUNTU_STYLE_RECORD")"; exit; }
+    echo "shell=${UBUNTU_COLOR_SCHEME} apps=${UBUNTU_COLOR_SCHEME_SETTING:-none} record=$(cat "$UBUNTU_STYLE_RECORD" 2>/dev/null) notes=${#STATUS_NOCHANGE[@]} defaults=$([ -n "$UBUNTU_DEFAULTS" ] && head -n 1 "$UBUNTU_DEFAULTS")"
+  )
+}
+is "style: read from the release's packages and recorded" \
+  "shell=prefer-light apps=none record=stonking prefer-light - - - - notes=0 defaults=# release: stonking" "$(styled 1 "" prefer-light)"
+is "style: a release that starts dark is followed" \
+  "shell=prefer-dark apps=prefer-dark record=stonking prefer-dark prefer-dark - - - notes=0 defaults=# release: stonking" "$(styled 1 "plucky prefer-light -" prefer-dark prefer-dark "" plucky)"
+is "style: unreadable packages, the record of this release is used" \
+  "shell=prefer-dark apps=prefer-dark record=stonking prefer-dark prefer-dark notes=1 defaults=# release: stonking" "$(styled 0 "stonking prefer-dark prefer-dark" x "" stonking)"
+is "style: unreadable packages and another release's record, light is assumed" \
+  "shell=prefer-light apps=none record=plucky prefer-dark prefer-dark notes=2 defaults=" "$(styled 0 "plucky prefer-dark prefer-dark" x "" plucky)"
+
+is "style: the session mode's extensions are the release's, Canonical's services apart" \
+  "mode=ubuntu-dock@ubuntu.com new-thing@ubuntu.com record=ubuntu-dock@ubuntu.com,snapd-prompting@canonical.com,new-thing@ubuntu.com" \
+  "$(EXTS='"ubuntu-dock@ubuntu.com", "snapd-prompting@canonical.com", "new-thing@ubuntu.com"' styled 1 "" prefer-light)"
+
+### The look's values come from the release's own defaults file
+DEFAULTS_SAMPLE="$T/defaults-sample"
+cat > "$DEFAULTS_SAMPLE" << 'SAMPLE'
+# release: stonking
+[org.gnome.desktop.interface]
+monospace-font-name="Ubuntu Sans Mono 13"
+accent-color = 'orange'
+[org.gnome.Epiphany]
+default-search-engine = 'Google'
+[org.gnome.desktop.interface:GNOME-Greeter]
+gtk-theme = "Greeter"
+[org.gnome.desktop.interface:ubuntu]
+gtk-theme = "Yaru-next"
+monospace-font-name = "Ubuntu Sans Mono 11"
+enable-hot-corners = "yes"
+[org.gnome.desktop.wm.keybindings:ubuntu]
+switch-windows = ['<Alt>Tab','<Super>w']
+[org.gnome.desktop.wm.preferences:ubuntu]
+button-layout = 'close,minimize,maximize:'
+[org.gnome.desktop.wm.preferences:Unity]
+button-layout = 'unity'
+[org.gnome.mutter:ubuntu]
+edge-tiling = true
+[org.gnome.shell.extensions.new-thing:ubuntu]
+shiny = true
+[org.gtk.Settings.FileChooser:ubuntu]
+startup-mode = 'recent'
+SAMPLE
+is "defaults: the Ubuntu session's section wins over the one for every session" \
+  "org.gnome.desktop.interface monospace-font-name \"Ubuntu Sans Mono 11\"" \
+  "$(ubuntu_defaults "$DEFAULTS_SAMPLE" | grep ' monospace-font-name ')"
+is "defaults: other sessions' sections are not read" "0" \
+  "$(ubuntu_defaults "$DEFAULTS_SAMPLE" | grep -c 'Greeter\|unity')"
+is "value: a string takes single quotes"   "'Yaru'"        "$(gvariant_canon '"Yaru"')"
+is "value: a list keeps its items"         "['a', 'b']"    "$(gvariant_canon "['a', 'b']")"
+is "kind: a string"   "string"  "$(gvariant_kind "'Ubuntu Sans 11'")"
+is "kind: a switch"   "bool"    "$(gvariant_kind true)"
+is "kind: a number"   "number"  "$(gvariant_kind 0)"
+is "kind: a list"     "strings" "$(gvariant_kind "['<Alt>Tab','<Super>w']")"
+is "kind: an empty list" "strings" "$(gvariant_kind "[]")"
+is "kind: anything else is none" "" "$(gvariant_kind "{'a': <1>}")"
+is "kind: a cut string is none"  "" "$(gvariant_kind "'Yaru")"
+is "schema: a path's schema"            "org.gnome.desktop.interface"  "$(schema_of_path org/gnome/desktop/interface)"
+is "schema: the file chooser's"         "org.gtk.Settings.FileChooser" "$(schema_of_path org/gtk/settings/file-chooser)"
+followed() {  # followed <key>: its value in GNOME_SETTINGS after the release's defaults are applied
+  (
+    message() { :; }
+    # The schemas this stand-in system has, beside those the look sets keys of.
+    gsettings() { echo "org.gnome.shell.extensions.new-thing /org/gnome/shell/extensions/new-thing/"; }
+    UBUNTU_DEFAULTS="$DEFAULTS_SAMPLE" UBUNTU_CODENAME=stonking RELEASE_SETTINGS_APPLIED=0 STATUS_NOCHANGE=()
+    apply_release_settings
+    if [ "$1" = notes ]; then printf '%s\n' "${STATUS_NOCHANGE[@]}"; exit; fi
+    printf '%s\n' "${GNOME_SETTINGS[@]}" | sed -n "s/^[^|]*|${1}|//p"
+  )
+}
+is "follow: a default the release changed is taken"      "'Yaru-next'"                "$(followed gtk-theme)"
+is "follow: the session's own section, not the general"  "'Ubuntu Sans Mono 11'"      "$(followed monospace-font-name)"
+is "follow: a list is taken"                             "['<Alt>Tab','<Super>w']"    "$(followed switch-windows)"
+is "follow: another session's value is not"              "'close,minimize,maximize:'" "$(followed button-layout)"
+is "follow: a mapped schema is found"                    "'recent'"                   "$(followed startup-mode)"
+is "follow: a value of another kind keeps the script's"  "false"                      "$(followed enable-hot-corners)"
+is "follow: a setting the release does not set keeps the script's" "'Yaru'"           "$(followed icon-theme)"
+is "follow: a default in a schema new to the look is applied where this system has the schema" "true" "$(followed shiny)"
+is "follow: nothing is reported for it, nor for one left out on purpose" "" "$(followed notes)"
+is "follow: a default for software this system does not have is not applied" "" \
+  "$(printf '# release: x\n[com.example.absent:ubuntu]\nthing = true\n' > "$T/absent"; DEFAULTS_SAMPLE="$T/absent"; followed thing)"
+is "follow: a later release's default the release does not set is not applied" "" "$(followed start-in-overview)"
+is "follow: a later release's default the release sets is applied" "false" \
+  "$(printf '# release: stonking\n[org.gnome.shell:ubuntu]\nstart-in-overview = false\n' > "$T/later"; DEFAULTS_SAMPLE="$T/later"; followed start-in-overview)"
+is "follow: a new default in a schema the look sets keys of is applied" "true" \
+  "$(printf '# release: x\n[org.gnome.desktop.interface:ubuntu]\nshiny-new = true\n' > "$T/new"; DEFAULTS_SAMPLE="$T/new"; followed shiny-new)"
+is "follow: it joins its schema's other settings" "org/gnome/desktop/interface" \
+  "$( ( message() { :; }; printf '# release: x\n[org.gnome.desktop.interface:ubuntu]\nshiny-new = true\n' > "$T/new"
+        UBUNTU_DEFAULTS="$T/new" UBUNTU_CODENAME=x RELEASE_SETTINGS_APPLIED=0 STATUS_NOCHANGE=()
+        apply_release_settings; printf '%s\n' "${GNOME_SETTINGS[@]}" | grep -B1 '|shiny-new|' | head -n 1 | cut -d'|' -f1 ) )"
+is "follow: a new default whose value is no value is reported, not applied" \
+  "Ubuntu stonking sets 1 default(s) whose value this script cannot take, not applied: org.gnome.desktop.interface.odd" \
+  "$(printf "# release: x\n[org.gnome.desktop.interface:ubuntu]\nodd = {'a': <1\n" > "$T/odd"; DEFAULTS_SAMPLE="$T/odd"; followed notes)"
+ok "value: one of a kind the script knows is valid"          gvariant_valid "'Yaru'"
+no "value: a cut value is not valid"                         gvariant_valid "{'a': <1"
+no "value: an empty value is not valid"                      gvariant_valid ""
+if command -v dconf > /dev/null 2>&1; then
+  ok "value: any value dconf's compiler takes is valid"      gvariant_valid "{'audio/x-vorbis': 'Ubuntu'}"
+  is "follow: a new default of any kind dconf takes is applied" "{'a': <1>}" \
+    "$(printf "# release: x\n[org.gnome.desktop.interface:ubuntu]\nodd = {'a': <1>}\n" > "$T/odd2"; DEFAULTS_SAMPLE="$T/odd2"; followed odd)"
+fi
+wallpapers() {  # wallpapers <defaults file text>
+  ( message() { :; }; printf '%b' "$1" > "$T/wp"
+    UBUNTU_DEFAULTS="$T/wp" UBUNTU_CODENAME=x RELEASE_SETTINGS_APPLIED=0 STATUS_NOCHANGE=()
+    apply_release_settings; echo "${WP_LIGHT##*/} ${WP_DARK##*/}" )
+}
+is "follow: the wallpaper files are the release's" "new-light.png new-dark.png" \
+  "$(wallpapers "# release: x\n[org.gnome.desktop.background:ubuntu]\npicture-uri = 'file:///usr/share/backgrounds/new-light.png'\npicture-uri-dark = 'file:///usr/share/backgrounds/new-dark.png'\n")"
+is "follow: a wallpaper outside the backgrounds folder is not taken" "warty-final-ubuntu.png ubuntu-wallpaper-d.png" \
+  "$(wallpapers "# release: x\n[org.gnome.desktop.background:ubuntu]\npicture-uri = 'file:///etc/passwd'\npicture-uri-dark = 'http://x/y.png'\n")"
+greeter() {  # greeter <key> <the session's value> [old font names: 0|1]
+  ( message() { :; }
+    printf '# release: x\n[org.gnome.desktop.interface:GNOME-Greeter]\ngtk-theme = "Yaru-greeter"\nfont-name = "Ubuntu Sans 12"\nfont-antialiasing = 7\n[org.gnome.desktop.interface:ubuntu]\ngtk-theme = "Yaru"\n' > "$T/gr"
+    UBUNTU_DEFAULTS="$T/gr" UBUNTU_CODENAME=x RELEASE_SETTINGS_APPLIED=0 STATUS_NOCHANGE=()
+    apply_release_settings; FONTS_OLD_NAMES="${3:-0}"; greeter_value "$1" "$2" )
+}
+is "greeter: the login screen's own value is used"        "'Yaru-greeter'"   "$(greeter gtk-theme "'Yaru'")"
+is "greeter: one it does not set takes the session's"     "'Yaru'"           "$(greeter icon-theme "'Yaru'")"
+is "greeter: a value of another kind is not taken"        "'rgba'"           "$(greeter font-antialiasing "'rgba'")"
+is "greeter: older font names are fitted"                 "'Ubuntu 12'"      "$(greeter font-name "'Ubuntu 11'" 1)"
+is "mode: its stylesheet"  "Yaru/gnome-shell.css" \
+  "$(printf '{\n  "stylesheetName": "Yaru/gnome-shell.css",\n  "colorScheme": "prefer-light"\n}\n' | mode_string stylesheetName)"
+is "mode: a name with anything but a file name's characters is not taken" "" \
+  "$(printf '{ "stylesheetName": "a b$(id)" }\n' | mode_string stylesheetName)"
+is "session mode: it names the release's stylesheet and theme" "2" \
+  "$(MODE_STYLESHEET=Next/shell.css MODE_THEME_RESOURCE=theme/Next/x.gresource; session_mode_content 2>/dev/null | grep -c 'Next/')"
+# The terminal's colours from the Yaru theme, against a stand-in for gresource.
+terminal_colours() {  # terminal_colours <the theme's rule>
+  (
+    message() { :; }
+    YARU_GTK_RESOURCE="$T/yaru.gresource"; : > "$YARU_GTK_RESOURCE"
+    gresource() {
+      case "$1" in
+        list) echo /com/ubuntu/themes/Yaru/3.0/gtk.css; echo /com/ubuntu/themes/Yaru/3.0/gtk-dark.css ;;
+        extract) printf 'window { color: red; }\n%b\nother { color: blue; }\n' "$RULE" ;;
+      esac
+    }
+    RULE="$1"
+    yaru_terminal_colours
+    printf '%s\n' "${GNOME_SETTINGS[@]}" | sed -n 's/.*|\(background\|foreground\)-color|//p' | xargs
+  )
+}
+is "terminal: the theme's colours are taken" "#2C001E #EEEEEE" \
+  "$(terminal_colours 'terminal-window .terminal-screen {\n  background-color: #2C001E;\n  color: #EEEEEE; }')"
+is "terminal: white is a colour" "#300A24 #FFFFFF" \
+  "$(terminal_colours 'terminal-window .terminal-screen {\n  background-color: #300A24;\n  color: white; }')"
+is "terminal: a theme without the rule keeps the script's colours" "#300A24 #FFFFFF" \
+  "$(terminal_colours 'terminal-window .other { background-color: #111111; }')"
+is "terminal: a value that is no colour is not taken" "#300A24 #FFFFFF" \
+  "$(terminal_colours 'terminal-window .terminal-screen {\n  background-color: url(x);\n  color: inherit; }')"
+adopted() {  # adopted <installs cleanly: 0|1>: the packages taken into the look, the pin's list, the note
+  (
+    message() { :; }
+    release_build() { echo 1; }
+    apt-cache() { echo "Depends: yaru-theme-gtk (>= 1), yaru-theme-new, network-manager, gnome-shell-ubuntu-extensions | gnome-shell-extension-ubuntu-dock, fonts-noto-core"; }
+    installs_cleanly() { [ "$CLEAN" = 1 ]; }
+    # shellcheck disable=SC2154  # the sourced script's package lists
+    CLEAN="$1" UBUNTU_CODENAME=stonking STATUS_NOCHANGE=() ALL_STAGE_PACKAGES="${packages[*]}"
+    adopt_release_look_packages
+    echo "adopted=${ADOPTED_PACKAGES# } pinned=$(in_word_list yaru-theme-new "$UBUNTU_PINNED_PACKAGES" && echo yes || echo no) staged=$(in_word_list yaru-theme-new "${packages[2-desktop-gnome]}" && echo yes || echo no) note=${STATUS_NOCHANGE[*]:-}"
+  )
+}
+is "packages: a new look package of Ubuntu's desktop that installs is taken, pinned and staged" \
+  "adopted=yaru-theme-new pinned=yes staged=yes note=" "$(adopted 1)"
+is "packages: one that does not install here is named, not taken" \
+  "adopted= pinned=no staged=no note=Ubuntu stonking's desktop also uses look packages that do not install on this Debian: yaru-theme-new" "$(adopted 0)"
+# The session's font configuration from the files Ubuntu enables.
+fonts_conf() {  # fonts_conf <files Ubuntu enables>: the files the session reads first
+  (
+    d="$T/fontconf"; rm -rf "$d"; mkdir -p "$d/avail" "$d/enabled"
+    touch "$d/avail/10-sub-pixel-rgb.conf" "$d/avail/10-sub-pixel-none.conf" "$d/avail/11-lcdfilter-default.conf"
+    touch "$d/enabled/10-sub-pixel-none.conf" "$d/enabled/11-lcdfilter-default.conf"
+    FONTCONFIG_AVAIL="$d/avail" FONTCONFIG_ENABLED="$d/enabled" UBUNTU_FONT_CONFS="$1"
+    session_fonts_content | sed -n 's#.*<include ignore_missing="yes">.*/\([^/<]*\)</include>.*#\1#p' | xargs
+    session_fonts_content | grep -c 'mode="assign"'
+  ) | xargs
+}
+is "fonts: the file Ubuntu enables and Debian does not is read, the others are not" \
+  "10-sub-pixel-rgb.conf 0" "$(fonts_conf "10-sub-pixel-rgb.conf 11-lcdfilter-default.conf 99-not-shipped.conf")"
+is "fonts: without Ubuntu's list the script's own rule stands" "1" "$(fonts_conf "")"
+if command -v fc-match > /dev/null 2>&1 && [ -f /usr/share/fontconfig/conf.avail/10-sub-pixel-rgb.conf ]; then
+  # fontconfig's own answer: 1 is rgb, and the first value counts.
+  is "fonts: the session's configuration gives sub-pixel rgb first" "rgba: 1" \
+    "$(UBUNTU_FONT_CONFS="10-sub-pixel-rgb.conf"; session_fonts_content > "$T/fonts.conf"
+       FONTCONFIG_FILE="$T/fonts.conf" fc-match -v sans 2> /dev/null | sed -n 's/^[[:space:]]*\(rgba: [0-9]*\).*$/\1/p')"
+fi
+is "mode: its extensions, in order" \
+  "ubuntu-dock@ubuntu.com ding@rastersoft.com snapd-prompting@canonical.com" \
+  "$(printf '{\n  "colorScheme": "prefer-light",\n  "enabledExtensions": [\n    "ubuntu-dock@ubuntu.com",\n    "ding@rastersoft.com",\n    "snapd-prompting@canonical.com"\n  ]\n}\n' | mode_extensions)"
+is "mode: a name that is no extension is not taken" "" \
+  "$(printf '{ "enabledExtensions": [ "$(id)", "no-at-sign" ] }' | mode_extensions)"
+is "follow: without the release's file the script's values stand" "'Yaru'" \
+  "$(DEFAULTS_SAMPLE=/nonexistent; followed gtk-theme)"
 is "reset: nothing of the user's own, nothing changed" \
-  "left=/org/gnome/shell/favorite-apps=['a'] changes=0 failed=0 saved=0 file=mine" \
+  "left=/org/gnome/shell/favorite-apps=['a'] changes=0 failed=0 home=./Documents ./Documents/notes.txt" \
   "$(reset_run "/org/gnome/shell/favorite-apps=['a']")"
 is "reset: a reset that fails is reported, and nothing is changed" \
-  "left=/org/gnome/desktop/interface/gtk-theme='Adwaita' changes=0 failed=1 saved=0 file=mine" \
+  "left=/org/gnome/desktop/interface/gtk-theme='Adwaita' changes=0 failed=1 home=./Documents ./Documents/notes.txt" \
   "$(reset_run "/org/gnome/desktop/interface/gtk-theme='Adwaita'" 1)"
+
+### Extensions the user has a build of their own of keep their settings
+own_build() {  # own_build <extension> <directory to make below the stand-in root> [owner package] [on the manifest: 0|1]
+  (
+    d="$T/ownext"; rm -rf "$d"; mkdir -p "$d/home" "$d/sys"
+    DATA_HOME="$d/home"; SYSTEM_EXT_DIR="$d/sys"; INSTALLED_MANIFEST="$d/manifest"; PACKAGES_BEFORE="$d/before"
+    : > "$PACKAGES_BEFORE"; : > "$INSTALLED_MANIFEST"
+    [ "${4:-0}" -eq 0 ] || echo "${3}" > "$INSTALLED_MANIFEST"
+    case "$2" in
+      home:*) mkdir -p "$d/home/gnome-shell/extensions/${2#home:}" ;;
+      sys:*)  mkdir -p "$d/sys/${2#sys:}" ;;
+    esac
+    dpkg-query() { [ -z "$OWNER" ] || echo "${OWNER}: $2"; }
+    OWNER="${3:-}"
+    has_own_ext_build "$1" && echo own || echo none
+  )
+}
+is "own build: none"                        "none" "$(own_build ubuntu-dock@ubuntu.com -)"
+is "own build: Dash to Dock in the home"    "own"  "$(own_build ubuntu-dock@ubuntu.com home:dash-to-dock@micxgx.gmail.com)"
+is "own build: a copy of the look's in the home" "own" "$(own_build ding@rastersoft.com home:ding@rastersoft.com)"
+is "own build: Debian's Dash to Dock"       "own"  "$(own_build ubuntu-dock@ubuntu.com sys:dash-to-dock@micxgx.gmail.com gnome-shell-extension-dashtodock)"
+is "own build: a system copy no package owns" "own" "$(own_build tiling-assistant@ubuntu.com sys:tiling-assistant@leleat-on-github)"
+is "own build: a system build the look installed is the look's" \
+  "none" "$(own_build ubuntu-appindicators@ubuntu.com sys:appindicatorsupport@rgcjonas.gmail.com gnome-shell-extension-appindicator 1)"
+is "own build: another extension's is not this one's" \
+  "none" "$(own_build ubuntu-dock@ubuntu.com home:tiling-assistant@leleat-on-github)"
+is "reset: an extension the user has a build of their own of keeps its settings" \
+  "left=/org/gnome/shell/extensions/dash-to-dock/dock-position='LEFT' changes=0 failed=0 home=./Documents ./Documents/notes.txt" \
+  "$(has_own_ext_build() { [ "$1" = ubuntu-dock@ubuntu.com ]; }; reset_run "/org/gnome/shell/extensions/dash-to-dock/dock-position='LEFT'")"
+
+### The uninstall gives back the user's own tiling settings
+SAVED_TILING="{'org.gnome.mutter.edge-tiling': <false>, 'org.gnome.desktop.wm.keybindings.maximize': <['<Super>k', '<Super>Up']>, 'org.gnome.desktop.wm.keybindings.unmaximize': <@as []>, 'org.gnome.mutter.keybindings.toggle-tiled-left': <@mb nothing>}"
+tiling_saved() { ( dconf() { echo "$SAVED_TILING"; }; tiling_saved_value "$1" "$2"; echo "rc=$?" ) | tr '\n' ' '; }
+is "tiling: a saved shortcut"          "['<Super>k', '<Super>Up'] rc=0 " "$(tiling_saved org/gnome/desktop/wm/keybindings maximize)"
+is "tiling: a saved empty shortcut"    "@as [] rc=0 "      "$(tiling_saved org/gnome/desktop/wm/keybindings unmaximize)"
+is "tiling: a saved switch"            "false rc=0 "       "$(tiling_saved org/gnome/mutter edge-tiling)"
+is "tiling: no value of the user's"    "@mb nothing rc=0 " "$(tiling_saved org/gnome/mutter/keybindings toggle-tiled-left)"
+is "tiling: a key it did not save"     "rc=1 "             "$(tiling_saved org/gnome/mutter/keybindings toggle-tiled-right)"
+is "tiling: maximize is not unmaximize" "['<Super>k', '<Super>Up'] rc=0 " "$(tiling_saved org/gnome/desktop/wm/keybindings maximize)"
+tiling_step() {  # tiling_step <own build: 0|1>: what the step writes and resets
+  (
+    step() { :; }
+    look_installed_ext() { return 0; }
+    has_own_ext_build() { [ "$OWN" = 1 ]; }
+    need_session() { return 0; }
+    extension_active() { return 1; }
+    dconf() {
+      case "$1" in
+        read)  case "$2" in
+                 */overridden-settings) echo "$SAVED_TILING" ;;
+                 */edge-tiling) echo false ;;
+                 *) echo "@as []" ;;
+               esac ;;
+        write) echo "write ${2##*/}=$3" >> "$T/tiling.log" ;;
+        reset) echo "reset ${2##*/}" >> "$T/tiling.log" ;;
+      esac
+    }
+    OWN="$1" DONE=() SKIPPED=() GUESSED=() USER_PENDING=0
+    : > "$T/tiling.log"
+    step_restore_tiling_keybindings > /dev/null 2>&1
+    echo "$(tr '\n' '|' < "$T/tiling.log") done=${#DONE[@]} pending=${USER_PENDING}"
+  )
+}
+is "tiling: the user's own values go back, the others to Debian's default" \
+  "write maximize=['<Super>k', '<Super>Up']|write unmaximize=@as []|reset toggle-tiled-left|reset toggle-tiled-right|write edge-tiling=false| done=2 pending=0" \
+  "$(tiling_step 0)"
+is "tiling: a tiling assistant of the user's own keeps the keys" \
+  " done=0 pending=0" "$(tiling_step 1)"
+
+### The terminal shortcut among the user's own: complete, so Debian's GNOME
+### session shows it too
+shortcut() {  # shortcut <the user's list> [binding of the user's own shortcut]
+  (
+    d="$T/shortcut"; rm -rf "$d"; mkdir -p "$d"; : > "$d/db"
+    [ -z "$1" ] || echo "${CUSTOM_KEYBINDINGS_KEY}=$1" > "$d/db"
+    [ -z "${2:-}" ] || echo "/mine/binding=$2" >> "$d/db"
+    user_dconf_read() { sed -n "s|^${1}=||p" "$d/db"; }
+    dconf() {
+      case "$1" in
+        read)  sed -n "s|^${2}=||p" "$d/db" ;;
+        write) grep -v "^${2}=" "$d/db" > "$d/db.new"; echo "${2}=${3}" >> "$d/db.new"; mv "$d/db.new" "$d/db" ;;
+      esac
+    }
+    p="${TERMINAL_SHORTCUT_PATH#/}"; p="${p%/}"
+    SESSION_ONLY_SETTINGS=("x|custom-keybindings|[]" "${p}|name|'Terminal'" "${p}|binding|'<Primary><Alt>t'")
+    STATUS_CHANGES=() STATUS_NOCHANGE=() STATUS_FAILED=()
+    add_terminal_shortcut > /dev/null 2>&1
+    echo "keys=$(grep -c "^${TERMINAL_SHORTCUT_PATH}" "$d/db") listed=$(grep -c "^${CUSTOM_KEYBINDINGS_KEY}=.*ubuntu-look-terminal" "$d/db") changes=${#STATUS_CHANGES[@]} failed=${#STATUS_FAILED[@]}"
+  )
+}
+is "shortcut: no shortcuts of the user's own, nothing written" \
+  "keys=0 listed=0 changes=0 failed=0" "$(shortcut "")"
+is "shortcut: added to the user's own, with its name and keys" \
+  "keys=2 listed=1 changes=1 failed=0" "$(shortcut "['/mine/']" "'<Super>e'")"
+is "shortcut: one already there without its name and keys is completed" \
+  "keys=2 listed=1 changes=1 failed=0" "$(shortcut "['/mine/', '${TERMINAL_SHORTCUT_PATH}']")"
+is "shortcut: the user's own Ctrl+Alt+T is left" \
+  "keys=0 listed=0 changes=0 failed=0" "$(shortcut "['/mine/']" "'<Control><Alt>t'")"
+
+### A finished uninstall removes the look's run logs, and only those
+logs_removed() {
+  (
+    d="$T/logs"; rm -rf "$d"; mkdir -p "$d"
+    touch "$d/ubuntu-look-install-20260101-120000.log" "$d/ubuntu-look-uninstall-20260102-120000-2.log" \
+          "$d/ubuntu-look-notes.log" "$d/ubuntu-look-install-notes.log" "$d/other.log"
+    message() { :; }
+    HOME="$d" UBUNTU_LOOK_STARTED_MARK="$d/mark"
+    remove_run_logs
+    echo "$(cd "$d" && echo *) mark=$(cat "$d/mark")"
+  )
+}
+is "uninstall: the run logs go, other files stay" \
+  "mark other.log ubuntu-look-install-notes.log ubuntu-look-notes.log mark=removed" "$(logs_removed)"
+
+### The uninstall removes the folder version 1.0 left in the home
+legacy() {  # legacy <settings pending: 0|1>
+  (
+    d="$T/legacy"; rm -rf "$d"; mkdir -p "$d/home/.ubuntu-look-backup" "$d/home/Documents"
+    echo old > "$d/home/.ubuntu-look-backup/record"; echo mine > "$d/home/Documents/notes.txt"
+    for f in step_extensions step_restore_tiling_keybindings step_restore_gnome_settings \
+             step_clear_extension_state step_terminal_shortcut; do eval "$f() { :; }"; done
+    message() { :; }
+    HOME="$d/home" LEGACY_BACKUP_DIR="$d/home/.ubuntu-look-backup" DATA_HOME="$d/home/.local/share"
+    INSTALLED_MANIFEST="$d/manifest" SYS_RECORDS="$d/none" SETTINGS_RESET_USERS="$d/none/users"
+    UBUNTU_LOOK_ANIMATIONS="" USER_PENDING="$1" RUN_USER=tester DONE=() SKIPPED=() GUESSED=()
+    uninstall_user_settings > /dev/null 2>&1
+    (cd "$d/home" && find . -mindepth 1 | LC_ALL=C sort -f | xargs)
+  )
+}
+is "uninstall: the old backup folder goes, the user's files stay" \
+  "./Documents ./Documents/notes.txt" "$(legacy 0)"
+is "uninstall: with settings still to reset the old folder is kept" \
+  "./.ubuntu-look-backup ./.ubuntu-look-backup/record ./Documents ./Documents/notes.txt" "$(legacy 1)"
 
 ### The session's record of users
 forgot() {  # forgot <users on record> <user>
@@ -553,7 +1084,9 @@ hook() {  # hook <gnome-shell package version> <major the look was set up for> <
     printf '#!/bin/sh\nprintf %%s "%s"\n' "$1" > "$d/bin/dpkg-query"; chmod +x "$d/bin/dpkg-query"
     apt_hook_content > "$d/hook.sh"
     PATH="$d/bin:$PATH" sh "$d/hook.sh" 2> /dev/null; rc=$?
-    [ -e "$SHELL_MODE_FILE" ] || [ -e "$d/ubuntu.desktop" ] || [ -e "$d/ubuntu-xorg.desktop" ] && s=kept || s=gone
+    # All three or none: a hook that took only some of them is neither.
+    n=0; for f in "$SHELL_MODE_FILE" "$d/ubuntu.desktop" "$d/ubuntu-xorg.desktop"; do [ ! -e "$f" ] || n=$((n + 1)); done
+    case "$n" in 3) s=kept ;; 0) s=gone ;; *) s="partly($n of 3)" ;; esac
     echo "${rc} session=${s} users=$({ xargs < "$SESSION_USERS_RECORD"; } 2> /dev/null)"
   )
 }

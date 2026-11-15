@@ -5,6 +5,8 @@ to="$1"
 # shellcheck disable=SC1091
 . /etc/os-release
 [ -n "$to" ] && [ -n "$VERSION_CODENAME" ] || exit 2
+# A release's codename, and nothing sed or apt would read as more than that.
+case "$to" in *[!a-z]*) echo "not a Debian codename: $to" >&2; exit 2 ;; esac
 [ "$VERSION_CODENAME" = "$to" ] || sed -i "s/\b${VERSION_CODENAME}\b/${to}/g" /etc/apt/sources.list
 export DEBIAN_FRONTEND=noninteractive
 done=0

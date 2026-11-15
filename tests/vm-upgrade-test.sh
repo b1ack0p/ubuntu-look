@@ -19,10 +19,10 @@ cd "$(dirname -- "${BASH_SOURCE[0]}")/.." || exit 1
 # shellcheck disable=SC1091
 . tests/vm/lib.sh
 need_tools
+need_vm
 need_free_space 12288
 TO="${UBUNTU_LOOK_VM_UPGRADE_TO:-forky}"
-[ -f "$VM/disk.qcow2" ] && [ -f "$VM/vars-fresh.fd" ] && [ -f "$VM/id_vm" ] \
-  || { echo "No test VM in $VM. Build it with: bash tests/vm/make-vm.sh" >&2; exit 2; }
+case "$TO" in *[!a-z]*|"") echo "UBUNTU_LOOK_VM_UPGRADE_TO is not a Debian codename: $TO" >&2; exit 2 ;; esac
 if (exec 3<> "/dev/tcp/127.0.0.1/${VM_PORT}") 2> /dev/null; then
   echo "Port ${VM_PORT} is in use: is the test VM already running?" >&2
   exit 2
@@ -34,6 +34,11 @@ case "${1:-both}" in
 esac
 
 trap 'stop_vm' EXIT
+# A stopped test leaves through its exit trap, so the VM does not stay up.
+trap 'exit 143' INT TERM HUP
+
+# The major version in "GNOME Shell 48.4".
+shell_major() { local v="${1##* }"; echo "${v%%[!0-9]*}"; }
 
 # One scenario, $1, start to end.
 scenario() {
@@ -43,7 +48,8 @@ scenario() {
   reset_vm || exit 2
   start_vm
   wait_desktop 400 || { echo "The VM's desktop did not come up." >&2; exit 2; }
-  to_vm ubuntu-look.sh tests/vm/state.sh tests/vm/upgrade.sh
+  to_vm ubuntu-look.sh tests/vm/state.sh tests/vm/upgrade.sh \
+    || { echo "Could not copy the script to the VM." >&2; exit 2; }
   from="$(in_vm '. /etc/os-release; echo "$VERSION_CODENAME"')"
   shell_before="$(in_vm 'gnome-shell --version')"
 
@@ -76,16 +82,22 @@ scenario() {
   check "GNOME Shell was upgraded"       [ "$shell_before" != "$shell_after" ]
   state upgraded
   if [ "$how" = keep ]; then
-    # The apt hook takes the Ubuntu session away once GNOME Shell changes, so
-    # the login lands in Debian's GNOME until the script has run again.
-    echo "  note  session after the upgrade: $(tr '\n' ' ' < "$RUN/upgraded/session")"
-    check "a desktop session runs"       in_vm 'pgrep -u "$USER" -x gnome-shell'
+    # The apt hook takes the Ubuntu session away once GNOME Shell's major
+    # version changes, so the login lands in Debian's GNOME until the script
+    # has run again. Within one major version the Ubuntu session stays.
+    echo "  note  session after the upgrade: $(tr '\n' ' ' < "$RUN/upgraded/session" 2> /dev/null)"
+    if [ "$(shell_major "$shell_before")" != "$(shell_major "$shell_after")" ]; then
+      check "the login is Debian's GNOME session" grep -qx 'XDG_CURRENT_DESKTOP=GNOME' "$RUN/upgraded/session"
+    else
+      check "the login is still the Ubuntu session" grep -qx 'XDG_CURRENT_DESKTOP=ubuntu:GNOME' "$RUN/upgraded/session"
+    fi
   fi
 
   echo "Run the script on ${TO}"
   boot="$(boot_id)"
   run reinstall y enter bash ubuntu-look.sh
   check "the install finished"           said reinstall "All steps finished"
+  check "Ubuntu's style is read from its packages" said reinstall "(read from its packages)"
   check "nothing was left undone"        unsaid reinstall "Not done"
   if said reinstall "Rebooting now."; then
     check "the VM rebooted"              wait_reboot "$boot"
