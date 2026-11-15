@@ -69,6 +69,13 @@
 #
 # Requires    : Debian with GNOME; a normal user (not root) with sudo rights;
 #               internet access.
+#
+# Disclaimer  : USE AT YOUR OWN RISK. This script changes system packages,
+#               apt sources, the login screen and the boot settings. It
+#               comes "as is", without warranty of any kind; the authors
+#               take no responsibility for data loss, a system that no
+#               longer starts, or any other damage. Back up what matters
+#               first. See the LICENSE file.
 # =============================================================================
 
 # Contents
@@ -760,6 +767,17 @@ report() {
 # user's own settings included: a plain run and --reset. --refresh only
 # updates.
 resets_settings() { [ "$ACTION" = install ] || [ "$ACTION" = reset ]; }
+
+# The disclaimer, shown before the first question of every action: the
+# same text as the header's and the README's.
+show_disclaimer() {
+  message warn "${YELLOW}USE AT YOUR OWN RISK.${ENDCOLOR} This script changes system packages, apt"
+  message warn "sources, the login screen and the boot settings. It comes \"as is\","
+  message warn "without warranty of any kind: the authors take no responsibility for"
+  message warn "data loss, a system that no longer starts, or any other damage."
+  message warn "Back up what matters first. By continuing you accept this."
+  message ""
+}
 
 # Returns 1 unless the answer is yes.
 ask_yes() {
@@ -4703,6 +4721,7 @@ refresh_check() {
   fi
   # Status 1, as for every declined prompt: without a terminal the answer
   # is no, and that run did not update anything.
+  show_disclaimer
   ask_yes || { message "Nothing changed."; exit 1; }
 }
 
@@ -5125,7 +5144,7 @@ _on_exit() {
 # 7. Setup: arguments, help, run log, options
 ###############################################################################
 
-# --help prints the header from Usage to Requires.
+# --help prints the header from Usage to Disclaimer.
 show_help() {
   if [ -f "$SCRIPT_FILE" ]; then
     sed -n '/^# Usage/,/^# ====/{/^# ====/d;s/^# \{0,1\}//;p}' "$SCRIPT_FILE"
@@ -6424,6 +6443,7 @@ uninstall_begin() {
   [ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ] \
     && message warn "No desktop session: your settings are checked on a later run from the desktop."
   echo ""
+  show_disclaimer
   confirm_continue
 
   sudo -v || error "sudo is required."
@@ -6694,6 +6714,7 @@ install_start() {
     message "written again where they differ."
     message "Your files, folders, installed apps and other settings are not touched."
     message ""
+    show_disclaimer
     confirm_continue
     sudo -v || error "User ${RUN_USER} cannot use sudo."
     take_run_lock
@@ -6709,6 +6730,7 @@ install_start() {
     message "Your files, folders, installed apps and other settings are not touched."
     message "Undo with: bash ubuntu-look.sh --uninstall"
     message ""
+    show_disclaimer
     confirm_continue
     sudo -v || error "User ${RUN_USER} cannot use sudo."
     take_run_lock
