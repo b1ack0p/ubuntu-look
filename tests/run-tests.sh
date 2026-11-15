@@ -63,8 +63,8 @@ no "mirror: no spaces"                   option_value_ok UBUNTU_MIRROR "http://a
 no "mirror: no shell characters"         option_value_ok UBUNTU_MIRROR 'http://a.example/$(id)'
 
 ### Saved options: parsed, never sourced
-# UBUNTU_LOOK_REBOOT is an option of the script's that is not a saved one, and
-# is unset here: only the list of saved names keeps it out.
+# UBUNTU_LOOK_REBOOT is no saved option, and is unset here: only the list of
+# saved names keeps it out.
 tmpd="$(mktemp -d)"; tmp="$tmpd/options"
 printf '%s\n' 'UBUNTU_CODENAME=plucky' "PLYMOUTH_THEME=\$(touch $tmpd/made)" \
   'UBUNTU_BOOT_SPLASH=5' 'PATH=/nowhere' 'UBUNTU_LOOK_REBOOT=0' \
@@ -136,17 +136,21 @@ is "an empty argument is refused" \
   "rc=1 [ERROR] An empty argument was given. See: bash ubuntu-look.sh --help" "$(parsed "")"
 is "an empty argument beside a command is refused" \
   "rc=1 [ERROR] An empty argument was given. See: bash ubuntu-look.sh --help" "$(parsed "" --reset)"
-# The on and off switches: only 0 and 1.
-switched() {  # switched <name> <value>: "ok", or the error
-  ( unset UBUNTU_LOOK_REBOOT UBUNTU_LOOK_LOG UBUNTU_LOOK_SYSTEM_UPGRADE
-    export "$1=$2"
-    (check_switches && echo ok) 2>&1 | sed -r 's/\x1b\[[0-9;]*m//g' )
+# Options earlier versions had: a run given one stops.
+removed() {  # removed [<name> <value>]: "ok", or the error
+  ( # shellcheck disable=SC2086
+    unset $REMOVED_OPTION_NAMES
+    [ $# -eq 0 ] || export "$1=$2"
+    (check_removed_options && echo ok) 2>&1 | sed -r 's/\x1b\[[0-9;]*m//g' )
 }
-is "a switch takes 0"                    "ok" "$(switched UBUNTU_LOOK_REBOOT 0)"
-is "a switch takes 1"                    "ok" "$(switched UBUNTU_LOOK_LOG 1)"
-is "a switch may be empty"               "ok" "$(switched UBUNTU_LOOK_SYSTEM_UPGRADE "")"
-is "a switch takes no word" \
-  "[ERROR] UBUNTU_LOOK_REBOOT takes 0 or 1 (got 'no')." "$(switched UBUNTU_LOOK_REBOOT no)"
+is "none of the removed options: the run goes on" "ok" "$(removed)"
+for name in UBUNTU_INCLUDE_DEVEL UBUNTU_LOOK_SYSTEM_UPGRADE UBUNTU_LOOK_LOG UBUNTU_LOOK_REBOOT; do
+  is "${name} is refused" \
+    "[ERROR] ${name} is no longer an option of this script. See: bash ubuntu-look.sh --help" "$(removed "$name" 1)"
+done
+is "a removed option is refused when empty too" \
+  "[ERROR] UBUNTU_LOOK_REBOOT is no longer an option of this script. See: bash ubuntu-look.sh --help" "$(removed UBUNTU_LOOK_REBOOT "")"
+is "the development release is no saved option" "UBUNTU_CODENAME UBUNTU_MIRROR UBUNTU_BOOT_SPLASH PLYMOUTH_THEME" "$SAVED_OPTION_NAMES"
 help="$(parsed --bogus --help)"
 is "--help wins over a bad command line" "Usage" "${help%% *}"
 
@@ -340,29 +344,27 @@ is "set_boot_splash: with the words in place the theme is set" \
 # auto_reboot: the real reboot command is never reached here, and the wait
 # for Enter is a stand-in that ends at once with the status of an Enter (0),
 # of the time running out (142) or of a terminal that went away (1).
-rebooted() {  # rebooted <UBUNTU_LOOK_REBOOT> <terminal: 0|1> [reboot status] [wait status]
+rebooted() {  # rebooted <terminal: 0|1> [reboot status] [wait status]
   (
     reboot_now() { echo "REBOOT"; return "$R_RC"; }
     reboot_can_be_answered() { [ "$TTY" = 1 ]; }
     countdown_read() { return "$READ_RC"; }
-    UBUNTU_LOOK_REBOOT="$1" TTY="$2" R_RC="${3:-0}" READ_RC="${4:-142}" REBOOT_COUNTDOWN=3
+    TTY="$1" R_RC="${2:-0}" READ_RC="${3:-142}" REBOOT_COUNTDOWN=3
     auto_reboot 2>&1 | sed -r 's/\x1b\[[0-9;]*m//g' | tr -s ' ' | tr '\n' '|'
   )
 }
 is "auto_reboot: counts down, then reboots" \
-  " Rebooting in 3 seconds. Press Enter to reboot now, Ctrl-C to cancel.| Rebooting now.|REBOOT|" "$(rebooted 1 1)"
+  " Rebooting in 3 seconds. Press Enter to reboot now, Ctrl-C to cancel.| Rebooting now.|REBOOT|" "$(rebooted 1)"
 is "auto_reboot: Enter reboots" \
-  " Rebooting in 3 seconds. Press Enter to reboot now, Ctrl-C to cancel.| Rebooting now.|REBOOT|" "$(rebooted 1 1 0 0)"
+  " Rebooting in 3 seconds. Press Enter to reboot now, Ctrl-C to cancel.| Rebooting now.|REBOOT|" "$(rebooted 1 0 0)"
 is "auto_reboot: Ctrl-C cancels" \
-  " Rebooting in 3 seconds. Press Enter to reboot now, Ctrl-C to cancel.| Reboot cancelled. When you are ready, run: sudo reboot|" "$(rebooted 1 1 0 130)"
+  " Rebooting in 3 seconds. Press Enter to reboot now, Ctrl-C to cancel.| Reboot cancelled. When you are ready, run: sudo reboot|" "$(rebooted 1 0 130)"
 is "auto_reboot: a terminal that went away does not reboot" \
-  " Rebooting in 3 seconds. Press Enter to reboot now, Ctrl-C to cancel.| The terminal is gone — not rebooting. Run: sudo reboot|" "$(rebooted 1 1 0 1)"
-is "auto_reboot: UBUNTU_LOOK_REBOOT=0 only names the command" \
-  " Run: sudo reboot|" "$(rebooted 0 1)"
+  " Rebooting in 3 seconds. Press Enter to reboot now, Ctrl-C to cancel.| The terminal is gone — not rebooting. Run: sudo reboot|" "$(rebooted 1 0 1)"
 is "auto_reboot: no terminal, no reboot" \
-  " Run: sudo reboot|" "$(rebooted 1 0)"
+  " Run: sudo reboot|" "$(rebooted 0)"
 is "auto_reboot: a reboot that does not start is reported" \
-  " Rebooting in 3 seconds. Press Enter to reboot now, Ctrl-C to cancel.| Rebooting now.|REBOOT|[WARN] could not start the reboot — run: sudo reboot|" "$(rebooted 1 1 1)"
+  " Rebooting in 3 seconds. Press Enter to reboot now, Ctrl-C to cancel.| Rebooting now.|REBOOT|[WARN] could not start the reboot — run: sudo reboot|" "$(rebooted 1 1)"
 
 ### The summary's reboot: one an earlier run owes starts no countdown
 summarised() {  # summarised <carried: 0|1> <relogin: 0|1> <failed items> <finished: 0|1>

@@ -24,18 +24,21 @@
 #               Safe to re-run.
 #
 # Options     : UBUNTU_CODENAME=<name>        use this Ubuntu release
-#               UBUNTU_INCLUDE_DEVEL=1        allow the unreleased series
 #               UBUNTU_MIRROR=<url>           Ubuntu mirror (default per architecture)
 #               UBUNTU_BOOT_SPLASH=0          no boot splash; removes the look's
 #                                             (GRUB only)
 #               PLYMOUTH_THEME=<name>         boot splash theme (default bgrt)
-#               UBUNTU_LOOK_SYSTEM_UPGRADE=1  also run a system-wide apt upgrade
-#               UBUNTU_LOOK_LOG=0             no run log
-#               UBUNTU_LOOK_REBOOT=0          no automatic reboot at the end
 #               UBUNTU_LOOK_ANIMATIONS=0|1    animation effects off or on for
 #                                             this user (default: unchanged)
-#               A finished run saves the first five; later runs reuse them
+#               A finished run saves the first four; later runs reuse them
 #               unless given again, e.g. UBUNTU_CODENAME=auto.
+#               Only released Ubuntu versions are used, and only the look's
+#               own packages are installed and upgraded: the rest of the
+#               system is left to your own apt upgrade.
+#
+# Log         : Every run that changes the system writes a log to your home
+#               folder, ubuntu-look-<command>-<date>-<time>.log; the newest
+#               ten of each command are kept.
 #
 # Upgrading   : Before a Debian release upgrade, run --uninstall; upgrade and
 #               reboot; then run this script again for the new GNOME Shell.
@@ -43,8 +46,7 @@
 # Reboot      : A run that changed the system and left nothing undone reboots
 #               after a 60 second countdown: Enter reboots at once, Ctrl-C
 #               cancels. A run that changed nothing does not reboot.
-#               Without a terminal, or with UBUNTU_LOOK_REBOOT=0, it names
-#               the command instead.
+#               Without a terminal it names the command instead.
 #
 # Refresh     : --refresh lists what an update would change: a newer Ubuntu
 #               release, a Debian or GNOME Shell change, newer builds of the
@@ -188,7 +190,7 @@ CUSTOM_KEYBINDINGS_KEY="/org/gnome/settings-daemon/plugins/media-keys/custom-key
 TERMINAL_SHORTCUT_PATH="${CUSTOM_KEYBINDINGS_KEY}/ubuntu-look-terminal/"
 # The options an install run saves: those that pick the Ubuntu release, then
 # the boot options.
-RELEASE_OPTION_NAMES="UBUNTU_CODENAME UBUNTU_INCLUDE_DEVEL UBUNTU_MIRROR"
+RELEASE_OPTION_NAMES="UBUNTU_CODENAME UBUNTU_MIRROR"
 BOOT_OPTION_NAMES="UBUNTU_BOOT_SPLASH PLYMOUTH_THEME"
 SAVED_OPTION_NAMES="${RELEASE_OPTION_NAMES} ${BOOT_OPTION_NAMES}"
 
@@ -404,8 +406,6 @@ PROVISIONAL_PIN_NEW=0
 SOURCE_WRITE_RC="$RC_UNCHANGED"
 # install_pin_release: 0 when the pin on disk is already the right one.
 NEED_PIN_REWRITE=1
-# install_system_upgrade: 1 when the upgrade moved GNOME Shell to a new major.
-SHELL_MOVED=0
 # boot_splash: 1 once this run has rebuilt the initramfs.
 INITRAMFS_REBUILT=0
 # strip_grub_words: the kernel command line without the look's words.
@@ -697,7 +697,7 @@ sys_record_sort() {
 option_value_ok() {
   case "$1" in
     UBUNTU_CODENAME) [[ "$2" =~ ^[a-z]+$ ]] && [ "$2" != devel ] ;;
-    UBUNTU_INCLUDE_DEVEL|UBUNTU_BOOT_SPLASH) [[ "$2" =~ ^[01]$ ]] ;;
+    UBUNTU_BOOT_SPLASH) [[ "$2" =~ ^[01]$ ]] ;;
     PLYMOUTH_THEME) [[ "$2" =~ ^[A-Za-z0-9._+-]+$ ]] ;;
     # One URL for the source's URIs line; empty means the default mirror.
     # No user name or password: the URL is shown in the run log and stored
@@ -1464,7 +1464,7 @@ list_dists() {
 }
 
 # Every released Ubuntu the archive lists, plus those the apt source names,
-# oldest to newest (development series only with UBUNTU_INCLUDE_DEVEL=1).
+# oldest to newest; the series in development is left out.
 # Debian's distro-info-data may lack new Ubuntu releases.
 discover_ubuntu_codenames() {
   local names header cn info ver state versioned="" rc
@@ -1476,9 +1476,7 @@ discover_ubuntu_codenames() {
   # names come from Ubuntu's release list, else Debian's distro-info-data;
   # each is still probed on the mirror below.
   if [ -z "$names" ]; then
-    names="$( { curl -fsSL -m 15 "$UBUNTU_META_RELEASE"
-                [ "$UBUNTU_INCLUDE_DEVEL" = 1 ] && curl -fsSL -m 15 "${UBUNTU_META_RELEASE}-development"
-              } 2>/dev/null | sed -n 's/^Dist: //p' | grep -E '^[a-z]+$' | tail -n 12)"
+    names="$(curl -fsSL -m 15 "$UBUNTU_META_RELEASE" 2>/dev/null | sed -n 's/^Dist: //p' | grep -E '^[a-z]+$' | tail -n 12)"
     [ -n "$names" ] || names="$(awk -F, 'NR > 1 && $3 ~ /^[a-z]+$/ { print $3 }' \
       /usr/share/distro-info/ubuntu.csv 2>/dev/null | tail -n 12)"
     [ -n "$names" ] && message warn "no release listing at ${UBUNTU_MIRROR} — the newest releases Ubuntu names are probed instead" >&2
@@ -1497,8 +1495,8 @@ discover_ubuntu_codenames() {
     [ "$rc" -eq 0 ] || continue
     ver="${info%% *}"
     state="${info#* }"; state="${state%% *}"
-    if [ "$state" = "devel" ] && [ "$UBUNTU_INCLUDE_DEVEL" != "1" ]; then
-      message "  skipping '${cn}' (${ver}) — not released yet; UBUNTU_INCLUDE_DEVEL=1 to use it" >&2
+    if [ "$state" = "devel" ]; then
+      message "  skipping '${cn}' (${ver}) — not released yet" >&2
       continue
     fi
     versioned="${versioned}${ver} ${cn}
@@ -1585,9 +1583,11 @@ set_candidate_codenames() {
   UBUNTU_CANDIDATE_CODENAMES="$(echo "$UBUNTU_ALL_CODENAMES" | tr ' ' '\n' \
     | tail -n "$MAX_UBUNTU_CANDIDATES" | xargs)"
   if [ "$1" != auto ] && ! in_word_list "$1" "$UBUNTU_CANDIDATE_CODENAMES"; then
-    ubuntu_release_info "$1" >/dev/null; local st=$?
+    local info st
+    info="$(ubuntu_release_info "$1")"; st=$?
     case $st in
-      0) ;;
+      0) [[ "$info" != *" devel "* ]] \
+           || error "UBUNTU_CODENAME=${1} is still in development: only released Ubuntu versions are used." ;;
       "$RC_FAILED") release_unread "$1"; exit 1 ;;
       *) error "UBUNTU_CODENAME=${1} is not published on ${UBUNTU_MIRROR} or ${UBUNTU_OLD_MIRROR}" ;;
     esac
@@ -2189,15 +2189,12 @@ resolve_release() {
     if [ -n "$debian_shell" ] && [ -n "$newest_shell" ] && [ "$debian_shell" -gt "$newest_shell" ]; then
       UBUNTU_CODENAME="$newest"
       message warn "GNOME Shell ${debian_shell} is newer than any released Ubuntu — using the newest, ${UBUNTU_CODENAME}"
-      [ "$UBUNTU_INCLUDE_DEVEL" = 1 ] \
-        || message warn "  a development release may support it: UBUNTU_INCLUDE_DEVEL=1 bash ubuntu-look.sh"
       return 0
     fi
     message warn "no Ubuntu release in the current window has a theme this GNOME Shell can load"
-    # The release pinned before, unless it is a development release the
-    # options no longer allow.
+    # The release pinned before, unless it is a development release.
     if [[ "$hint" =~ ^[a-z]+$ ]] && ! in_word_list "$hint" "$UBUNTU_CANDIDATE_CODENAMES" \
-       && { [ "$UBUNTU_INCLUDE_DEVEL" = 1 ] || [[ "$(ubuntu_release_info "$hint" 2>/dev/null)" != *" devel "* ]]; }; then
+       && [[ "$(ubuntu_release_info "$hint" 2>/dev/null)" != *" devel "* ]]; then
       try_older_releases "$hint"
     fi
     if [ -z "$UBUNTU_CODENAME" ]; then
@@ -2219,7 +2216,7 @@ resolve_release() {
       [ "$info_rc" -eq "$RC_FAILED" ] && { release_unread "$hint"; exit 1; }
     fi
     if [ "$info_rc" -eq 0 ] \
-       && { [ "$UBUNTU_INCLUDE_DEVEL" = 1 ] || [[ "$pinned_info" != *" devel "* ]]; }; then
+       && [[ "$pinned_info" != *" devel "* ]]; then
       UBUNTU_CODENAME="$hint"
       # shellcheck disable=SC2086
       in_word_list "$hint" "$UBUNTU_CANDIDATE_CODENAMES" \
@@ -4983,11 +4980,10 @@ countdown_read() {
 }
 
 # Reboot after a countdown of REBOOT_COUNTDOWN seconds: Enter reboots at once,
-# Ctrl-C cancels. With UBUNTU_LOOK_REBOOT=0, or with no terminal to answer
-# from, it only names the command.
+# Ctrl-C cancels. With no terminal to answer from, it only names the command.
 auto_reboot() {
   local n key old_int tty_state ticker reader answer
-  if [ "${UBUNTU_LOOK_REBOOT:-1}" = 0 ] || ! reboot_can_be_answered; then
+  if ! reboot_can_be_answered; then
     echo -e "   Run: ${YELLOW}sudo reboot${ENDCOLOR}"
     return 0
   fi
@@ -5109,15 +5105,15 @@ rm_release_cache() {
     "${UBUNTU_RELEASE_CACHE}.devel-unread"
 }
 
-# The run's on and off switches take 0 or 1 only: "no" or "false" must not
-# read as on.
-check_switches() {
+# Options earlier versions had. A run given one stops, so nobody takes it
+# for still working: only released Ubuntu versions are used, only the look's
+# packages are upgraded, every run is logged and a finished run reboots.
+REMOVED_OPTION_NAMES="UBUNTU_INCLUDE_DEVEL UBUNTU_LOOK_SYSTEM_UPGRADE UBUNTU_LOOK_LOG UBUNTU_LOOK_REBOOT"
+check_removed_options() {
   local name
-  for name in UBUNTU_LOOK_REBOOT UBUNTU_LOOK_LOG UBUNTU_LOOK_SYSTEM_UPGRADE; do
-    case "${!name:-}" in
-      ''|0|1) ;;
-      *) error "${name} takes 0 or 1 (got '${!name}')." ;;
-    esac
+  for name in $REMOVED_OPTION_NAMES; do
+    [ -z "${!name+x}" ] \
+      || error "${name} is no longer an option of this script. See: bash ubuntu-look.sh --help"
   done
 }
 
@@ -5193,7 +5189,7 @@ start_run_log() {
   # A second run in the same second gets a file of its own.
   while [ -e "${_log_file}${_sfx}.log" ]; do _n=$((_n + 1)); _sfx="-${_n}"; done
   _log_file="${_log_file}${_sfx}.log"
-  if [ "${UBUNTU_LOOK_LOG:-1}" != "0" ] && [ -z "${UBUNTU_LOOK_LOGGING:-}" ] \
+  if [ -z "${UBUNTU_LOOK_LOGGING:-}" ] \
      && { [ -f "$SCRIPT_FILE" ] && : > "$_log_file"; } 2>/dev/null; then
 
     # Pass on the shell options -u, -e and -x.
@@ -5231,7 +5227,7 @@ start_run_log() {
     fi
     [ -z "$_mark" ] || rm -f "$_mark"
     exit "$_rc"
-  elif [ "${UBUNTU_LOOK_LOG:-1}" != "0" ] && [ -z "${UBUNTU_LOOK_LOGGING:-}" ]; then
+  elif [ -z "${UBUNTU_LOOK_LOGGING:-}" ]; then
     echo "No run log: the script is not read from a file, or ${_log_file} is not writable."
   fi
 }
@@ -5297,7 +5293,7 @@ init_options() {
   # Checked before any network work; the uninstall needs no release.
   if [ "$ACTION" != uninstall ]; then
     [ "$UBUNTU_CODENAME" != devel ] \
-      || error "UBUNTU_CODENAME=devel names no release: give the series' codename, or UBUNTU_INCLUDE_DEVEL=1."
+      || error "UBUNTU_CODENAME=devel names no release: give a released version's codename, or auto."
     option_value_ok UBUNTU_CODENAME "$UBUNTU_CODENAME" \
       || error "UBUNTU_CODENAME must be a codename in lower case letters, or auto."
   fi
@@ -5351,11 +5347,6 @@ init_options() {
     ''|0|1) ;;
     *) error "UBUNTU_LOOK_ANIMATIONS takes 0 or 1 (got '${UBUNTU_LOOK_ANIMATIONS}')." ;;
   esac
-
-  # 1 = also consider the Ubuntu series in development.
-  UBUNTU_INCLUDE_DEVEL="${UBUNTU_INCLUDE_DEVEL:-0}"
-  option_value_ok UBUNTU_INCLUDE_DEVEL "$UBUNTU_INCLUDE_DEVEL" \
-    || error "UBUNTU_INCLUDE_DEVEL takes 0 or 1 (got '${UBUNTU_INCLUDE_DEVEL}')."
 }
 
 # Work out what the constants cannot hold: the user's directories, this run's
@@ -6656,7 +6647,6 @@ run_install() {
   # Before anything is written from it: the session mode, the look's
   # database and the reset follow the release's own style.
   read_ubuntu_style
-  install_system_upgrade
 
   use_combined_extensions_if_offered
 
@@ -6901,59 +6891,6 @@ install_pin_release() {
   narrow_ubuntu_sources
 }
 
-# The system-wide apt upgrade, only with UBUNTU_LOOK_SYSTEM_UPGRADE=1; then
-# check that it left GNOME Shell on the major version the release was
-# resolved for.
-install_system_upgrade() {
-  local _p _rec_ok _shell_before _sim _was upgradable_before
-  step "System upgrade (only with UBUNTU_LOOK_SYSTEM_UPGRADE=1)"
-  if [ "${UBUNTU_LOOK_SYSTEM_UPGRADE:-0}" = "1" ]; then
-    _sim="$(LC_ALL=C apt-get -s upgrade --with-new-pkgs 2>/dev/null)"
-    upgradable_before="$(printf '%s\n' "$_sim" | grep -c '^Inst ')"
-    if [ "$upgradable_before" -gt 0 ]; then
-      message warn "UBUNTU_LOOK_SYSTEM_UPGRADE=1 — upgrading ${upgradable_before} package(s) system-wide"
-      # The pinned packages it moves to Ubuntu's builds are recorded first, as in
-      # the stages, so the uninstall puts back what they replace.
-      _sim="$(printf '%s\n' "$_sim" \
-        | awk -v l=" ${UBUNTU_PINNED_PACKAGES} $(wallpaper_packs) " '/^Inst / && index(l, " " $2 " ")')"
-      _rec_ok=1
-      record_planned_installs "$_sim" || _rec_ok=0
-      while read -r _p _was; do
-        record_upgraded_pkg "$_p" "$_was" || _rec_ok=0
-      done < <(printf '%s\n' "$_sim" | awk '$3 ~ /^\[/ { gsub(/[][]/, "", $3); print $2, $3 }')
-      # Not fatal: a held package or third-party repository must not stop the look.
-      if [ "$_rec_ok" = 0 ]; then
-        message warn "could not write the install records — system upgrade skipped"
-        STATUS_FAILED+=("system upgrade (the install records could not be written)")
-      elif apt_get upgrade -y --with-new-pkgs; then
-        STATUS_CHANGES+=("Upgraded ${upgradable_before} package(s) system-wide")
-        RELOGIN_NEEDED=1
-      else
-        message warn "apt upgrade failed — continuing; the theming steps do not depend on it"
-        STATUS_FAILED+=("system upgrade (apt-get upgrade returned an error)")
-      fi
-    else
-      message "nothing to upgrade"
-      STATUS_NOCHANGE+=("apt upgrade: nothing to upgrade")
-    fi
-  else
-    message "leaving the rest of the system to your own 'apt upgrade'"
-    message "  this script upgrades only the look's packages"
-    STATUS_NOCHANGE+=("System-wide apt upgrade skipped (UBUNTU_LOOK_SYSTEM_UPGRADE=1 to enable)")
-  fi
-  # The upgrade may have moved gnome-shell to a new major version; the release
-  # was resolved for the old one, so its state is not saved and the next run
-  # resolves it again.
-  _shell_before="$SHELL_MAJOR_CACHE"
-  SHELL_MAJOR_CACHE=""
-  shell_major > /dev/null
-  SHELL_MOVED=0
-  if [ "$_shell_before" != "$SHELL_MAJOR_CACHE" ]; then
-    SHELL_MOVED=1
-    STATUS_FAILED+=("GNOME Shell moved from ${_shell_before:-?} to ${SHELL_MAJOR_CACHE:-?} during the system upgrade — reboot, then run this script again")
-  fi
-}
-
 # Install or upgrade the packages of stage $1: as one batch when apt removes
 # nothing for it, else package by package.
 install_stage_packages() {
@@ -7161,7 +7098,7 @@ install_finish() {
 
   # The run records its options and what it was resolved against.
   save_options
-  [ "$SHELL_MOVED" = 0 ] && save_release_state
+  save_release_state
 
   [ "$INITRAMFS_PARTIAL" = 1 ] && STATUS_FAILED+=("$INITRAMFS_PARTIAL_NOTE")
   if [ ${#STATUS_FAILED[@]} -eq 0 ]; then
@@ -7183,7 +7120,7 @@ main() {
   set -u
   parse_args "$@"
 
-  check_switches
+  check_removed_options
 
   # Before the run log, so root leaves no log file behind.
   [ "$(id -u)" -eq 0 ] \

@@ -136,30 +136,41 @@ Options are settings placed in front of the command. Several can be given
 at once, separated by spaces:
 
 <pre>
-<b>UBUNTU_BOOT_SPLASH=0</b> <b>UBUNTU_LOOK_REBOOT=0</b> bash ubuntu-look.sh
+<b>UBUNTU_BOOT_SPLASH=0</b> <b>UBUNTU_LOOK_ANIMATIONS=0</b> bash ubuntu-look.sh
 </pre>
 
 A value that is not accepted stops the run before it changes anything.
 
-**Remembered options.** A finished install saves these five, and later
+**Remembered options.** A finished install saves these four, and later
 runs use them again until you give a new value.
 
-| Option                 | Sets                       | Default          | Accepted values     |
-|------------------------|----------------------------|------------------|---------------------|
-| `UBUNTU_CODENAME`      | the Ubuntu release used    | `auto`           | `auto`, a code name |
-| `UBUNTU_INCLUDE_DEVEL` | the release in development | `0`              | `0`, `1`            |
-| `UBUNTU_MIRROR`        | the download server        | Ubuntu's archive | one web address     |
-| `UBUNTU_BOOT_SPLASH`   | the boot splash            | `1`              | `0`, `1`            |
-| `PLYMOUTH_THEME`       | the boot splash theme      | `bgrt`           | an installed theme  |
+| Option               | Sets                    | Default          | Accepted values     |
+|----------------------|-------------------------|------------------|---------------------|
+| `UBUNTU_CODENAME`    | the Ubuntu release used | `auto`           | `auto`, a code name |
+| `UBUNTU_MIRROR`      | the download server     | Ubuntu's archive | one web address     |
+| `UBUNTU_BOOT_SPLASH` | the boot splash         | `1`              | `0`, `1`            |
+| `PLYMOUTH_THEME`     | the boot splash theme   | `bgrt`           | an installed theme  |
 
-**One-run options.** These apply only to the run they are given to.
+**One-run option.** It applies only to the run it is given to.
 
-| Option                       | Sets                        | Default | Accepted values |
-|------------------------------|-----------------------------|---------|-----------------|
-| `UBUNTU_LOOK_ANIMATIONS`     | animation effects           | not set | `0`, `1`        |
-| `UBUNTU_LOOK_SYSTEM_UPGRADE` | upgrade of the whole system | `0`     | `0`, `1`        |
-| `UBUNTU_LOOK_LOG`            | the run log                 | `1`     | `0`, `1`        |
-| `UBUNTU_LOOK_REBOOT`         | the reboot at the end       | `1`     | `0`, `1`        |
+| Option                   | Sets              | Default | Accepted values |
+|--------------------------|-------------------|---------|-----------------|
+| `UBUNTU_LOOK_ANIMATIONS` | animation effects | not set | `0`, `1`        |
+
+**Not options.** These are fixed, and nothing changes them:
+
+| Behaviour         | Fixed to                                         |
+|-------------------|--------------------------------------------------|
+| Ubuntu release    | released versions only, never one in development |
+| Upgrades          | the look's own packages only                     |
+| Run log           | always written                                   |
+| Reboot at the end | always, after a 60 second countdown              |
+
+- The rest of the system is left to your own `apt upgrade`.
+- `UBUNTU_INCLUDE_DEVEL`, `UBUNTU_LOOK_SYSTEM_UPGRADE`, `UBUNTU_LOOK_LOG`
+  and `UBUNTU_LOOK_REBOOT` were options of earlier versions. A run given
+  one of them stops before it changes anything and says so.
+- See [Run log](#run-log) and [Reboot](#reboot).
 
 ### `UBUNTU_CODENAME`
 
@@ -170,6 +181,7 @@ The Ubuntu release the look is taken from, named by its code name.
 | `auto` (default)           | the newest release that fits your GNOME Shell |
 | a code name, in lower case | that release                                  |
 | `devel`                    | refused: it names no release                  |
+| a release in development   | refused                                       |
 
 - Code names are, for example, `noble`, `plucky`, `questing`, `resolute`
   and `stonking`; see
@@ -178,28 +190,13 @@ The Ubuntu release the look is taken from, named by its code name.
   archive.
 - A release made for another GNOME Shell may leave out the dock or the
   shell theme; the summary says which.
-- For the release in development, use `UBUNTU_INCLUDE_DEVEL=1`.
+- Only released versions are used. The release in development is the one
+  the archive's `devel` link names, checked against Ubuntu's own list of
+  releases.
 
 <pre>
 UBUNTU_CODENAME=<b>noble</b> bash ubuntu-look.sh   # use Ubuntu 24.04
 UBUNTU_CODENAME=<b>auto</b> bash ubuntu-look.sh    # back to automatic
-</pre>
-
-### `UBUNTU_INCLUDE_DEVEL`
-
-Whether the Ubuntu release still in development may be chosen.
-
-| Value         | Meaning                                      |
-|---------------|----------------------------------------------|
-| `0` (default) | released versions only                       |
-| `1`           | the release in development is considered too |
-
-The release in development is the one the archive's `devel` link names,
-checked against Ubuntu's own list of releases.
-
-<pre>
-UBUNTU_INCLUDE_DEVEL=<b>1</b> bash ubuntu-look.sh   # also consider the release in development
-UBUNTU_INCLUDE_DEVEL=<b>0</b> bash ubuntu-look.sh   # released versions only
 </pre>
 
 ### `UBUNTU_MIRROR`
@@ -288,28 +285,10 @@ UBUNTU_LOOK_ANIMATIONS=<b>1</b> bash ubuntu-look.sh               # on
 UBUNTU_LOOK_ANIMATIONS=<b>0</b> bash ubuntu-look.sh --uninstall   # off, while uninstalling
 </pre>
 
-### `UBUNTU_LOOK_SYSTEM_UPGRADE`
+### Run log
 
-Whether the run also upgrades the rest of the system, as `apt upgrade`
-does, from your own sources.
-
-| Value         | Meaning                               |
-|---------------|---------------------------------------|
-| `0` (default) | only the look's packages are upgraded |
-| `1`           | the whole system is upgraded          |
-
-<pre>
-UBUNTU_LOOK_SYSTEM_UPGRADE=<b>1</b> bash ubuntu-look.sh
-</pre>
-
-### `UBUNTU_LOOK_LOG`
-
-Whether the run writes a log file.
-
-| Value         | Meaning                                                        |
-|---------------|----------------------------------------------------------------|
-| `1` (default) | a log in your home folder for each run that changes the system |
-| `0`           | no log file                                                    |
+Every run that changes the system writes a log to your home folder. It
+cannot be switched off.
 
 - The file is named `ubuntu-look-<command>-<date>-<time>.log`, for
   example `ubuntu-look-install-20260928-151900.log`.
@@ -317,24 +296,10 @@ Whether the run writes a log file.
 - A run you declined, or one refused before it changed anything, keeps no
   log. A complete uninstall removes them all.
 
-<pre>
-UBUNTU_LOOK_LOG=<b>0</b> bash ubuntu-look.sh
-</pre>
+### Reboot
 
-### `UBUNTU_LOOK_REBOOT`
-
-Whether the script reboots by itself at the end.
-
-| Value         | Meaning                                             |
-|---------------|-----------------------------------------------------|
-| `1` (default) | reboots after a 60 second countdown                 |
-| `0`           | never reboots; the script names the command instead |
-
-<pre>
-UBUNTU_LOOK_REBOOT=<b>0</b> bash ubuntu-look.sh
-</pre>
-
-When the countdown runs, and when it does not:
+A run that changed the system reboots at the end, after a 60 second
+countdown. It cannot be switched off.
 
 | Situation                                   | What happens                    |
 |---------------------------------------------|---------------------------------|
@@ -391,7 +356,7 @@ What you get:
   Ubuntu. It stays the newest release Debian 13's GNOME Shell can take.
 - **forky:** 26.10 is the newest released Ubuntu; its theme and extensions
   accept GNOME Shell 51.
-- A release in development is used only with `UBUNTU_INCLUDE_DEVEL=1`.
+- A release in development is never used.
 
 ## Where each feature comes from
 
@@ -658,28 +623,120 @@ gsettings set org.gnome.desktop.interface enable-hot-corners <b>true</b>
 Ctrl+Alt+T is changed in Settings → Keyboard → View and Customise
 Shortcuts → Custom Shortcuts.
 
-### Power and session
+### Power, lock and session
 
-| Setting                    | Ubuntu (the look)              | Debian                       |
-|----------------------------|--------------------------------|------------------------------|
-| Power button               | `interactive`: asks what to do | `suspend`                    |
-| Sleep on mains power       | `0`: never                     | `900`: after 15 minutes idle |
-| Log Out in the system menu | `true`: always shown           | `false`: with several users  |
-| Start of the session       | on the desktop                 | in the Activities overview   |
+The look sets the first two rows and the last two. The others are the
+power options Ubuntu has; Ubuntu and Debian ship the same value for them,
+and no command of the script changes them.
+
+| Setting                           | Ubuntu (the look)              | Debian                     |
+|-----------------------------------|--------------------------------|----------------------------|
+| Power button                      | `interactive`: asks what to do | `suspend`                  |
+| Sleep on mains power, after       | `0`: never                     | `900`: 15 minutes idle     |
+| Sleep on mains power, action      | `suspend`                      | `suspend`                  |
+| Sleep on battery, after           | `900`: 15 minutes idle         | `900`: 15 minutes idle     |
+| Sleep on battery, action          | `suspend`                      | `suspend`                  |
+| Screen blank, after               | `300`: 5 minutes idle          | `300`: 5 minutes idle      |
+| Dim the screen when idle          | `true`: on                     | `true`: on                 |
+| Automatic screen lock             | `true`: on                     | `true`: on                 |
+| Lock delay after blank            | `0`: at once                   | `0`: at once               |
+| Notifications on the lock screen  | `true`: shown                  | `true`: shown              |
+| Power saver on low battery        | `true`: on                     | `true`: on                 |
+| Battery percentage in the top bar | `false`: hidden                | `false`: hidden            |
+| Power mode                        | `balanced`                     | `balanced`                 |
+| Lid close, on battery             | `suspend`                      | `suspend`                  |
+| Lid close, on mains power         | `suspend`                      | `suspend`                  |
+| Lid close, docked                 | `ignore`                       | `ignore`                   |
+| Log Out in the system menu        | `true`: always shown           | `false`: several users     |
+| Start of the session              | on the desktop                 | in the Activities overview |
+
+Power button and sleep:
 
 <pre>
 # power button: interactive, suspend, hibernate, nothing
 gsettings set org.gnome.settings-daemon.plugins.power power-button-action <b>suspend</b>
 
-# sleep on mains power: a number of seconds idle; 0 = never
+# sleep on mains power, after: a number of seconds idle; 0 = never
 gsettings set org.gnome.settings-daemon.plugins.power sleep-inactive-ac-timeout <b>900</b>
 
+# sleep on mains power, action: suspend, hibernate, shutdown, logout, blank, interactive, nothing
+gsettings set org.gnome.settings-daemon.plugins.power sleep-inactive-ac-type <b>nothing</b>
+
+# sleep on battery, after: a number of seconds idle; 0 = never
+gsettings set org.gnome.settings-daemon.plugins.power sleep-inactive-battery-timeout <b>1800</b>
+
+# sleep on battery, action: suspend, hibernate, shutdown, logout, blank, interactive, nothing
+gsettings set org.gnome.settings-daemon.plugins.power sleep-inactive-battery-type <b>hibernate</b>
+
+# suspend now
+systemctl suspend
+</pre>
+
+Screen and lock:
+
+<pre>
+# screen blank, after: a number of seconds idle; 0 = never
+gsettings set org.gnome.desktop.session idle-delay <b>600</b>
+
+# dim the screen when idle: true, false
+gsettings set org.gnome.settings-daemon.plugins.power idle-dim <b>false</b>
+
+# automatic screen lock: true, false
+gsettings set org.gnome.desktop.screensaver lock-enabled <b>false</b>
+
+# lock delay after the screen blanks: a number of seconds; 0 = at once
+gsettings set org.gnome.desktop.screensaver lock-delay <b>30</b>
+
+# notifications on the lock screen: true, false
+gsettings set org.gnome.desktop.notifications show-in-lock-screen <b>false</b>
+
+# lock the screen now (also Super+L)
+loginctl lock-session
+</pre>
+
+Battery and power mode:
+
+<pre>
+# power saver on low battery: true, false
+gsettings set org.gnome.settings-daemon.plugins.power power-saver-profile-on-low-battery <b>false</b>
+
+# battery percentage in the top bar: true, false
+gsettings set org.gnome.desktop.interface show-battery-percentage <b>true</b>
+
+# power mode: performance, balanced, power-saver (as far as the computer supports them)
+powerprofilesctl set <b>power-saver</b>
+</pre>
+
+Lid close. GNOME has no setting for it; systemd's login service decides,
+on Ubuntu and on Debian alike. The usual values are `suspend`, `hibernate`,
+`lock`, `poweroff` and `ignore`. Write the file, then reboot:
+
+<pre>
+sudo mkdir -p /etc/systemd/logind.conf.d
+printf '[Login]\nHandleLidSwitch=<b>ignore</b>\nHandleLidSwitchExternalPower=<b>ignore</b>\nHandleLidSwitchDocked=<b>ignore</b>\n' | sudo tee /etc/systemd/logind.conf.d/lid.conf
+</pre>
+
+To undo it, delete the file and reboot:
+
+```bash
+sudo rm /etc/systemd/logind.conf.d/lid.conf
+```
+
+Session:
+
+<pre>
 # Log Out in the system menu: true, false
 gsettings set org.gnome.shell always-show-log-out <b>false</b>
 </pre>
 
-The session starts on the desktop only with an Ubuntu release that sets it
-(26.10 on).
+- The same settings are in Settings → Power and in Settings → Privacy &
+  Security → Screen Lock.
+- `HandleLidSwitch` is the lid on battery, `HandleLidSwitchExternalPower`
+  on mains power, `HandleLidSwitchDocked` when docked or with a second
+  screen.
+- The power mode needs `power-profiles-daemon`.
+- The session starts on the desktop only with an Ubuntu release that sets
+  it (26.10 on).
 
 ### Touchpad and sound
 
@@ -992,7 +1049,7 @@ gsettings reset org.gnome.desktop.interface <b>icon-theme</b>
 - **Something looks half done.** Run the same command again; every step
   is safe to repeat.
 - **What did a run do?** Read its log in your home folder; see
-  [`UBUNTU_LOOK_LOG`](#ubuntu_look_log).
+  [Run log](#run-log).
 
 ## How it works
 
@@ -1129,8 +1186,8 @@ script follows it, point by point, and where it makes an exception.
 - **Don't use GPU manufacturer install scripts.** Nothing is installed
   outside APT; the boot splash is Debian's Plymouth.
 - **Don't suffer from Shiny New Stuff Syndrome.** Debian's packages are
-  upgraded only by your own `apt upgrade` (or with
-  `UBUNTU_LOOK_SYSTEM_UPGRADE=1`, from your own sources). The Ubuntu
+  upgraded only by your own `apt upgrade`; the script upgrades the look's
+  packages and nothing else. The Ubuntu
   packages get no support from Debian's security team, and Ubuntu may no
   longer support the chosen release; `--refresh` shows when a newer one
   fits.

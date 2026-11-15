@@ -54,7 +54,7 @@ done
 check "two commands are rejected"      rejected "--refresh --uninstall" "Give only one of"
 check "'bogus' is rejected"            rejected bogus "Unknown argument"
 check "an empty argument is rejected"  rejected "''" "An empty argument was given"
-check "a switch takes only 0 or 1"     eval 'in_vm "UBUNTU_LOOK_REBOOT=no bash ubuntu-look.sh < /dev/null 2>&1" | grep -qF "takes 0 or 1"'
+check "a removed option is refused"    eval 'in_vm "UBUNTU_LOOK_REBOOT=0 bash ubuntu-look.sh < /dev/null 2>&1" | grep -qF "is no longer an option"'
 check "--refresh needs an install"     rejected --refresh "not installed"
 check "--reset needs an install"       rejected --reset "not installed"
 run decline n "" bash ubuntu-look.sh
@@ -100,7 +100,7 @@ check "it exits with 1"                said refresh-no "SCRIPT EXIT 1"
 # puts the file back and leaves the setting.
 in_vm "dconf write /org/gnome/desktop/wm/preferences/button-layout \"'close:'\""
 vm_sudo rm -f /usr/local/share/gnome-shell/modes/ubuntu.json
-run repair y "" UBUNTU_LOOK_REBOOT=0 bash ubuntu-look.sh --refresh
+run repair y ctrlc bash ubuntu-look.sh --refresh
 check "--refresh repairs a missing file" in_vm '[ -f /usr/local/share/gnome-shell/modes/ubuntu.json ]'
 check "--refresh keeps the user's setting" in_vm 'dconf read /org/gnome/desktop/wm/preferences/button-layout | grep -q close:'
 in_vm 'dconf reset /org/gnome/desktop/wm/preferences/button-layout'
@@ -116,7 +116,7 @@ in_vm "mkdir -p Documents && echo mine > Documents/notes.txt
 check "the settings were changed"      in_vm 'dconf read /org/gnome/desktop/interface/gtk-theme | grep -q Adwaita'
 # shellcheck disable=SC2034  # read in the check below
 home_before="$(home_names)"
-run reset y "" UBUNTU_LOOK_REBOOT=0 bash ubuntu-look.sh --reset
+run reset y ctrlc bash ubuntu-look.sh --reset
 check "the reset finished"             said reset "All steps finished"
 check "nothing was left undone"        unsaid reset "Not done"
 check "it reset the user's settings"   said reset "of your own settings reset to the look's defaults"
@@ -130,12 +130,12 @@ check "no backup folder in the home"   in_vm '[ ! -e .ubuntu-look-backup ]'
 check "nothing new in the home folder" eval '[ -n "$home_before" ] && [ "$(home_names)" = "$home_before" ]'
 state reset
 check "packages unchanged by the reset" same installed reset packages grub apt-files
-run reset2 y "" UBUNTU_LOOK_REBOOT=0 bash ubuntu-look.sh --reset
+run reset2 y ctrlc bash ubuntu-look.sh --reset
 check "a second reset changes nothing" said reset2 "Nothing changed"
 
 echo "A plain run resets too"
 in_vm "dconf write /org/gnome/desktop/wm/preferences/button-layout \"'close:'\""
-run rerun2 y "" UBUNTU_LOOK_REBOOT=0 bash ubuntu-look.sh
+run rerun2 y ctrlc bash ubuntu-look.sh
 check "the plain run finished"         said rerun2 "All steps finished"
 check "it reset the user's setting"    said rerun2 "of your own settings reset to the look's defaults"
 check "the window buttons are the look's" in_vm '[ -z "$(dconf read /org/gnome/desktop/wm/preferences/button-layout)" ]'
@@ -169,11 +169,10 @@ check "version 1.0's backup folder is gone" in_vm '[ ! -e .ubuntu-look-backup ]'
 check "the run logs are gone"          in_vm '! ls ubuntu-look-*.log'
 in_vm 'dconf reset /org/gnome/shell/favorite-apps; rm -rf Documents'
 
-echo "Second install, UBUNTU_LOOK_REBOOT=0"
-run install2 y "" UBUNTU_LOOK_REBOOT=0 bash ubuntu-look.sh
+echo "Second install, Ctrl-C at the countdown"
+run install2 y ctrlc bash ubuntu-look.sh
 check "the install finished"           said install2 "All steps finished"
-check "it only names the command"      said install2 "Run: sudo reboot"
-check "there is no countdown"          unsaid install2 "Rebooting in"
+check "Ctrl-C cancels the reboot"      said install2 "Reboot cancelled"
 check "the VM reboots by hand"         reboot_vm
 state reinstalled
 check "same packages as the first install"  same installed reinstalled packages

@@ -110,7 +110,7 @@ scenario() {
   check "a repeat run changes nothing"   said rerun "Nothing changed"
 
   echo "Uninstall on ${TO}"
-  run uninstall-final y "" UBUNTU_LOOK_REBOOT=0 bash ubuntu-look.sh --uninstall
+  run uninstall-final y ctrlc bash ubuntu-look.sh --uninstall
   check "the uninstall exits with 0"     said uninstall-final "SCRIPT EXIT 0"
   check "the VM reboots by hand"         reboot_vm
   state gone
